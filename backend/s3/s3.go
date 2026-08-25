@@ -561,6 +561,22 @@ This is usually set to a CloudFront CDN URL as AWS S3 offers
 cheaper egress for data downloaded through the CloudFront network.`,
 			Advanced: true,
 		}, {
+			Name: "download_host",
+			Help: `Download objects through a CDN host using presigned URLs.
+When set, rclone signs GetObject requests against the configured
+endpoint, then rewrites the host of the presigned URL to this value
+and issues a plain GET. The CDN must forward the request to the
+origin with the original host and query string intact so the
+signature still validates. Mutually exclusive with download_url.
+
+Object metadata lookups (NewObject and the post-upload verification)
+also go through this host, using a presigned first-byte GET instead
+of HEAD: some CDNs or workers in front of them mishandle HEAD while
+serving GET just fine, and a ranged GET carries the same headers plus
+the total size in Content-Range. Use --s3-no-head-object to fall back
+to skipping those lookups entirely.`,
+			Advanced: true,
+		}, {
 			Name:     "directory_markers",
 			Default:  false,
 			Advanced: true,
@@ -1121,6 +1137,7 @@ type Options struct {
 	Enc                         encoder.MultiEncoder `config:"encoding"`
 	DisableHTTP2                bool                 `config:"disable_http2"`
 	DownloadURL                 string               `config:"download_url"`
+	DownloadHost                string               `config:"download_host"`
 	DirectoryMarkers            bool                 `config:"directory_markers"`
 	UseMultipartEtag            fs.Tristate          `config:"use_multipart_etag"`
 	UsePresignedRequest         bool                 `config:"use_presigned_request"`
@@ -1842,6 +1859,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	if opt.Versions && opt.VersionAt.IsSet() {
 		return nil, errors.New("s3: can't use --s3-versions and --s3-version-at at the same time")
+	}
+	if opt.DownloadURL != "" && opt.DownloadHost != "" {
+		return nil, errors.New("s3: can't use --s3-download-url and --s3-download-host at the same time")
+	}
+	if opt.DownloadHost != "" && opt.SSECustomerKey != "" {
+		return nil, errors.New("s3: can't use --s3-download-host with sse_customer_key (SSE-C headers can't be presigned)")
 	}
 	if opt.BucketACL == "" {
 		opt.BucketACL = opt.ACL
@@ -4075,6 +4098,16 @@ func (f *Fs) headObject(ctx context.Context, req *s3.HeadObjectInput) (resp *s3.
 	if f.opt.SSECustomerKeyMD5 != "" {
 		req.SSECustomerKeyMD5 = &f.opt.SSECustomerKeyMD5
 	}
+	if f.opt.DownloadHost != "" {
+		resp, err = f.headObjectViaDownloadHost(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		if req.Bucket != nil {
+			f.cache.MarkOK(*req.Bucket)
+		}
+		return resp, nil
+	}
 	err = f.pacer.Call(func() (bool, error) {
 		var err error
 		resp, err = f.c.HeadObject(ctx, req)
@@ -4090,6 +4123,155 @@ func (f *Fs) headObject(ctx context.Context, req *s3.HeadObjectInput) (resp *s3.
 		f.cache.MarkOK(*req.Bucket)
 	}
 	return resp, nil
+}
+
+// headObjectViaDownloadHost fetches object metadata through opt.DownloadHost
+// using a presigned GET for the first byte, mirroring downloadPresigned. This
+// serves origins that only allow reads from the CDN egress IPs (e.g. bucket
+// policies restricted to a CDN), where a direct HeadObject would be rejected
+// with 403 - most notably rclone's own post-upload verification and object
+// lookups on such a destination.
+//
+// A HEAD is deliberately NOT used: CDNs or the workers in front of them may
+// mishandle it while serving GET just fine - notably workers that rebuild the
+// upstream request and thereby default its method to GET, which breaks the
+// signature. A ranged GET carries everything a HEAD would: ETag,
+// Last-Modified and x-amz-meta-* headers, plus Content-Range with the total
+// size.
+//
+// The URL is signed against the configured endpoint (which must be the origin
+// host the CDN forwards to), then only the host is rewritten to DownloadHost.
+// The CDN is expected to restore the original host when fetching from the
+// origin so the signature still validates.
+func (f *Fs) headObjectViaDownloadHost(ctx context.Context, req *s3.HeadObjectInput) (resp *s3.HeadObjectOutput, err error) {
+	getReq := &s3.GetObjectInput{
+		Bucket:    req.Bucket,
+		Key:       req.Key,
+		VersionId: req.VersionId,
+	}
+	presigned, err := s3.NewPresignClient(f.c).PresignGetObject(ctx, getReq, s3.WithPresignExpires(15*time.Minute))
+	if err != nil {
+		return nil, fmt.Errorf("presign failed: %w", err)
+	}
+
+	u, err := url.Parse(presigned.URL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse presigned URL: %w", err)
+	}
+	// NOTE: do not touch the query (see downloadPresigned) - presigned URLs
+	// are signed over the full query including x-id, and removing anything
+	// breaks the signature. Range travels as a plain unsigned header.
+	fs.Debugf(f, "Heading via %s using a first-byte GET (signed for %s)", f.opt.DownloadHost, u.Host)
+	u.Host = f.opt.DownloadHost
+
+	opts := rest.Opts{
+		Method:     "GET",
+		RootURL:    u.String(),
+		Options:    []fs.OpenOption{&fs.RangeOption{Start: 0, End: 0}},
+		NoResponse: true,
+	}
+	var httpResp *http.Response
+	err = f.pacer.Call(func() (bool, error) {
+		httpResp, err = f.srvRest.Call(ctx, &opts)
+		// rest errors don't implement the SDK status interface, so
+		// shouldRetry can't see transient HTTP codes - check them here.
+		if err != nil && httpResp != nil && slices.Contains(retryErrorCodes, httpResp.StatusCode) {
+			return true, err
+		}
+		return f.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		if httpResp != nil {
+			switch httpResp.StatusCode {
+			case http.StatusNotFound:
+				return nil, fs.ErrorObjectNotFound
+			case http.StatusRequestedRangeNotSatisfiable:
+				// Zero-length object: any range beyond the last byte
+				// (there are none) is unsatisfiable. Treat as size 0.
+				return f.headObjectOutputFromHTTP(httpResp, 0), nil
+			default:
+				return nil, fmt.Errorf("head via %s failed: HTTP %d (%w)", f.opt.DownloadHost, httpResp.StatusCode, err)
+			}
+		}
+		return nil, err
+	}
+	if code := httpResp.StatusCode; code != http.StatusPartialContent && code != http.StatusOK {
+		return nil, fmt.Errorf("head via %s failed: unexpected HTTP %d", f.opt.DownloadHost, code)
+	}
+
+	var contentLength int64 = -1
+	if httpResp.StatusCode == http.StatusPartialContent {
+		if total, ok := contentRangeTotal(httpResp.Header.Get("Content-Range")); ok {
+			contentLength = total
+		} else {
+			fs.Debugf(f, "Failed to parse file size from Content-Range %q", httpResp.Header.Get("Content-Range"))
+		}
+	} else {
+		contentLength = rest.ParseSizeFromHeaders(httpResp.Header)
+	}
+	return f.headObjectOutputFromHTTP(httpResp, contentLength), nil
+}
+
+// headObjectOutputFromHeaders builds a HeadObjectOutput from the response
+// headers of a presigned first-byte GET via DownloadHost. contentLength < 0
+// means the size could not be determined and stays unset.
+func (f *Fs) headObjectOutputFromHTTP(resp *http.Response, contentLength int64) *s3.HeadObjectOutput {
+	var lastModified time.Time
+	if lm := resp.Header.Get("Last-Modified"); lm != "" {
+		if parsed, perr := http.ParseTime(lm); perr == nil {
+			lastModified = parsed
+		} else {
+			fs.Debugf(f, "Failed to parse last modified from string %s, %v", lm, perr)
+		}
+	}
+
+	metaData := make(map[string]string)
+	for key, value := range resp.Header {
+		key = strings.ToLower(key)
+		if after, ok := strings.CutPrefix(key, "x-amz-meta-"); ok {
+			metaData[after] = value[0]
+		}
+	}
+
+	header := func(k string) *string {
+		v := resp.Header.Get(k)
+		if v == "" {
+			return nil
+		}
+		return &v
+	}
+
+	head := &s3.HeadObjectOutput{
+		ETag:               header("Etag"),
+		LastModified:       &lastModified,
+		Metadata:           metaData,
+		CacheControl:       header("Cache-Control"),
+		ContentDisposition: header("Content-Disposition"),
+		ContentEncoding:    header("Content-Encoding"),
+		ContentLanguage:    header("Content-Language"),
+		ContentType:        header("Content-Type"),
+		StorageClass:       types.StorageClass(deref(header("X-Amz-Storage-Class"))),
+	}
+	if contentLength >= 0 {
+		head.ContentLength = &contentLength
+	} else {
+		fs.Debugf(f, "Failed to parse file size from headers")
+	}
+	return head
+}
+
+// contentRangeTotal parses a "bytes s-e/total" Content-Range value and
+// returns the total size.
+func contentRangeTotal(v string) (int64, bool) {
+	_, total, ok := strings.Cut(v, "/")
+	if !ok {
+		return -1, false
+	}
+	n, perr := strconv.ParseInt(strings.TrimSpace(total), 10, 64)
+	if perr != nil || n < 0 {
+		return -1, false
+	}
+	return n, true
 }
 
 // readMetaData gets the metadata if it hasn't already been fetched
@@ -4336,6 +4518,123 @@ func (o *Object) downloadFromURL(ctx context.Context, bucketPath string, options
 	return resp.Body, err
 }
 
+// downloadPresigned downloads the object through opt.DownloadHost using a
+// presigned URL.
+//
+// The URL is signed against the configured endpoint (which must be the
+// origin host the CDN forwards to), then only the host is rewritten to
+// DownloadHost. The CDN is expected to restore the original host when
+// fetching from the origin so the signature still validates.
+//
+// Range/Seek options are deliberately kept out of the presigned input:
+// they travel as plain unsigned headers (SigV4 only signs host here), so
+// any intermediary header handling can't invalidate the signature.
+func (o *Object) downloadPresigned(ctx context.Context, bucket, bucketPath string, options ...fs.OpenOption) (in io.ReadCloser, err error) {
+	// Normalize negative/trailing ranges before computing expiry and
+	// rendering headers - the main GetObject path does the same.
+	fs.FixRangeOption(options, o.bytes)
+
+	// Presigned URL must outlive the transfer. Estimate from the object
+	// size at ~10MB/s with 30% headroom, clamped to [1h, 12h].
+	expire := time.Hour
+	if o.bytes > 0 {
+		estimated := time.Duration(float64(o.bytes) / (10 << 20) * 1.3 * float64(time.Second))
+		if estimated > expire {
+			expire = estimated
+		}
+		if expire > 12*time.Hour {
+			expire = 12 * time.Hour
+		}
+	}
+
+	req := s3.GetObjectInput{
+		Bucket:    &bucket,
+		Key:       &bucketPath,
+		VersionId: o.versionID,
+	}
+	presignClient := s3.NewPresignClient(o.fs.c)
+	presigned, err := presignClient.PresignGetObject(ctx, &req, s3.WithPresignExpires(expire))
+	if err != nil {
+		return nil, fmt.Errorf("presign failed: %w", err)
+	}
+
+	u, err := url.Parse(presigned.URL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse presigned URL: %w", err)
+	}
+	// NOTE: do not touch the query (e.g. stripping the SDK's x-id marker
+	// like fixupRequest does for plain requests) - presigned URLs are
+	// signed over the full query including x-id, and removing it breaks
+	// the signature.
+	fs.Debugf(o, "Downloading via %s (signed for %s, expires in %v)", o.fs.opt.DownloadHost, u.Host, expire)
+	u.Host = o.fs.opt.DownloadHost
+
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: u.String(),
+		Options: options,
+	}
+	var resp *http.Response
+	err = o.fs.pacer.Call(func() (bool, error) {
+		resp, err = o.fs.srvRest.Call(ctx, &opts)
+		// rest errors don't implement the SDK status interface, so
+		// shouldRetry can't see transient HTTP codes - check them here.
+		if err != nil && resp != nil && slices.Contains(retryErrorCodes, resp.StatusCode) {
+			return true, err
+		}
+		return o.fs.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	contentLength := rest.ParseSizeFromHeaders(resp.Header)
+	if contentLength < 0 {
+		fs.Debugf(o, "Failed to parse file size from headers")
+	}
+
+	var lastModified time.Time
+	if lm := resp.Header.Get("Last-Modified"); lm != "" {
+		if parsed, perr := http.ParseTime(lm); perr == nil {
+			lastModified = parsed
+		} else {
+			fs.Debugf(o, "Failed to parse last modified from string %s, %v", lm, perr)
+		}
+	}
+
+	metaData := make(map[string]string)
+	for key, value := range resp.Header {
+		key = strings.ToLower(key)
+		if after, ok := strings.CutPrefix(key, "x-amz-meta-"); ok {
+			metaKey := after
+			metaData[metaKey] = value[0]
+		}
+	}
+
+	header := func(k string) *string {
+		v := resp.Header.Get(k)
+		if v == "" {
+			return nil
+		}
+		return &v
+	}
+
+	var head = s3.HeadObjectOutput{
+		ETag:               header("Etag"),
+		ContentLength:      &contentLength,
+		LastModified:       &lastModified,
+		Metadata:           metaData,
+		CacheControl:       header("Cache-Control"),
+		ContentDisposition: header("Content-Disposition"),
+		ContentEncoding:    header("Content-Encoding"),
+		ContentLanguage:    header("Content-Language"),
+		ContentType:        header("Content-Type"),
+		StorageClass:       types.StorageClass(deref(header("X-Amz-Storage-Class"))),
+	}
+	o.setMetaData(&head)
+	return resp.Body, nil
+}
+
 // middleware to stop the SDK adding `Accept-Encoding: identity`
 func removeDisableGzip() func(*middleware.Stack) error {
 	return func(stack *middleware.Stack) error {
@@ -4361,6 +4660,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 
 	if o.fs.opt.DownloadURL != "" {
 		return o.downloadFromURL(ctx, bucketPath, options...)
+	}
+	if o.fs.opt.DownloadHost != "" {
+		return o.downloadPresigned(ctx, bucket, bucketPath, options...)
 	}
 
 	req := s3.GetObjectInput{
