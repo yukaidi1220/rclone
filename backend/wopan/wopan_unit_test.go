@@ -1020,3 +1020,59 @@ func TestUnitUploadHTTP500NoRetry(t *testing.T) {
 	assert.Contains(t, err.Error(), "http 500")
 	assert.True(t, fserrors.IsNoRetryError(err), "the 500 must be marked non-retryable, got: %v", err)
 }
+
+// zoneRecorder records request URLs and serves the GetZoneInfo dispatcher
+// response with a server-assigned zone, so uploadZone's two paths (configured
+// override, lazy fetch with cache) can be driven without a live server.
+type zoneRecorder struct {
+	zoneURL string
+	urls    []string
+}
+
+func (z *zoneRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
+	z.urls = append(z.urls, r.URL.String())
+	body := `{"code":"0000","data":{"fid":"F"},"msg":"ok"}`
+	if strings.HasSuffix(r.URL.Path, "/wohome/dispatcher") {
+		data, err := aesEncrypt([]byte(`{"url":"`+z.zoneURL+`"}`), aesKeyFor(chanWoHome, testAccessToken))
+		if err != nil {
+			return nil, err
+		}
+		body = `{"STATUS":"200","MSG":"ok","LOGID":"L","RSP":{"RSP_CODE":"0000","RSP_DESC":"ok","DATA":"` + data + `"}}`
+	}
+	return &http.Response{
+		StatusCode:    http.StatusOK,
+		Status:        "200 OK",
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+	}, nil
+}
+
+// TestUnitUploadZoneOverride is the regression lock for upload_zone: a
+// configured endpoint is returned verbatim and GetZoneInfo is never sent,
+// even though the lazy cache is still empty.
+func TestUnitUploadZoneOverride(t *testing.T) {
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example"}
+	f := newUnitTestFs(rec)
+	f.opt.UploadZone = "https://override.example"
+
+	zone, err := f.uploadZone(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "https://override.example", zone)
+	assert.Empty(t, rec.urls, "upload_zone override must not issue any request")
+}
+
+// TestUnitUploadZoneLazyCache covers the default path: the first uploadZone
+// call fetches the zone from GetZoneInfo, later calls reuse the cached value.
+func TestUnitUploadZoneLazyCache(t *testing.T) {
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example"}
+	f := newUnitTestFs(rec)
+
+	zone, err := f.uploadZone(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "https://zone-from-server.example", zone)
+	zone, err = f.uploadZone(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "https://zone-from-server.example", zone)
+	assert.Len(t, rec.urls, 1, "GetZoneInfo must be sent exactly once, then cached")
+}

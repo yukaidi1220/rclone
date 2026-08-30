@@ -453,6 +453,7 @@ type Options struct {
 	RootFolderID string               `config:"root_folder_id"`
 	NoRefresh    bool                 `config:"no_refresh"`
 	HardDelete   bool                 `config:"hard_delete"`
+	UploadZone   string               `config:"upload_zone"`
 	Enc          encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -488,6 +489,14 @@ func init() {
 			Name:     "hard_delete",
 			Help:     "Delete permanently instead of putting files into the recycle bin.",
 			Default:  false,
+			Advanced: true,
+		}, {
+			Name: "upload_zone",
+			Help: "Upload endpoint override, e.g. https://tjupload.pan.wo.cn.\n\n" +
+				"Leave blank to use the zone the server assigns per account (recommended). " +
+				"When set, all upload traffic - file contents and the access token - goes " +
+				"through the given host, so only point it at a server you trust, such as " +
+				"your own reverse proxy. The URL must present a valid TLS certificate.",
 			Advanced: true,
 		}, {
 			Name:     config.ConfigEncoding,
@@ -908,6 +917,15 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 	}
 	if opt.AccessToken == "" && opt.RefreshToken == "" {
 		return nil, errors.New("wopan: need either a refresh_token or an access_token")
+	}
+	// Uploads put the access token in an unencrypted form field, so an
+	// http:// override would silently leak it; reject non-https early.
+	if opt.UploadZone != "" {
+		u, err := url.Parse(opt.UploadZone)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return nil, fmt.Errorf("wopan: upload_zone must be a valid https:// URL, got %q", opt.UploadZone)
+		}
+		opt.UploadZone = strings.TrimSuffix(opt.UploadZone, "/")
 	}
 
 	// Bootstrap the shared state before anything needs a token. It is keyed by
@@ -1609,10 +1627,13 @@ func formatShootingTime(t time.Time) string {
 	return t.In(api.Beijing).Format(api.TimeFormat)
 }
 
-// uploadZone returns the upload endpoint for this account, fetching it via
-// GetZoneInfo on first use. The endpoint varies by account, so it must not be
-// hardcoded.
+// uploadZone returns the upload endpoint: the manually configured upload_zone
+// if set, otherwise the server-assigned zone fetched via GetZoneInfo on first
+// use. The endpoint varies by account, so it must not be hardcoded.
 func (f *Fs) uploadZone(ctx context.Context) (string, error) {
+	if f.opt.UploadZone != "" {
+		return f.opt.UploadZone, nil
+	}
 	f.zoneMu.Lock()
 	defer f.zoneMu.Unlock()
 	if f.zoneLoaded {
