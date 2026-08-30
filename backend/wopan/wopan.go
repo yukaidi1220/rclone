@@ -110,10 +110,16 @@ const (
 	// tempSuffix is the suffix appended to Update's temporary upload name.
 	tempSuffix = ".rclone-tmp-"
 
-	// recyclePageSize is the page size for QueryRecycleData. The server
-	// ignores the page number entirely (verified live, fifth round), so one
-	// large page is the only way to see more entries.
+	// recyclePageSize is the page size for QueryRecycleData. Whether the
+	// server honours pageNum is unknown (early probing was inconclusive
+	// beyond page 0), so listRecycleAll probes further pages and falls back
+	// to a single large page when they repeat.
 	recyclePageSize = 1000
+
+	// maxRecyclePages bounds the recycle-bin scan: 10 full pages of 1000
+	// entries cover any realistic personal bin while keeping a
+	// page-num-ignoring server bounded to 10 identical fetches.
+	maxRecyclePages = 10
 
 	// recycleBudget bounds the wait for deleted entries to become visible in
 	// the recycle bin; the measured visibility delay is ~2.1s.
@@ -1776,7 +1782,15 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, zoneURL, dirID, name 
 		return api.UploadData{}, err
 	}
 	if res.StatusCode >= 300 {
-		return api.UploadData{}, fmt.Errorf("wopan: upload: http %s: %s", res.Status, truncate(string(raw), 500))
+		// An HTTP-level rejection from upload2C is deterministic for the
+		// given request - the server answers a bare 500 for file names it
+		// cannot store (manual test G7: certain special-symbol and 4-byte
+		// names) - and NoRetryError stops the retry ladder and --retries
+		// from re-running a request that will never succeed. The cost is
+		// that a genuinely transient server 5xx also fails the transfer
+		// immediately; re-run the command to retry it.
+		return api.UploadData{}, fserrors.NoRetryError(
+			fmt.Errorf("wopan: upload: http %s: %s", res.Status, truncate(string(raw), 500)))
 	}
 	var ur api.UploadResponse
 	if err := json.Unmarshal(raw, &ur); err != nil {
@@ -2074,15 +2088,56 @@ func (f *Fs) listRecyclePage(ctx context.Context, pageNum int) ([]api.RecycleIte
 // Newly deleted entries sort first, so hard_delete's pending ids are found
 // even when the bin holds more entries than one page.
 func (f *Fs) listRecycleAll(ctx context.Context) ([]api.RecycleItem, error) {
-	items, err := f.listRecyclePage(ctx, 0)
-	if err == nil && len(items) >= recyclePageSize {
-		// A full page may mean the bin holds more entries than one page and
-		// the sort order no longer surfaces them all. hard_delete stays safe
-		// (fail-loud when a pending id is missing), but log it so the
-		// condition is visible.
-		fs.Logf(f, "recycle bin returned a full page of %d items; entries beyond it are invisible to hard_delete", len(items))
+	items, truncated, err := collectRecyclePages(ctx, func(page int) ([]api.RecycleItem, error) {
+		return f.listRecyclePage(ctx, page)
+	}, recyclePageSize, maxRecyclePages)
+	if truncated {
+		// A repeated page means the server ignores pageNum, so entries beyond
+		// the first page are unreachable: hard_delete stays fail-loud (a
+		// pending id it cannot find is left in the bin and reported), but the
+		// condition must be visible to the user.
+		fs.Logf(f, "recycle bin holds more than %d entries and the server ignored recycling paging: entries beyond the first page are invisible to hard_delete; empty the recycle bin from the app to restore full hard_delete", recyclePageSize)
 	}
 	return items, err
+}
+
+// collectRecyclePages fetches recycle pages until the bin is exhausted. A
+// full page triggers a probe of the next page: the server ignored pageNum in
+// early probing (35-entry bin, inconclusive beyond page 0), so a page that
+// repeats the previous one stops the scan and reports truncated - when the
+// server does honour paging, further pages are appended and nothing is
+// truncated. fetch must be safe for page numbers 0..maxPages-1.
+func collectRecyclePages(ctx context.Context, fetch func(page int) ([]api.RecycleItem, error), pageSize, maxPages int) (items []api.RecycleItem, truncated bool, err error) {
+	var prev []api.RecycleItem
+	for page := 0; page < maxPages; page++ {
+		pageItems, err := fetch(page)
+		if err != nil {
+			return items, false, err
+		}
+		if page > 0 && recycleSamePage(prev, pageItems) {
+			return items, true, nil
+		}
+		items = append(items, pageItems...)
+		if len(pageItems) < pageSize {
+			return items, false, nil
+		}
+		prev = pageItems
+	}
+	return items, true, nil
+}
+
+// recycleSamePage reports whether two recycle pages hold the same entries in
+// the same order - the server's signature of an ignored pageNum.
+func recycleSamePage(a, b []api.RecycleItem) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].DeleteNo != b[i].DeleteNo || a[i].ID != b[i].ID {
+			return false
+		}
+	}
+	return true
 }
 
 // snapshotRecycle records the deleteNos already in the recycle bin, indexed by
@@ -2266,6 +2321,20 @@ func (f *Fs) moveCopyParams(targetDirID string, dirIDs, fileIDs []string) map[st
 	return p
 }
 
+// sameDir reports whether the source object's directory equals the
+// destination directory. The two remotes are relative to their OWN Fs roots,
+// so when source and destination are different Fs instances of the same
+// backend (a --backup-dir move, a moveto across directories) their relative
+// directories can both be "." even though the directories differ server-side
+// - comparing the remotes directly would misread a cross-directory move as a
+// same-directory one: with equal leaves Move would skip the server-side move
+// and report success while the object never moved (the caller then overwrites
+// it - silent data loss), and with different leaves it would rename the
+// object in place instead of moving it.
+func sameDir(srcObj *Object, dstRoot, dstRemote string) bool {
+	return path.Join(srcObj.fs.root, path.Dir(srcObj.remote)) == path.Join(dstRoot, path.Dir(dstRemote))
+}
+
 // Copy src to this remote using server-side copy operations.
 //
 // CopyFile creates a NEW id and lands the copy under the source's name, so the
@@ -2292,7 +2361,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (dst fs.Obj
 	// it (z(1).txt) and findNewEntry can never match the requested name.
 	// Fall back to a bandwidth copy (always safe: nothing has been moved and
 	// no copy exists yet).
-	if path.Dir(src.Remote()) == path.Dir(remote) {
+	if sameDir(srcObj, f.root, remote) {
 		return nil, fs.ErrorCantCopy
 	}
 	// Age discriminator for the re-list below, relaxed by a small slack for the
@@ -2428,7 +2497,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (dst fs.Obj
 	}
 	srcLeaf := path.Base(src.Remote())
 
-	if path.Dir(src.Remote()) != path.Dir(remote) {
+	if !sameDir(srcObj, f.root, remote) {
 		// Different parent: move first. A failure here leaves the object at the
 		// source, but its outcome is uncertain (the request may have landed),
 		// so it is reported wrapped - the bare sentinel would trigger rclone's
@@ -2443,6 +2512,28 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (dst fs.Obj
 			return nil, fmt.Errorf("wopan: move object: %w", err)
 		}
 		fs.Debugf(f, "wopan: MoveFile took %s", time.Since(phaseStart).Round(time.Millisecond))
+		// The server acknowledges a move with 0000 even while the moved entry
+		// is still missing from the target listing, and a move that silently
+		// failed is indistinguishable from one that succeeded - the caller
+		// would then overwrite the object it believes was relocated (manual
+		// test BUG-D: a --backup-dir move lost the old version this way).
+		// Confirm the entry by id with a bounded retry and fail loudly
+		// instead of reporting success for data that may not have moved.
+		verify := func() (string, error) {
+			entries, err := f.listDirEntries(ctx, dstDirID)
+			if err != nil {
+				return "", err
+			}
+			for _, item := range entries {
+				if item.ID == srcObj.id {
+					return item.ID, nil
+				}
+			}
+			return "", fs.ErrorDirNotFound
+		}
+		if _, err := retryFindDir(ctx, dirFindAttempts, dirFindDelay, verify); err != nil {
+			return nil, fmt.Errorf("wopan: moved file %q did not appear in the target directory: %w", srcLeaf, err)
+		}
 	}
 	if srcLeaf != dstLeaf {
 		// MoveFile does not rename, so a leaf change needs a rename; the id is

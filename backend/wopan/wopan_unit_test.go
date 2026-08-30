@@ -911,3 +911,111 @@ func TestUnitHashGraceBySize(t *testing.T) {
 	_, err = newObj(24*1024*1024, largeHashGracePeriod+time.Minute).Hash(context.Background(), hash.MD5)
 	assert.Error(t, err)
 }
+
+// statusTransport answers every request with a bare HTTP status and an
+// empty body.
+type statusTransport struct{ code int }
+
+func (t statusTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: t.code,
+		Status:     fmt.Sprintf("%d %s", t.code, http.StatusText(t.code)),
+		Body:       io.NopCloser(strings.NewReader("")),
+		Header:     http.Header{},
+	}, nil
+}
+
+// TestUnitSameDir locks the absolute-directory comparison behind Move and
+// Copy (manual test BUG-D): the source remote is relative to the SOURCE Fs
+// root while the destination remote is relative to the DESTINATION Fs root,
+// so two different directories of the same backend compare equal as bare
+// relative paths and a --backup-dir move used to be skipped entirely while
+// reporting success.
+func TestUnitSameDir(t *testing.T) {
+	srcObj := &Object{fs: &Fs{root: "manual/c3"}, remote: "old.bin"}
+	assert.False(t, sameDir(srcObj, "manual/backup", "old.bin"), "different dirs of different Fs instances must not read as same-dir")
+	assert.True(t, sameDir(srcObj, "manual/c3", "old.bin"), "the object's own directory is same-dir")
+	assert.False(t, sameDir(srcObj, "manual/c3", "sub/old.bin"), "a nested destination is a different directory")
+
+	// Top-level objects of an account-rooted Fs: both directories are the
+	// account root and do read as same-dir.
+	rootObj := &Object{fs: &Fs{root: ""}, remote: "old.bin"}
+	assert.True(t, sameDir(rootObj, "", "old.bin"))
+	assert.False(t, sameDir(rootObj, "", "sub/old.bin"))
+}
+
+// TestUnitRecyclePagination locks collectRecyclePages: short page = done,
+// distinct full pages are appended, a repeated full page means the server
+// ignores pageNum (truncated, further entries unreachable), and fetch errors
+// surface.
+func TestUnitRecyclePagination(t *testing.T) {
+	item := func(no string) api.RecycleItem {
+		return api.RecycleItem{DeleteNo: no, ID: "id-" + no}
+	}
+	ctx := context.Background()
+
+	// Short first page: bin exhausted, single fetch.
+	fetches := 0
+	items, truncated, err := collectRecyclePages(ctx, func(page int) ([]api.RecycleItem, error) {
+		fetches++
+		return []api.RecycleItem{item("a")}, nil
+	}, 2, 10)
+	require.NoError(t, err)
+	assert.False(t, truncated)
+	assert.Equal(t, []string{"a"}, []string{items[0].DeleteNo})
+	assert.Equal(t, 1, fetches)
+
+	// Distinct full pages then a short page: everything is collected and the
+	// server is judged to honour paging.
+	fetches = 0
+	items, truncated, err = collectRecyclePages(ctx, func(page int) ([]api.RecycleItem, error) {
+		fetches++
+		switch page {
+		case 0:
+			return []api.RecycleItem{item("a"), item("b")}, nil // "full" for pageSize 2
+		case 1:
+			return []api.RecycleItem{item("c")}, nil
+		default:
+			t.Fatalf("unexpected fetch of page %d", page)
+			return nil, nil
+		}
+	}, 2, 10)
+	require.NoError(t, err)
+	assert.False(t, truncated)
+	assert.Equal(t, 3, len(items))
+	assert.Equal(t, 2, fetches)
+
+	// The server ignores pageNum: page 1 repeats page 0, the scan stops and
+	// reports truncated so hard_delete can warn about invisible entries.
+	items, truncated, err = collectRecyclePages(ctx, func(page int) ([]api.RecycleItem, error) {
+		return []api.RecycleItem{item("a"), item("b")}, nil
+	}, 2, 10)
+	require.NoError(t, err)
+	assert.True(t, truncated)
+	assert.Equal(t, 2, len(items), "repeated page content must not be appended twice")
+
+	// Fetch errors surface immediately.
+	_, _, err = collectRecyclePages(ctx, func(page int) ([]api.RecycleItem, error) {
+		return nil, errors.New("boom")
+	}, 2, 10)
+	assert.EqualError(t, err, "boom")
+}
+
+// TestUnitUploadHTTP500NoRetry locks the upload error mapping (manual test
+// F-GH-1): a bare HTTP 500 from upload2C is deterministic for the given file
+// name, so it must carry the no-retry mark instead of burning the low-level
+// retry ladder.
+func TestUnitUploadHTTP500NoRetry(t *testing.T) {
+	// A transport that answers every request with a bare HTTP 500 - the
+	// upload2C rejection shape observed for unstoreable file names.
+	f := newUnitTestFs(statusTransport{code: http.StatusInternalServerError})
+	f.zoneURL = "https://zone.example"
+	f.zoneLoaded = true
+	in := struct{ io.Reader }{strings.NewReader("content")}
+	src := fsobject.NewStaticObjectInfo("dir/x.bin", time.Now(), 7, true, nil, nil)
+
+	_, err := f.uploadSingle(context.Background(), in, "dirID", "x.bin", 7, src)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "http 500")
+	assert.True(t, fserrors.IsNoRetryError(err), "the 500 must be marked non-retryable, got: %v", err)
+}

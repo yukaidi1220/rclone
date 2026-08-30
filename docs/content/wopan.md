@@ -72,7 +72,11 @@ The advanced options are:
   [Sharing an account with OpenList](#sharing-an-account-with-openlist) below.
 - `--wopan-hard_delete`: delete files permanently instead of moving them to
   the recycle bin. Deleting files from the recycle bin still works, so quota
-  is only released immediately with this flag.
+  is only released immediately with this flag. Note that permanent deletion
+  works by purging the file from the recycle bin: when the bin holds more
+  entries than the server is willing to page out, files beyond that page can
+  only be moved into the bin (rclone logs a warning) - empty the recycle bin
+  from the app to restore full hard delete.
 - `--wopan-encoding`: the encoding for the backend. The default is `Standard`
   plus `EncodeInvalidUtf8` and should normally be left alone. The server
   stores file names verbatim (including trailing spaces, dots and tabs), so
@@ -110,7 +114,10 @@ objects.
   the app and web clients themselves truncate long names.
 - **Emoji and other non-BMP characters are not supported.** The service
   rejects them outright; rclone reports the offending character instead of
-  retrying.
+  retrying. A handful of storable-looking special symbols and 4-byte names
+  pass that check but are then rejected by the server with a bare HTTP 500;
+  rclone surfaces this as a non-retryable upload error for the file instead
+  of burning the retry ladder on it.
 - **Names are case-insensitive.** Two names differing only in case refer to
   the same file.
 - **Modification times cannot be changed after upload.** `rclone touch` on an
