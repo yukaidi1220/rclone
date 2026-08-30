@@ -1,0 +1,25 @@
+backend: wopan
+name: China Unicom Cloud Drive (联通云盘)
+tier: Tier 1
+maintainers: External
+features_score: 4
+integration_tests: Flaky
+data_integrity: Hash
+performance: High
+adoption: Some use
+docs: Full
+security: High
+virtual: false
+remote: 'TestWopan:'
+features:
+- About
+- CanHaveEmptyDirectories
+- CaseInsensitive
+- Copy
+- DirMove
+- Move
+- Purge
+- SlowHash
+hashes:
+- MD5
+precision: 1000000000

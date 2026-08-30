@@ -704,3 +704,15 @@ backends:
    fastlist: false
    extratime: 2.0
    listretries: 5
+ - backend:  "wopan"
+   remote:   "TestWopan:"
+   # bisync cannot work with write-only-modtime, case-insensitive names and
+   # no empty files; gitannex needs remote copy support across remotes
+   ignoretests:
+     - cmd/bisync
+     - cmd/gitannex
+   fastlist: false
+   extratime: 2.0
+   # The server shows new/deleted entries in the parent listing seconds to
+   # tens of seconds late, so fstest's retry ladder needs headroom.
+   listretries: 10
