@@ -839,10 +839,11 @@ func TestUnitDirMoveOverlapGuard(t *testing.T) {
 	assert.Equal(t, fs.ErrorCantDirMove, err)
 
 	// Identity: a directory moved onto itself, expressed with the source as
-	// the destination parent.
+	// the destination parent. The fstests contract (fstests.go FsDirMove)
+	// requires fs.ErrorDirExists when the destination already exists.
 	fSelf := &Fs{root: "manual"}
 	err = fSelf.DirMove(context.Background(), src, "b4", "b4")
-	assert.Equal(t, fs.ErrorCantDirMove, err)
+	assert.Equal(t, fs.ErrorDirExists, err)
 }
 
 // TestUnitRetryFindDir locks retryFindDir's contract: only ErrorDirNotFound
