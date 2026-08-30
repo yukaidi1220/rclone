@@ -822,3 +822,92 @@ func TestUnitCopySameDirFallback(t *testing.T) {
 	assert.Nil(t, dst)
 	assert.Equal(t, fs.ErrorCantCopy, err)
 }
+
+// TestUnitDirMoveOverlapGuard locks the overlap guard on DirMove: a
+// destination inside the source directory (the degenerate shape a moveto
+// degrades to when its source file is not yet listing-visible) must be
+// refused with the BARE ErrorCantDirMove before any server call, so the
+// server can never partially apply a self-nested directory move. The guard
+// fires on path shapes alone, before any dircache access, so bare Fs values
+// suffice here.
+func TestUnitDirMoveOverlapGuard(t *testing.T) {
+	f := &Fs{root: "manual/b4"}
+	src := &Fs{root: "manual"}
+
+	// Destination inside the source directory.
+	err := f.DirMove(context.Background(), src, "b4", "sub")
+	assert.Equal(t, fs.ErrorCantDirMove, err)
+
+	// Identity: a directory moved onto itself, expressed with the source as
+	// the destination parent.
+	fSelf := &Fs{root: "manual"}
+	err = fSelf.DirMove(context.Background(), src, "b4", "b4")
+	assert.Equal(t, fs.ErrorCantDirMove, err)
+}
+
+// TestUnitRetryFindDir locks retryFindDir's contract: only ErrorDirNotFound
+// retries (a directory created moments ago can be missing from its parent
+// listing for seconds), every other error surfaces immediately, and the
+// attempt count is a hard bound.
+func TestUnitRetryFindDir(t *testing.T) {
+	ctx := context.Background()
+
+	// Two visibility-window misses, then success.
+	calls := 0
+	id, err := retryFindDir(ctx, 4, time.Millisecond, func() (string, error) {
+		calls++
+		if calls < 3 {
+			return "", fs.ErrorDirNotFound
+		}
+		return "id-3", nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "id-3", id)
+	assert.Equal(t, 3, calls)
+
+	// The directory never becomes visible: ErrorDirNotFound after exactly
+	// attempts lookups.
+	calls = 0
+	_, err = retryFindDir(ctx, 3, time.Millisecond, func() (string, error) {
+		calls++
+		return "", fs.ErrorDirNotFound
+	})
+	assert.Equal(t, fs.ErrorDirNotFound, err)
+	assert.Equal(t, 3, calls)
+
+	// Any other error surfaces on the first attempt.
+	calls = 0
+	_, err = retryFindDir(ctx, 4, time.Millisecond, func() (string, error) {
+		calls++
+		return "", errors.New("boom")
+	})
+	assert.EqualError(t, err, "boom")
+	assert.Equal(t, 1, calls)
+}
+
+// TestUnitHashGraceBySize locks the size-tiered hash grace (manual test B3):
+// files of 8 MiB or more are stored in server-side shards whose ETag takes
+// minutes to settle to the content MD5, so their grace window outlives the
+// small-file one - verify must not treat a freshly uploaded big file as
+// hashless-with-error in between.
+func TestUnitHashGraceBySize(t *testing.T) {
+	newObj := func(size int64, age time.Duration) *Object {
+		f := newUnitTestFs(hashTransport{headStatus: http.StatusInternalServerError})
+		return &Object{fs: f, remote: "dir/a.bin", id: "id", fid: "fid",
+			size: size, uploadedAt: time.Now().Add(-age)}
+	}
+
+	// Small file past the small grace: the HEAD error surfaces.
+	_, err := newObj(4*1024*1024, hashGracePeriod+time.Minute).Hash(context.Background(), hash.MD5) // 4 MiB: small file
+	assert.Error(t, err)
+
+	// Large file of the same age is still inside the large grace: no-hash,
+	// no error.
+	sum, err := newObj(24*1024*1024, hashGracePeriod+time.Minute).Hash(context.Background(), hash.MD5) // 24 MiB: multi-shard
+	assert.NoError(t, err)
+	assert.Empty(t, sum)
+
+	// Large file past even the large grace: the error surfaces.
+	_, err = newObj(24*1024*1024, largeHashGracePeriod+time.Minute).Hash(context.Background(), hash.MD5)
+	assert.Error(t, err)
+}

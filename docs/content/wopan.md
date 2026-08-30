@@ -90,12 +90,15 @@ used when you ask for it explicitly with `--checksum`. **Using `--checksum`
 is the recommended way to run sync and copy against wopan**; without it,
 rclone compares sizes and modification times.
 
-Files uploaded by other clients at 16 MiB or larger are stored as multipart
-objects. Their ETag is a multipart digest, not a content MD5, and rclone
-cannot tell the difference between a real MD5 and a multipart digest for
-files it did not upload itself. For those files `--checksum` **silently
-degrades to size-only comparison** - this is by design so that verification
-does not delete valid objects.
+Files of 8 MiB or more are stored in server-side shards, however they were
+uploaded. The shard aggregate's ETag is not immediately the content MD5: for
+rclone's own uploads it settles to the real MD5 over a period that can run
+into minutes, while files uploaded by other clients as true multi-part
+uploads keep a multipart digest, which is not a content hash at all. rclone
+treats an unsettled or multipart ETag as "no hash available", so `--checksum`
+**silently degrades to size-only comparison** for those files and time
+windows - this is by design so that verification does not delete valid
+objects.
 
 ## Restrictions
 
@@ -120,6 +123,12 @@ does not delete valid objects.
 - **Server side copy and move work only within the same remote.** Copying
   between a personal space remote and a family space remote transfers the
   data through rclone, even if it is the same account.
+- **Naming a freshly uploaded file in `moveto`/`move` can fail oddly.** The
+  listing index is eventually consistent (see below): while the new file is
+  not yet listing-visible, `moveto` may report `directory not found` or fall
+  back to a directory move, which rclone then refuses as a directory moved
+  into itself. Wait a few seconds and repeat the command - the retry applies
+  cleanly.
 - **Renaming onto an existing name fails with `file name already in use`**;
   the server never overwrites on rename. When two concurrent updates race,
   the loser reports the error and the next run repairs it. A rename that
