@@ -77,6 +77,12 @@ The advanced options are:
   entries than the server is willing to page out, files beyond that page can
   only be moved into the bin (rclone logs a warning) - empty the recycle bin
   from the app to restore full hard delete.
+- `--wopan-upload_zone`: upload endpoint override, e.g.
+  `https://tjupload.pan.wo.cn`. Leave blank to use the zone the server
+  assigns per account (recommended). When set, all upload traffic - file
+  contents and the access token included - goes through the given host, so
+  only point it at a server you trust, such as your own reverse proxy. The
+  URL must present a valid TLS certificate.
 - `--wopan-encoding`: the encoding for the backend. The default is `Standard`
   plus `EncodeInvalidUtf8` and should normally be left alone. The server
   stores file names verbatim (including trailing spaces, dots and tabs), so
