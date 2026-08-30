@@ -89,6 +89,19 @@ const (
 	// not be ready, and an error would make verify delete the just-uploaded file.
 	hashGracePeriod = 60 * time.Second
 
+	// largeHashGracePeriod covers multi-shard objects: every file of 8 MiB
+	// or more is stored in server-side shards regardless of how it was
+	// uploaded, and the shard aggregate's ETag settles to the content MD5
+	// only after a settling period that can run into minutes.
+	largeHashGracePeriod = 10 * time.Minute
+
+	// dirFindAttempts/dirFindDelay bound the re-lookup when CreateDirectory
+	// reports an existing directory: the entry can be missing from its parent
+	// listing for a few seconds after creation (listing eventual
+	// consistency), and a bare lookup would fail with ErrorDirNotFound.
+	dirFindAttempts = 4
+	dirFindDelay    = 2 * time.Second
+
 	// renameDeadline bounds the rename retry loop after Update's delete step:
 	// the name index is released asynchronously, and the pacer's default budget
 	// (~4.5s) is too short.
@@ -1119,6 +1132,26 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 	return pathIDOut, found, err
 }
 
+// retryFindDir runs lookup with a bounded retry across the listing
+// visibility window: a directory that was just created (or just renamed
+// into place) can be missing from its parent listing for seconds before
+// the server makes it visible, and a bare lookup would fail the caller
+// with ErrorDirNotFound. Only ErrorDirNotFound retries; every other error
+// surfaces immediately.
+func retryFindDir(ctx context.Context, attempts int, delay time.Duration, lookup func() (string, error)) (string, error) {
+	for attempt := 1; ; attempt++ {
+		id, err := lookup()
+		if err != fs.ErrorDirNotFound || attempt >= attempts {
+			return id, err
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+}
+
 // findDirID returns the id of the directory named leaf inside pathID.
 func (f *Fs) findDirID(ctx context.Context, pathID, leaf string) (string, error) {
 	id, found, err := f.FindLeaf(ctx, pathID, leaf)
@@ -1155,7 +1188,12 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 			var ae *apiError
 			if asAPIError(err, &ae) && ae.Code == codeDirExists {
 				// The directory already exists - Mkdir must not report an error.
-				id, ferr := f.findDirID(ctx, pathID, leaf)
+				// But a just-created directory can be missing from its parent
+				// listing for a few seconds, so look it up with a bounded
+				// retry across the visibility window.
+				id, ferr := retryFindDir(ctx, dirFindAttempts, dirFindDelay, func() (string, error) {
+					return f.findDirID(ctx, pathID, leaf)
+				})
 				if ferr != nil {
 					return false, ferr
 				}
@@ -1321,6 +1359,17 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 	return fs.ErrorCantSetModTime
 }
 
+// hashGrace returns how long after this object's upload Hash() should
+// swallow transient errors. Small files settle within seconds, but files
+// of 8 MiB or more are stored in server-side shards whose ETag takes
+// minutes to settle to the content MD5 (manual test B3).
+func (o *Object) hashGrace() time.Duration {
+	if o.size >= partSize {
+		return largeHashGracePeriod
+	}
+	return hashGracePeriod
+}
+
 // Hash returns the selected checksum of the file.
 //
 // The MD5 is the ETag of the download URL. A multipart ETag (with a "-N"
@@ -1334,7 +1383,7 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	}
 	url, err := o.downloadURL(ctx)
 	if err != nil {
-		if time.Since(o.uploadedAt) < hashGracePeriod {
+		if time.Since(o.uploadedAt) < o.hashGrace() {
 			// GetDownloadUrlV2 itself can fail transiently within the
 			// settling window (rate limit, pacer budget exhausted); fall
 			// back to no-hash instead of making verify delete the freshly
@@ -1345,7 +1394,7 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	}
 	etag, err := o.fs.headETag(ctx, url)
 	if err != nil {
-		if time.Since(o.uploadedAt) < hashGracePeriod {
+		if time.Since(o.uploadedAt) < o.hashGrace() {
 			// The download link may not be settled yet; fall back to no-hash
 			// instead of making verify delete the freshly uploaded file.
 			return "", nil
@@ -2445,6 +2494,15 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	srcFs, ok := src.(*Fs)
 	if !ok {
 		fs.Debugf(src, "Can't move directory - not same remote type")
+		return fs.ErrorCantDirMove
+	}
+	// A destination inside the source directory (e.g. the degenerate
+	// "directory into its own subdirectory" a moveto can degrade to when
+	// the source file is not yet listing-visible) would ask the server to
+	// move a directory into itself; refuse before touching the server.
+	srcPath := path.Join(srcFs.root, srcRemote)
+	dstPath := path.Join(f.root, dstRemote)
+	if dstPath == srcPath || strings.HasPrefix(dstPath, srcPath+"/") {
 		return fs.ErrorCantDirMove
 	}
 	srcID, srcDirectoryID, srcLeaf, dstDirectoryID, dstLeaf, err :=
