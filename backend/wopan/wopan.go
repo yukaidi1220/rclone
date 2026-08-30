@@ -2593,7 +2593,11 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	// move a directory into itself; refuse before touching the server.
 	srcPath := path.Join(srcFs.root, srcRemote)
 	dstPath := path.Join(f.root, dstRemote)
-	if dstPath == srcPath || strings.HasPrefix(dstPath, srcPath+"/") {
+	if dstPath == srcPath {
+		// Moving onto itself means the destination already exists.
+		return fs.ErrorDirExists
+	}
+	if strings.HasPrefix(dstPath, srcPath+"/") {
 		return fs.ErrorCantDirMove
 	}
 	srcID, srcDirectoryID, srcLeaf, dstDirectoryID, dstLeaf, err :=
