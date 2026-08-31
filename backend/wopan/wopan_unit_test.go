@@ -1,6 +1,7 @@
 package wopan
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1024,15 +1027,42 @@ func TestUnitUploadHTTP500NoRetry(t *testing.T) {
 // zoneRecorder records request URLs and serves the GetZoneInfo dispatcher
 // response with a server-assigned zone, so uploadZone's two paths (configured
 // override, lazy fetch with cache) can be driven without a live server.
+// upload2C requests are additionally parsed into their multipart form fields
+// (parts) for multipart assertions; intermediate parts are answered with an
+// empty data object, the last part with a fid, mirroring the server.
 type zoneRecorder struct {
 	zoneURL string
 	urls    []string
+	parts   []partValues
+}
+
+type partValues struct {
+	url.Values
+	partBytes int64
 }
 
 func (z *zoneRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
 	z.urls = append(z.urls, r.URL.String())
-	body := `{"code":"0000","data":{"fid":"F"},"msg":"ok"}`
-	if strings.HasSuffix(r.URL.Path, "/wohome/dispatcher") {
+	body := `{"code":"0000","data":{"fid":"F","wcFileId":"W"},"msg":"ok"}`
+	if mr, err := r.MultipartReader(); err == nil {
+		pv := partValues{Values: url.Values{}}
+		for {
+			p, err := mr.NextPart()
+			if err != nil {
+				break
+			}
+			b, _ := io.ReadAll(p)
+			if p.FileName() != "" {
+				pv.partBytes = int64(len(b))
+			} else {
+				pv.Set(p.FormName(), string(b))
+			}
+		}
+		z.parts = append(z.parts, pv)
+		if pv.Get("partIndex") != "" && pv.Get("partIndex") != pv.Get("totalPart") {
+			body = `{"code":"0000","data":{},"msg":"ok"}`
+		}
+	} else if strings.HasSuffix(r.URL.Path, "/wohome/dispatcher") {
 		data, err := aesEncrypt([]byte(`{"url":"`+z.zoneURL+`"}`), aesKeyFor(chanWoHome, testAccessToken))
 		if err != nil {
 			return nil, err
@@ -1075,4 +1105,43 @@ func TestUnitUploadZoneLazyCache(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "https://zone-from-server.example", zone)
 	assert.Len(t, rec.urls, 1, "GetZoneInfo must be sent exactly once, then cached")
+}
+
+// TestUnitUploadMultipart drives the chunked path: a file above
+// singlePartMax goes as several 8 MiB POSTs sharing one uniqueId, and the
+// fid from the last part is the one returned.
+func TestUnitUploadMultipart(t *testing.T) {
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example"}
+	f := newUnitTestFs(rec)
+	f.zoneURL = "https://zone-from-server.example"
+	f.zoneLoaded = true
+
+	size := int64(65<<20) + 1 // floor(65MiB+1 / 8MiB) = 8 parts, last 1MiB+1
+	src := fsobject.NewStaticObjectInfo("a", time.Now(), size, true, nil, nil)
+	_, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, size)), "dirID", "big.bin", size, src)
+	require.NoError(t, err)
+
+	require.Len(t, rec.parts, 8, "expected 8 part POSTs")
+	var uniqueID string
+	totalSent := int64(0)
+	for i, pv := range rec.parts {
+		if i == 0 {
+			uniqueID = pv.Get("uniqueId")
+			require.NotEmpty(t, uniqueID)
+		} else {
+			assert.Equal(t, uniqueID, pv.Get("uniqueId"), "uniqueId must stay stable across parts")
+		}
+		assert.Equal(t, strconv.Itoa(i+1), pv.Get("partIndex"))
+		assert.Equal(t, "8", pv.Get("totalPart"))
+		assert.Equal(t, strconv.FormatInt(size, 10), pv.Get("fileSize"))
+		if i < 7 {
+			assert.Equal(t, "8388608", pv.Get("partSize"))
+		} else {
+			// SDK split: the last part absorbs 7*8MiB plus the remainder,
+			// i.e. 65MiB+1 - 7*8MiB = 9MiB+1.
+			assert.Equal(t, "9437185", pv.Get("partSize"), "the last part absorbs the remainder")
+		}
+		totalSent += pv.partBytes
+	}
+	assert.Equal(t, size, totalSent, "parts must cover the file exactly")
 }
