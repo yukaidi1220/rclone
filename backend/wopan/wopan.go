@@ -7,6 +7,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -459,6 +460,7 @@ type Options struct {
 	NoRefresh         bool                 `config:"no_refresh"`
 	HardDelete        bool                 `config:"hard_delete"`
 	UploadZone        string               `config:"upload_zone"`
+	DisableHTTP2      bool                 `config:"disable_http2"`
 	UploadCutoff      fs.SizeSuffix        `config:"upload_cutoff"`
 	ChunkSize         fs.SizeSuffix        `config:"chunk_size"`
 	UploadConcurrency int                  `config:"upload_concurrency"`
@@ -505,6 +507,15 @@ func init() {
 				"When set, all upload traffic - file contents and the access token - goes " +
 				"through the given host, so only point it at a server you trust, such as " +
 				"your own reverse proxy. The URL must present a valid TLS certificate.",
+			Advanced: true,
+		}, {
+			Name: "disable_http2",
+			Help: "Disable HTTP/2 for the upload connection pool.\n\n" +
+				"HTTP/2 multiplexes every concurrent part onto a single TCP connection, " +
+				"which caps aggregate upload throughput at one connection's worth of " +
+				"bandwidth. Set this to use HTTP/1.1 keep-alive instead, so the " +
+				"concurrent part uploads spread across multiple parallel TCP connections.",
+			Default:  false,
 			Advanced: true,
 		}, {
 			Name: "upload_cutoff",
@@ -950,7 +961,11 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		root:       parsePath(root),
 		opt:        *opt,
 		m:          m,
-		httpClient: fshttp.NewClient(ctx),
+		httpClient: fshttp.NewClientCustom(ctx, func(t *http.Transport) {
+			if opt.DisableHTTP2 {
+				t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+			}
+		}),
 		spaceType:  spacePersonal,
 		zoneMu:     new(sync.Mutex),
 	}
