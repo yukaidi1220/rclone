@@ -67,7 +67,10 @@ func TestDownloadPresignedHostRewrite(t *testing.T) {
 		w.Header().Set("ETag", `"5d41402abc4b2a76b9719d911017c592"`)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("X-Amz-Meta-Foo", "bar")
-		_, _ = w.Write([]byte("0123456789"))
+		// A real CDN answers a ranged GET with 206 and the requested window.
+		w.Header().Set("Content-Range", "bytes 0-3/10")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("0123"))
 	}))
 	defer cdn.Close()
 
@@ -90,6 +93,42 @@ func TestDownloadPresignedHostRewrite(t *testing.T) {
 	assert.Equal(t, "bytes=0-3", gotRange, "Range must travel as a plain header")
 
 	assert.Equal(t, "5d41402abc4b2a76b9719d911017c592", o.md5, "MD5-format ETag should be applied to the object")
+}
+
+// TestDownloadPresignedRangeIgnored checks that a CDN answering a ranged GET
+// with the full body (HTTP 200) surfaces fs.ErrorRangeIgnored instead of
+// handing out misplaced bytes - the multi-thread engine keys its
+// single-stream fallback on that error.
+func TestDownloadPresignedRangeIgnored(t *testing.T) {
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("0123456789")) // ignores Range, answers 200
+	}))
+	defer cdn.Close()
+
+	f := makeDownloadHostFs(t, cdn)
+	o := &Object{fs: f, remote: "08887b268e7c8196b6a0baf5/dir/file.bin", bytes: 10}
+
+	_, err := o.Open(context.Background(), &fs.RangeOption{Start: 4, End: 7})
+	require.ErrorIs(t, err, fs.ErrorRangeIgnored)
+}
+
+// TestDownloadPresignedRangeShifted checks that a mismatched Content-Range is
+// rejected: a 206 with the wrong window would otherwise corrupt the assembled
+// file without tripping any size or protocol error.
+func TestDownloadPresignedRangeShifted(t *testing.T) {
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 8-11/12")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("89ab"))
+	}))
+	defer cdn.Close()
+
+	f := makeDownloadHostFs(t, cdn)
+	o := &Object{fs: f, remote: "08887b268e7c8196b6a0baf5/dir/file.bin", bytes: 12}
+
+	_, err := o.Open(context.Background(), &fs.RangeOption{Start: 4, End: 7})
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, fs.ErrorRangeIgnored)
 }
 
 // TestDownloadPresignedExpiryClamp checks that Open succeeds for size

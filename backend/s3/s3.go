@@ -4632,6 +4632,14 @@ func (o *Object) downloadPresigned(ctx context.Context, bucket, bucketPath strin
 		StorageClass:       types.StorageClass(deref(header("X-Amz-Storage-Class"))),
 	}
 	o.setMetaData(&head)
+	// Verify the CDN actually honored a requested Range: ignoring it would
+	// corrupt multi-thread copies silently. fs.ErrorRangeIgnored lets the
+	// multi-thread engine fall back to a single stream.
+	if err := rest.CheckContentRange(resp, options, o.bytes); err != nil {
+		fs.Debugf(o, "range check failed: %v", err)
+		_ = resp.Body.Close()
+		return nil, err
+	}
 	return resp.Body, nil
 }
 
@@ -4693,11 +4701,13 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	// Set the SDK to always download compressed files as-is
 	APIOptions = append(APIOptions, o.fs.acceptEncoding()...)
 
+	rangeRequested := false
 	for _, option := range options {
 		switch option.(type) {
 		case *fs.RangeOption, *fs.SeekOption:
 			_, value := option.Header()
 			req.Range = &value
+			rangeRequested = true
 		case *fs.HTTPOption:
 			key, value := option.Header()
 			APIOptions = append(APIOptions, smithyhttp.AddHeaderValue(key, value))
@@ -4724,6 +4734,28 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 			return nil, fs.ErrorObjectNotFound
 		}
 		return nil, err
+	}
+
+	// Verify the response actually satisfies a requested Range: a server or
+	// an intermediary in front of it (CDN, gateway) answering a partial
+	// request with the full body or a shifted window would otherwise corrupt
+	// multi-thread copies and ranged reads silently. The status is inferred
+	// from Content-Range: 206 carries one, 200 does not.
+	// fs.ErrorRangeIgnored lets the multi-thread engine fall back to a single
+	// stream; other mismatches fail the request.
+	if rangeRequested {
+		hr := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}}
+		if resp.ContentRange != nil {
+			hr.StatusCode = http.StatusPartialContent
+			hr.Header.Set("Content-Range", *resp.ContentRange)
+		}
+		if resp.ContentLength != nil {
+			hr.ContentLength = *resp.ContentLength
+		}
+		if err := rest.CheckContentRange(hr, options, o.bytes); err != nil {
+			fs.Debugf(o, "range check failed: %v", err)
+			return nil, err
+		}
 	}
 
 	// read size from ContentLength or ContentRange
