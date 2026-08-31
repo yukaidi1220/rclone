@@ -21,6 +21,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/fserrors"
+	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	fsobject "github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/lib/dircache"
@@ -1372,4 +1373,54 @@ func TestUnitChunkWriterPartFailure(t *testing.T) {
 	assert.Equal(t, int64(0), n)
 	require.Error(t, w.Close(context.Background()), "without a fid Close must fail")
 	require.Len(t, rec.parts, 1)
+}
+
+// TestUnitDisableHTTP2Transport locks the disable_http2 option to the transport
+// wiring: when set, the wopan client's transport carries a non-nil empty
+// TLSNextProto map (Go's documented way to disable HTTP/2); by default the
+// transport must never carry that marker.
+func TestUnitDisableHTTP2Transport(t *testing.T) {
+	ctx := context.Background()
+
+	enabled := newHTTPClient(ctx, &Options{DisableHTTP2: true})
+	tr, ok := enabled.Transport.(*fshttp.Transport)
+	require.True(t, ok, "wopan client must use the fshttp transport")
+	require.NotNil(t, tr.TLSNextProto, "disable_http2 must set TLSNextProto to a non-nil empty map")
+	assert.Empty(t, tr.TLSNextProto, "disable_http2 must leave no h2 slot configured")
+
+	def := newHTTPClient(ctx, &Options{})
+	tr2, ok := def.Transport.(*fshttp.Transport)
+	require.True(t, ok)
+	// http.Transport lazily fills TLSNextProto with the h2 slots on first
+	// use, and the copy of http.DefaultTransport's map can make that state
+	// observable before use depending on test order. Either way the default
+	// client must never carry the empty map that disables HTTP/2.
+	if tr2.TLSNextProto != nil {
+		_, hasH2 := tr2.TLSNextProto["h2"]
+		assert.True(t, hasH2, "default transport must not disable HTTP/2")
+	}
+}
+
+// TestUnitDisableHTTP2Negotiation proves the disabled client really negotiates
+// HTTP/1.1 against a local HTTP/2-capable TLS server. The default side is left
+// to net/http's own behaviour (an empty TLSNextProto map disables HTTP/2), so
+// only the enabled direction - the behaviour this option controls - is asserted.
+func TestUnitDisableHTTP2Negotiation(t *testing.T) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	ci := fs.GetConfig(context.Background())
+	oldSkip := ci.InsecureSkipVerify
+	ci.InsecureSkipVerify = true
+	defer func() { ci.InsecureSkipVerify = oldSkip }()
+
+	c := newHTTPClient(context.Background(), &Options{DisableHTTP2: true})
+	res, err := c.Get(srv.URL)
+	require.NoError(t, err)
+	defer res.Body.Close()
+	assert.Equal(t, 1, res.ProtoMajor, "disable_http2 must negotiate HTTP/1.1")
 }
