@@ -32,6 +32,12 @@ jobs:
       - name: Test backend/s3
         run: go test ./backend/s3/
 
+      # Race detector for the concurrent chunked-upload pipeline. Not
+      # runnable on Windows dev machines (needs CGO); ubuntu runners ship
+      # gcc so it runs here.
+      - name: Test backend/wopan with race detector
+        run: go test -race -count=2 ./backend/wopan/
+
       - name: Build linux/amd64
         env:
           VERSION: ${{ github.ref_name }}
