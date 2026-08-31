@@ -36,6 +36,7 @@ import (
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/rest"
+	"golang.org/x/sync/errgroup"
 )
 
 // ------------------------------------------------------------ constants ----
@@ -450,14 +451,17 @@ func validateName(leaf string) error {
 
 // Options defines the configuration for this backend
 type Options struct {
-	RefreshToken string               `config:"refresh_token"`
-	AccessToken  string               `config:"access_token"`
-	FamilyID     string               `config:"family_id"`
-	RootFolderID string               `config:"root_folder_id"`
-	NoRefresh    bool                 `config:"no_refresh"`
-	HardDelete   bool                 `config:"hard_delete"`
-	UploadZone   string               `config:"upload_zone"`
-	Enc          encoder.MultiEncoder `config:"encoding"`
+	RefreshToken      string               `config:"refresh_token"`
+	AccessToken       string               `config:"access_token"`
+	FamilyID          string               `config:"family_id"`
+	RootFolderID      string               `config:"root_folder_id"`
+	NoRefresh         bool                 `config:"no_refresh"`
+	HardDelete        bool                 `config:"hard_delete"`
+	UploadZone        string               `config:"upload_zone"`
+	UploadCutoff      fs.SizeSuffix        `config:"upload_cutoff"`
+	ChunkSize         fs.SizeSuffix        `config:"chunk_size"`
+	UploadConcurrency int                  `config:"upload_concurrency"`
+	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
 func init() {
@@ -500,6 +504,37 @@ func init() {
 				"When set, all upload traffic - file contents and the access token - goes " +
 				"through the given host, so only point it at a server you trust, such as " +
 				"your own reverse proxy. The URL must present a valid TLS certificate.",
+			Advanced: true,
+		}, {
+			Name: "upload_cutoff",
+			Help: "Cutoff for switching to chunked upload.\n\n" +
+				"Any files larger than this will be uploaded in chunks of chunk_size. " +
+				"Smaller files are sent as a single request, where the server's ETag is " +
+				"the content MD5 immediately at upload time, while chunked files never " +
+				"carry a content MD5.",
+			Default:  fs.SizeSuffix(64 * 1024 * 1024),
+			Advanced: true,
+		}, {
+			Name: "chunk_size",
+			Help: "Chunk size to use for uploading.\n\n" +
+				"Files larger than upload_cutoff are uploaded in chunks of this size, " +
+				"the last chunk absorbing the remainder and possibly reaching twice " +
+				"this size, matching the official client. " +
+				"The minimum is 5Mi: smaller chunks have triggered a server error " +
+				"when the upload was completing.\n\n" +
+				"Note that '--wopan-upload-concurrency' chunks of this size are " +
+				"buffered in memory per transfer, and each buffer may reach " +
+				"twice this size.",
+			Default:  fs.SizeSuffix(8 * 1024 * 1024),
+			Advanced: true,
+		}, {
+			Name: "upload_concurrency",
+			Help: "Concurrency for chunked uploads.\n\n" +
+				"This is the number of chunks of the same file that are uploaded " +
+				"concurrently. The server accepts out-of-order parts within one " +
+				"upload session and assembles them by part index. Increasing this " +
+				"may speed up transfers of large files, at the cost of more memory.",
+			Default:  4,
 			Advanced: true,
 		}, {
 			Name:     config.ConfigEncoding,
@@ -893,6 +928,12 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 	opt := new(Options)
 	if err := configstruct.Set(m, opt); err != nil {
 		return nil, err
+	}
+	if opt.ChunkSize < 5*1024*1024 {
+		return nil, fmt.Errorf("wopan: chunk_size must be at least 5Mi, got %s", opt.ChunkSize)
+	}
+	if opt.UploadConcurrency < 1 {
+		return nil, fmt.Errorf("wopan: upload_concurrency must be at least 1, got %d", opt.UploadConcurrency)
 	}
 
 	f := &Fs{
@@ -1336,6 +1377,9 @@ func (o *Object) setMetaData(item *api.File) {
 	o.id = item.ID
 	o.fid = item.Fid
 	o.size = item.Size
+	// Chunked uploads never carry a content MD5 in the ETag (same rule as
+	// refreshFromUpload), so Hash() skips the ETag probe for them.
+	o.multipart = item.Size > int64(o.fs.opt.UploadCutoff)
 	o.thumbURL = item.ThumbURL
 	o.shootingTime, _ = api.ParseTime(item.ShootingTime)
 	o.createTime, _ = api.ParseTime(item.CreateTime)
@@ -1666,25 +1710,15 @@ func (f *Fs) uploadZone(ctx context.Context) (string, error) {
 	return f.zoneURL, nil
 }
 
-// singlePartMax caps the single-request upload fast path. Files above it go
-// as partSize chunks so the request body stays friendly to reverse proxies
-// with body limits.
-const singlePartMax = int64(64 << 20)
-
-// uploadSingle uploads a file of known size to the upload2C endpoint.
-//
-// Files up to singlePartMax are sent as one part, where the server's ETag is
-// the content MD5 immediately at upload time. Larger files are sent as
-// partSize chunks so the HTTP request body stays small enough for reverse
-// proxies with body limits, and each part is one POST; the last part carries
-// the remainder and its response holds the fid. uniqueId is generated once
-// per upload attempt because it must stay stable across parts, and changed
-// between attempts so a retried upload cannot mix with the orphaned parts of
-// the aborted session.
-func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string, size int64, src fs.ObjectInfo) (api.UploadData, error) {
-	zoneURL, err := f.uploadZone(ctx)
+// uploadSession holds the per-attempt state shared by every part of one
+// upload2C session: the zone endpoint, the encrypted fileInfo together with
+// the token it was encrypted with, and the uniqueId that binds the parts.
+// Every call generates a fresh uniqueId, so a retried upload cannot mix with
+// the orphaned parts of the aborted session.
+func (f *Fs) newUploadSession(ctx context.Context, dirID, name string, size int64, src fs.ObjectInfo) (zoneURL, fiEnc string, fiJSON []byte, uniqueID, token string, err error) {
+	zoneURL, err = f.uploadZone(ctx)
 	if err != nil {
-		return api.UploadData{}, err
+		return "", "", nil, "", "", err
 	}
 	fi := api.UploadFileInfo{
 		SpaceType:   f.spaceType,
@@ -1700,28 +1734,48 @@ func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string,
 	// shootingTime is the only mtime carrier and only takes effect at creation,
 	// so a zero source mtime is omitted rather than formatted to a bogus value.
 	fi.ShootingTime = formatShootingTime(src.ModTime(ctx))
-	fiJSON, err := json.Marshal(fi)
+	fiJSON, err = json.Marshal(fi)
 	if err != nil {
-		return api.UploadData{}, err
+		return "", "", nil, "", "", err
 	}
 	// Read the token once: the fileInfo is encrypted with the key derived from
 	// it and the form carries the same value, so a concurrent refresh between
 	// the two reads cannot produce a ciphertext the server cannot decrypt.
-	token := f.tok.accessTokenNow()
-	fiEnc, err := aesEncrypt(fiJSON, aesKeyFor(chanWoHome, token))
+	token = f.tok.accessTokenNow()
+	fiEnc, err = aesEncrypt(fiJSON, aesKeyFor(chanWoHome, token))
 	if err != nil {
-		return api.UploadData{}, err
+		return "", "", nil, "", "", err
 	}
 	// A random uniqueId: the server aggregates a shard session by it, so a
 	// collision between concurrent uploads (same millisecond under
 	// --transfers > 1) could merge or clobber sessions. A timestamp alone is
 	// not enough (fifth round B4).
-	uniqueID := random.String(16)
+	uniqueID = random.String(16)
+	return zoneURL, fiEnc, fiJSON, uniqueID, token, nil
+}
+
+// uploadSingle uploads a file of known size to the upload2C endpoint.
+//
+// Files up to upload_cutoff are sent as one part, where the server's ETag is
+// the content MD5 immediately at upload time. Larger files are read
+// sequentially and sent as chunk_size chunks by upload_concurrency workers,
+// so the request body stays friendly to reverse proxies with body limits;
+// each part is one POST and the last part's response holds the fid.
+// uniqueId is generated once per upload attempt because it must stay stable
+// across parts, and changed between attempts so a retried upload cannot mix
+// with the orphaned parts of the aborted session.
+func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string, size int64, src fs.ObjectInfo) (api.UploadData, error) {
+	zoneURL, fiEnc, fiJSON, uniqueID, token, err := f.newUploadSession(ctx, dirID, name, size, src)
+	if err != nil {
+		return api.UploadData{}, err
+	}
 	plans := []api.PartPlan{{Index: 1, PartSize: size}}
-	if size > singlePartMax {
-		plans = api.PlanParts(size, partSize)
+	if size > int64(f.opt.UploadCutoff) {
+		plans = api.PlanParts(size, int64(f.opt.ChunkSize))
 	}
 	total := int64(len(plans))
+	fs.Debugf(src, "wopan: upload session %s: %d part(s) of up to %v",
+		uniqueID, total, fs.SizeSuffix(f.opt.ChunkSize))
 
 	var data api.UploadData
 	// The upload channel never goes through the dispatcher, so an expired
@@ -1744,13 +1798,19 @@ func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string,
 			if _, serr := seeker.Seek(0, io.SeekStart); serr != nil {
 				return api.UploadData{}, serr
 			}
-			uniqueID = random.String(16)
+			zoneURL, fiEnc, fiJSON, uniqueID, token, err = f.newUploadSession(ctx, dirID, name, size, src)
+			if err != nil {
+				return api.UploadData{}, err
+			}
 			data = api.UploadData{}
+			// The fresh session gets a new uniqueId: without logging it, the
+			// retried POSTs cannot be correlated in server-side logs.
+			fs.Debugf(src, "wopan: upload session %s: %d part(s) of up to %v",
+				uniqueID, total, fs.SizeSuffix(f.opt.ChunkSize))
 		}
-		for i := range plans {
-			p := plans[i]
+		if total == 1 {
 			err = f.pacer.CallNoRetry(func() (bool, error) {
-				d, err := f.uploadPart(ctx, io.LimitReader(in, p.PartSize), zoneURL, dirID, name, size, fiEnc, uniqueID, token, p, total)
+				d, err := f.uploadPart(ctx, io.LimitReader(in, size), zoneURL, dirID, name, size, fiEnc, uniqueID, token, plans[0], total)
 				if err != nil {
 					var ae *apiError
 					if asAPIError(err, &ae) {
@@ -1761,21 +1821,21 @@ func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string,
 					// retry here - that is left to the outer copy retry loop.
 					return true, err
 				}
-				if d.Fid != "" {
-					// Intermediate parts answer with empty data; the last
-					// part carries the fid (and wcFileId).
-					data = d
-				}
+				data = d
 				return false, nil
 			})
-			if err != nil {
-				break
-			}
+		} else {
+			// The reader is consumed sequentially while the parts are sent
+			// concurrently, mirroring the s3 backend's multipart pipeline.
+			err = f.uploadPartsConcurrent(ctx, in, zoneURL, dirID, name, size, fiEnc, uniqueID, token, plans, total, &data)
 		}
 		fs.Debugf(f, "wopan: upload attempt #%d took %s (err=%v)", attempt+1, time.Since(uploadStart).Round(time.Millisecond), err)
 		if err == nil || !isAuthInvalid(err) || attempt > 0 || f.opt.NoRefresh {
 			break
 		}
+		// This retry re-runs the whole upload (possibly minutes), a
+		// user-visible retry/degradation event.
+		fs.Logf(f, "wopan: upload token rejected, refreshing the access token and retrying the upload")
 		if rerr := f.refreshToken(ctx, f.tok, token); rerr != nil {
 			return api.UploadData{}, rerr
 		}
@@ -1791,9 +1851,97 @@ func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string,
 	if data.WcFileID == "" || data.Fid == "" {
 		// A ghost object: rclone would build an Object that cannot be
 		// downloaded or updated. Fail loudly instead.
-		return api.UploadData{}, errors.New("wopan: upload response has an empty fid or wcFileId")
+		return api.UploadData{}, fmt.Errorf("wopan: upload session %s response has an empty fid or wcFileId", uniqueID)
 	}
 	return data, nil
+}
+
+// partJob pairs a part plan with the buffer holding its bytes, read
+// sequentially from the source.
+type partJob struct {
+	plan api.PartPlan
+	buf  []byte
+}
+
+// uploadPartsConcurrent sends the parts of one file through
+// upload_concurrency workers sharing the uniqueId session. The source is read
+// sequentially - the server assembles out-of-order parts by part index, so
+// only the sending needs concurrency. Any part failure cancels the remaining
+// ones; the retry decision is left to the caller's attempt loop.
+func (f *Fs) uploadPartsConcurrent(ctx context.Context, in io.Reader, zoneURL, dirID, name string, size int64, fiEnc, uniqueID, token string, plans []api.PartPlan, total int64, data *api.UploadData) error {
+	concurrency := f.opt.UploadConcurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if int64(concurrency) > total {
+		concurrency = int(total)
+	}
+
+	g, gctx := errgroup.WithContext(ctx)
+	// Fixed buffer pool sized for the largest part: the SDK split lets the
+	// last part absorb the remainder, so it can reach chunk_size plus one
+	// chunk's worth of remainder.
+	maxPart := plans[total-1].PartSize
+	free := make(chan []byte, concurrency)
+	for i := 0; i < concurrency; i++ {
+		free <- make([]byte, maxPart)
+	}
+	jobs := make(chan partJob)
+	var mu sync.Mutex
+
+	// Producer: fill buffers from the reader one part at a time.
+	g.Go(func() error {
+		defer close(jobs)
+		for _, plan := range plans {
+			var buf []byte
+			select {
+			case buf = <-free:
+			case <-gctx.Done():
+				return gctx.Err()
+			}
+			n, err := io.ReadFull(in, buf[:plan.PartSize])
+			if err != nil {
+				return fmt.Errorf("wopan: reading part %d: %w", plan.Index, err)
+			}
+			job := partJob{plan: plan, buf: buf[:n]}
+			select {
+			case jobs <- job:
+			case <-gctx.Done():
+				return gctx.Err()
+			}
+		}
+		return nil
+	})
+	for w := 0; w < concurrency; w++ {
+		g.Go(func() error {
+			for job := range jobs {
+				perr := f.pacer.CallNoRetry(func() (bool, error) {
+					d, err := f.uploadPart(gctx, bytes.NewReader(job.buf), zoneURL, dirID, name, size, fiEnc, uniqueID, token, job.plan, total)
+					if err != nil {
+						var ae *apiError
+						if asAPIError(err, &ae) {
+							return false, err
+						}
+						return true, err
+					}
+					if d.Fid != "" {
+						mu.Lock()
+						// Intermediate parts answer with empty data; the
+						// last completed part carries the fid (and wcFileId).
+						*data = d
+						mu.Unlock()
+					}
+					return false, nil
+				})
+				free <- job.buf
+				if perr != nil {
+					return perr
+				}
+			}
+			return nil
+		})
+	}
+	return g.Wait()
 }
 
 // uploadPart sends one part to the upload2C endpoint and decodes the response.
@@ -1844,24 +1992,171 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, zoneURL, dirID, name 
 		return api.UploadData{}, err
 	}
 	if res.StatusCode >= 300 {
-		// An HTTP-level rejection from upload2C is deterministic for the
-		// given request - the server answers a bare 500 for file names it
-		// cannot store (manual test G7: certain special-symbol and 4-byte
-		// names) - and NoRetryError stops the retry ladder and --retries
-		// from re-running a request that will never succeed. The cost is
-		// that a genuinely transient server 5xx also fails the transfer
-		// immediately; re-run the command to retry it.
-		return api.UploadData{}, fserrors.NoRetryError(
-			fmt.Errorf("wopan: upload: http %s: %s", res.Status, truncate(string(raw), 500)))
+		// part/session context is the only way to attribute a failed POST
+		// from the logs: the Put/Update path has no per-chunk logging above
+		// this layer (multi-thread's "chunk %d/%d failed" covers only that
+		// engine's path).
+		err := fmt.Errorf("wopan: upload: part %d/%d session %s: http %s: %s", plan.Index, total, uniqueID, res.Status, truncate(string(raw), 500))
+		// For single-part requests an HTTP-level rejection is deterministic
+		// for the given request - the server answers a bare 500 for file
+		// names it cannot store (manual test G7: certain special-symbol and
+		// 4-byte names) - and NoRetryError stops the retry ladder and
+		// --retries from re-running a request that will never succeed.
+		//
+		// A chunked upload posts one request per part, and probe E4 observed
+		// bare 500s there unrelated to the file name, so a 5xx in the
+		// chunked path stays retryable: a minutes-long upload should get its
+		// whole-file retry instead of dying without one. 4xx rejections
+		// remain deterministic.
+		if total <= 1 || res.StatusCode < 500 {
+			return api.UploadData{}, fserrors.NoRetryError(err)
+		}
+		return api.UploadData{}, err
 	}
 	var ur api.UploadResponse
 	if err := json.Unmarshal(raw, &ur); err != nil {
-		return api.UploadData{}, fmt.Errorf("wopan: decode upload response: %w", err)
+		return api.UploadData{}, fmt.Errorf("wopan: decode upload response (part %d/%d session %s): %w", plan.Index, total, uniqueID, err)
 	}
 	if ur.Code != successCode {
-		return api.UploadData{}, &apiError{Code: ur.Code, Desc: ur.Msg}
+		// Wrapped with %w so asAPIError can still unwrap the *apiError for
+		// isAuthInvalid while the message carries the part/session context.
+		return api.UploadData{}, fmt.Errorf("wopan: upload part %d/%d session %s: %w", plan.Index, total, uniqueID, &apiError{Code: ur.Code, Desc: ur.Msg})
 	}
+	fs.Debugf(f, "wopan: uploaded part %d/%d (%v) in session %s", plan.Index, total, fs.SizeSuffix(plan.PartSize), uniqueID)
 	return ur.Data, nil
+}
+
+// OpenChunkWriter returns a ChunkWriter for the multi-thread copy engine.
+//
+// The engine splits src into ceil(size/ChunkSize) chunks of ChunkSize bytes
+// (the last absorbing the remainder) and calls WriteChunk once per chunk, in
+// completion order, from up to Concurrency goroutines; the server assembles
+// the parts by part index, so completion order does not matter. One upload
+// session (a single uniqueId) spans the whole file, and the caller's retry of
+// a failed copy opens a fresh session via a new OpenChunkWriter call.
+func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
+	size := src.Size()
+	if size < 0 {
+		return info, nil, errors.New("wopan: can't upload files of unknown size")
+	}
+	if size == 0 {
+		return info, nil, fs.ErrorCantUploadEmptyFiles
+	}
+	if err := f.validateName(remote); err != nil {
+		return info, nil, err
+	}
+	leaf, dirID, err := f.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return info, nil, err
+	}
+	leaf = f.opt.Enc.FromStandardName(leaf)
+	// 重要1 (fifth round): the server truncates the ENCODED name, and the
+	// encoder can expand characters, so re-check the rune count on what is
+	// actually sent.
+	if err := validateName(leaf); err != nil {
+		return info, nil, err
+	}
+	zoneURL, fiEnc, _, uniqueID, token, err := f.newUploadSession(ctx, dirID, leaf, size, src)
+	if err != nil {
+		return info, nil, err
+	}
+	chunkSize := int64(f.opt.ChunkSize)
+	if size < chunkSize {
+		chunkSize = size
+	}
+	w := &wopanChunkWriter{
+		f:        f,
+		zoneURL:  zoneURL,
+		dirID:    dirID,
+		name:     leaf,
+		size:     size,
+		chunk:    chunkSize,
+		total:    (size + chunkSize - 1) / chunkSize,
+		fiEnc:    fiEnc,
+		uniqueID: uniqueID,
+		token:    token,
+	}
+	info = fs.ChunkWriterInfo{
+		ChunkSize:   chunkSize,
+		Concurrency: f.opt.UploadConcurrency,
+	}
+	fs.Debugf(src, "wopan: open chunk writer: %d parts of %v in session %s", w.total, fs.SizeSuffix(chunkSize), uniqueID)
+	return info, w, nil
+}
+
+// wopanChunkWriter uploads the parts of one file through a single upload2C
+// session, one POST per WriteChunk call.
+type wopanChunkWriter struct {
+	f        *Fs
+	zoneURL  string
+	dirID    string
+	name     string
+	size     int64
+	chunk    int64
+	total    int64
+	fiEnc    string
+	uniqueID string
+	token    string
+
+	mu   sync.Mutex
+	data api.UploadData // populated by the part whose response carries the fid
+}
+
+// planFor computes the part parameters of a 0-based chunk number.
+func (w *wopanChunkWriter) planFor(chunkNumber int) api.PartPlan {
+	plan := api.PartPlan{Index: int64(chunkNumber + 1), PartSize: w.chunk}
+	if int64(chunkNumber) == w.total-1 {
+		plan.PartSize = w.size - int64(chunkNumber)*w.chunk
+	}
+	return plan
+}
+
+// WriteChunk posts one part of the session. The engine may call it
+// concurrently and out of order; the server reassembles by part index and the
+// final part's response carries the fid, whichever arrives first.
+func (w *wopanChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (bytesWritten int64, err error) {
+	plan := w.planFor(chunkNumber)
+	perr := w.f.pacer.CallNoRetry(func() (bool, error) {
+		d, err := w.f.uploadPart(ctx, io.LimitReader(reader, plan.PartSize), w.zoneURL, w.dirID, w.name, w.size, w.fiEnc, w.uniqueID, w.token, plan, w.total)
+		if err != nil {
+			var ae *apiError
+			if asAPIError(err, &ae) {
+				// A business rejection never succeeds on retry.
+				return false, err
+			}
+			// A transport failure: signal the pacer to back off, but do not
+			// retry here - that is left to the outer copy retry loop.
+			return true, err
+		}
+		if d.Fid != "" {
+			w.mu.Lock()
+			w.data = d
+			w.mu.Unlock()
+		}
+		return false, nil
+	})
+	if perr != nil {
+		return 0, perr
+	}
+	return plan.PartSize, nil
+}
+
+// Close finishes the session. The last part posted already assembled the file
+// server-side, so this only checks that a fid came back.
+func (w *wopanChunkWriter) Close(ctx context.Context) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.data.WcFileID == "" || w.data.Fid == "" {
+		return fmt.Errorf("wopan: chunked upload session %s (%s) response has an empty fid or wcFileId", w.uniqueID, w.name)
+	}
+	return nil
+}
+
+// Abort abandons the session. There is no server-side abort API: the orphaned
+// parts stay invisible, consume no quota and expire on their own, so nothing
+// needs to be done here.
+func (w *wopanChunkWriter) Abort(ctx context.Context) error {
+	return nil
 }
 
 // ------------------------------------------------------------ rename --------
@@ -2041,7 +2336,7 @@ func (o *Object) refreshFromUpload(ctx context.Context, src fs.ObjectInfo, data 
 	o.uploadedAt = time.Now()
 	// Multi-part uploads never carry a content MD5 in the ETag, so remember
 	// the split and skip the probe in Hash().
-	o.multipart = size > singlePartMax
+	o.multipart = size > int64(o.fs.opt.UploadCutoff)
 	o.url = ""
 	o.urlExpiry = time.Time{}
 }
@@ -2766,5 +3061,6 @@ var (
 	_ fs.DirMover        = (*Fs)(nil)
 	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
+	_ fs.OpenChunkWriter = (*Fs)(nil)
 	_ dircache.DirCacher = (*Fs)(nil)
 )

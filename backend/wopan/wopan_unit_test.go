@@ -626,7 +626,11 @@ func TestUnitFileVersionMixed(t *testing.T) {
 // TestUnitRefreshFromUpload verifies the receiver refresh is pure memory (no
 // network) and leaves no stale download link behind.
 func TestUnitRefreshFromUpload(t *testing.T) {
+	// refreshFromUpload reads only f.opt.UploadCutoff (no network), so a
+	// bare Fs with the split defaults suffices.
+	f := newUnitTestFs(nil)
 	o := &Object{
+		fs:        f,
 		remote:    "dir/a.bin",
 		id:        "old-id",
 		fid:       "old-fid",
@@ -652,7 +656,13 @@ func TestUnitRefreshFromUpload(t *testing.T) {
 // dircache; callers seed directories with dirCache.Put to stay offline.
 func newUnitTestFs(transport http.RoundTripper) *Fs {
 	f := &Fs{
-		opt:       Options{},
+		// The upload split defaults mirror what newFs would produce from an
+		// empty config; unit tests bypass newFs so they are set here.
+		opt: Options{
+			UploadCutoff:      64 * 1024 * 1024,
+			ChunkSize:         8 * 1024 * 1024,
+			UploadConcurrency: 4,
+		},
 		spaceType: spacePersonal,
 		tok: &tokenState{
 			accessToken:  testAccessToken,
@@ -1032,16 +1042,28 @@ func TestUnitUploadHTTP500NoRetry(t *testing.T) {
 // empty data object, the last part with a fid, mirroring the server.
 type zoneRecorder struct {
 	zoneURL string
-	urls    []string
-	parts   []partValues
+	// failPart, if non-zero, makes that partIndex answer with a business
+	// error so the failure propagation of the concurrent pipeline can be
+	// driven.
+	failPart int
+	// failPart5xx, if non-zero, makes that partIndex answer with a bare
+	// HTTP 500, driving the transport-level failure path of the chunked
+	// upload.
+	failPart5xx int
+	mu          sync.Mutex
+	urls        []string
+	parts       []partValues
 }
 
 type partValues struct {
 	url.Values
-	partBytes int64
+	partBytes   int64
+	fileContent []byte
 }
 
 func (z *zoneRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
+	z.mu.Lock()
+	defer z.mu.Unlock()
 	z.urls = append(z.urls, r.URL.String())
 	body := `{"code":"0000","data":{"fid":"F","wcFileId":"W"},"msg":"ok"}`
 	if mr, err := r.MultipartReader(); err == nil {
@@ -1054,12 +1076,24 @@ func (z *zoneRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
 			b, _ := io.ReadAll(p)
 			if p.FileName() != "" {
 				pv.partBytes = int64(len(b))
+				pv.fileContent = b
 			} else {
 				pv.Set(p.FormName(), string(b))
 			}
 		}
 		z.parts = append(z.parts, pv)
-		if pv.Get("partIndex") != "" && pv.Get("partIndex") != pv.Get("totalPart") {
+		if idx, err := strconv.Atoi(pv.Get("partIndex")); err == nil && idx == z.failPart5xx {
+			return &http.Response{
+				StatusCode:    http.StatusInternalServerError,
+				Status:        "500 Internal Server Error",
+				Body:          io.NopCloser(strings.NewReader("server error")),
+				ContentLength: int64(len("server error")),
+				Header:        http.Header{"Content-Type": []string{"text/plain"}},
+			}, nil
+		}
+		if idx, err := strconv.Atoi(pv.Get("partIndex")); err == nil && idx == z.failPart {
+			body = `{"code":"9999","msg":"boom"}`
+		} else if pv.Get("partIndex") != "" && pv.Get("partIndex") != pv.Get("totalPart") {
 			body = `{"code":"0000","data":{},"msg":"ok"}`
 		}
 	} else if strings.HasSuffix(r.URL.Path, "/wohome/dispatcher") {
@@ -1108,7 +1142,7 @@ func TestUnitUploadZoneLazyCache(t *testing.T) {
 }
 
 // TestUnitUploadMultipart drives the chunked path: a file above
-// singlePartMax goes as several 8 MiB POSTs sharing one uniqueId, and the
+// upload_cutoff goes as several 8 MiB POSTs sharing one uniqueId, and the
 // fid from the last part is the one returned.
 func TestUnitUploadMultipart(t *testing.T) {
 	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example"}
@@ -1116,25 +1150,34 @@ func TestUnitUploadMultipart(t *testing.T) {
 	f.zoneURL = "https://zone-from-server.example"
 	f.zoneLoaded = true
 
-	size := int64(65<<20) + 1 // floor(65MiB+1 / 8MiB) = 8 parts, last 1MiB+1
+	size := int64(65<<20) + 1 // floor(65MiB+1 / 8MiB) = 8 parts, last 9MiB+1
 	src := fsobject.NewStaticObjectInfo("a", time.Now(), size, true, nil, nil)
 	_, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, size)), "dirID", "big.bin", size, src)
 	require.NoError(t, err)
 
 	require.Len(t, rec.parts, 8, "expected 8 part POSTs")
+	// Parts complete concurrently, so sort them by partIndex before asserting.
+	byIndex := make(map[int]partValues, len(rec.parts))
+	for _, pv := range rec.parts {
+		idx, err := strconv.Atoi(pv.Get("partIndex"))
+		require.NoError(t, err)
+		byIndex[idx] = pv
+	}
 	var uniqueID string
 	totalSent := int64(0)
-	for i, pv := range rec.parts {
-		if i == 0 {
+	for i := 1; i <= 8; i++ {
+		pv := byIndex[i]
+		require.NotNil(t, pv.Values, "part %d missing", i)
+		if i == 1 {
 			uniqueID = pv.Get("uniqueId")
 			require.NotEmpty(t, uniqueID)
 		} else {
 			assert.Equal(t, uniqueID, pv.Get("uniqueId"), "uniqueId must stay stable across parts")
 		}
-		assert.Equal(t, strconv.Itoa(i+1), pv.Get("partIndex"))
+		assert.Equal(t, strconv.Itoa(i), pv.Get("partIndex"))
 		assert.Equal(t, "8", pv.Get("totalPart"))
 		assert.Equal(t, strconv.FormatInt(size, 10), pv.Get("fileSize"))
-		if i < 7 {
+		if i < 8 {
 			assert.Equal(t, "8388608", pv.Get("partSize"))
 		} else {
 			// SDK split: the last part absorbs 7*8MiB plus the remainder,
@@ -1144,4 +1187,179 @@ func TestUnitUploadMultipart(t *testing.T) {
 		totalSent += pv.partBytes
 	}
 	assert.Equal(t, size, totalSent, "parts must cover the file exactly")
+}
+
+// TestUnitUploadPartFailure drives a business rejection in the middle of the
+// concurrent pipeline: the upload fails as a whole and must not be reported
+// as success.
+func TestUnitUploadPartFailure(t *testing.T) {
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example", failPart: 3}
+	f := newUnitTestFs(rec)
+	f.zoneURL = "https://zone-from-server.example"
+	f.zoneLoaded = true
+	// A serial worker pins the schedule so the early-stop count below is
+	// deterministic: with several workers the remaining in-flight parts
+	// would race the cancellation and the part count would be flaky. The
+	// concurrent success path is covered by TestUnitUploadMultipart.
+	f.opt.UploadConcurrency = 1
+
+	size := int64(65<<20) + 1 // 8 parts
+	src := fsobject.NewStaticObjectInfo("a", time.Now(), size, true, nil, nil)
+	_, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, size)), "dirID", "big.bin", size, src)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "boom")
+	assert.Equal(t, 3, len(rec.parts), "parts 4+ must never reach the server after part 3 failed")
+}
+
+// TestUnitUploadPart5xxRetryable locks the retry semantics of transport-level
+// failures: a bare HTTP 500 in the chunked path must NOT be marked NoRetry,
+// so --retries still re-runs the whole file (probe E4 saw transient 500s
+// there), while a 4xx and the single-part path keep their deterministic
+// NoRetry protection.
+func TestUnitUploadPart5xxRetryable(t *testing.T) {
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example", failPart5xx: 3}
+	f := newUnitTestFs(rec)
+	f.zoneURL = "https://zone-from-server.example"
+	f.zoneLoaded = true
+	// Serial worker, same determinism reasoning as TestUnitUploadPartFailure.
+	f.opt.UploadConcurrency = 1
+
+	size := int64(65<<20) + 1 // 8 parts
+	src := fsobject.NewStaticObjectInfo("a", time.Now(), size, true, nil, nil)
+	_, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, size)), "dirID", "big.bin", size, src)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "500 Internal Server Error")
+	assert.False(t, fserrors.IsNoRetryError(err), "a chunked-path 5xx must stay retryable")
+	assert.Equal(t, 3, len(rec.parts), "parts 4+ must never reach the server after part 3 failed")
+}
+
+// TestUnitNewFsOptionValidation checks the fail-fast validation of the
+// chunked-upload options before any network call.
+func TestUnitNewFsOptionValidation(t *testing.T) {
+	for _, tc := range []struct {
+		key, value, wantErr string
+	}{
+		{"chunk_size", "1Ki", "chunk_size"},
+		// 4Mi chunks reproduced a bare HTTP 500 at upload completion twice
+		// (probe E4), so the floor sits at 5Mi.
+		{"chunk_size", "4Mi", "chunk_size"},
+		{"upload_concurrency", "0", "upload_concurrency"},
+	} {
+		// configstruct.Set does not fill option defaults, so the sibling
+		// option must be given a valid value explicitly.
+		m := configmap.Simple{"chunk_size": "8Mi", "upload_concurrency": "4"}
+		m[tc.key] = tc.value
+		_, err := newFs(context.Background(), "wopan-test", "", m)
+		require.Error(t, err, tc.key)
+		assert.Contains(t, err.Error(), tc.wantErr)
+	}
+}
+
+// TestUnitChunkWriterOpen checks the OpenChunkWriter contract: unknown
+// sizes and empty files are rejected, a file below chunk_size collapses to
+// a single-part plan, opening a writer issues no upload requests, and
+// Close without any posted part fails rather than faking success.
+func TestUnitChunkWriterOpen(t *testing.T) {
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example"}
+	f := newUnitTestFs(rec)
+	f.zoneURL = "https://zone-from-server.example"
+	f.zoneLoaded = true
+	ctx := context.Background()
+
+	_, _, err := f.OpenChunkWriter(ctx, "u.bin", fsobject.NewStaticObjectInfo("u.bin", time.Now(), -1, true, nil, nil))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown size")
+
+	_, _, err = f.OpenChunkWriter(ctx, "e.bin", fsobject.NewStaticObjectInfo("e.bin", time.Now(), 0, true, nil, nil))
+	require.ErrorIs(t, err, fs.ErrorCantUploadEmptyFiles)
+
+	src := fsobject.NewStaticObjectInfo("s.bin", time.Now(), 100, true, nil, nil)
+	info, w, err := f.OpenChunkWriter(ctx, "s.bin", src)
+	require.NoError(t, err)
+	require.NotNil(t, w)
+	assert.Equal(t, int64(100), info.ChunkSize, "a file below chunk_size is one part")
+	assert.Equal(t, 4, info.Concurrency)
+	require.Error(t, w.Close(ctx), "Close without a fid must fail")
+	assert.Empty(t, rec.urls, "opening a writer must not issue upload requests")
+}
+
+// TestUnitChunkWriterOutOfOrder posts the three parts out of order through
+// the ChunkWriter contract the multi-thread engine uses, and locks the
+// session semantics: one stable uniqueId, exact per-part boundaries and
+// content, and a successful Close driven by the fid of the final part even
+// though it was posted first.
+func TestUnitChunkWriterOutOfOrder(t *testing.T) {
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example"}
+	f := newUnitTestFs(rec)
+	f.zoneURL = "https://zone-from-server.example"
+	f.zoneLoaded = true
+	f.opt.ChunkSize = 8
+
+	payload := []byte("0123456789ABCDEFGHIJ") // 20 bytes -> parts 8, 8, 4
+	src := fsobject.NewStaticObjectInfo("oo.bin", time.Now(), int64(len(payload)), true, nil, nil)
+	info, w0, err := f.OpenChunkWriter(context.Background(), "oo.bin", src)
+	require.NoError(t, err)
+	w := w0.(*wopanChunkWriter)
+	assert.Equal(t, int64(8), info.ChunkSize)
+
+	ctx := context.Background()
+	n, err := w.WriteChunk(ctx, 2, bytes.NewReader(payload[16:]))
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), n)
+	n, err = w.WriteChunk(ctx, 1, bytes.NewReader(payload[8:16]))
+	require.NoError(t, err)
+	assert.Equal(t, int64(8), n)
+	n, err = w.WriteChunk(ctx, 0, bytes.NewReader(payload[:8]))
+	require.NoError(t, err)
+	assert.Equal(t, int64(8), n)
+
+	require.NoError(t, w.Close(ctx))
+	require.NoError(t, w.Abort(ctx), "abort is a no-op: orphaned parts expire on their own")
+
+	require.Len(t, rec.parts, 3)
+	byIndex := make(map[int]partValues, 3)
+	var uniqueID string
+	for _, pv := range rec.parts {
+		idx, err := strconv.Atoi(pv.Get("partIndex"))
+		require.NoError(t, err)
+		byIndex[idx] = pv
+		if uniqueID == "" {
+			uniqueID = pv.Get("uniqueId")
+			require.NotEmpty(t, uniqueID)
+		} else {
+			assert.Equal(t, uniqueID, pv.Get("uniqueId"), "one session spans the whole file")
+		}
+		assert.Equal(t, "3", pv.Get("totalPart"))
+		assert.Equal(t, strconv.Itoa(len(payload)), pv.Get("fileSize"))
+	}
+	assert.Equal(t, payload[:8], byIndex[1].fileContent, "part 1 content")
+	assert.Equal(t, payload[8:16], byIndex[2].fileContent, "part 2 content")
+	assert.Equal(t, payload[16:], byIndex[3].fileContent, "part 3 content")
+	assert.Equal(t, "8", byIndex[1].Get("partSize"))
+	assert.Equal(t, "8", byIndex[2].Get("partSize"))
+	assert.Equal(t, "4", byIndex[3].Get("partSize"), "the final part absorbs the remainder")
+}
+
+// TestUnitChunkWriterPartFailure drives a business rejection through the
+// ChunkWriter path: the error propagates, no fid is recorded and Close
+// refuses to report success.
+func TestUnitChunkWriterPartFailure(t *testing.T) {
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example", failPart: 2}
+	f := newUnitTestFs(rec)
+	f.zoneURL = "https://zone-from-server.example"
+	f.zoneLoaded = true
+	f.opt.ChunkSize = 8
+
+	payload := []byte("0123456789ABCDEFGHIJ")
+	src := fsobject.NewStaticObjectInfo("pf.bin", time.Now(), int64(len(payload)), true, nil, nil)
+	_, w0, err := f.OpenChunkWriter(context.Background(), "pf.bin", src)
+	require.NoError(t, err)
+	w := w0.(*wopanChunkWriter)
+
+	n, err := w.WriteChunk(context.Background(), 1, bytes.NewReader(payload[8:16]))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "boom")
+	assert.Equal(t, int64(0), n)
+	require.Error(t, w.Close(context.Background()), "without a fid Close must fail")
+	require.Len(t, rec.parts, 1)
 }
