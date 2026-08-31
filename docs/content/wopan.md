@@ -83,6 +83,20 @@ The advanced options are:
   contents and the access token included - goes through the given host, so
   only point it at a server you trust, such as your own reverse proxy. The
   URL must present a valid TLS certificate.
+- `--wopan-upload_cutoff`: files above this size are uploaded in chunks of
+  `--wopan-chunk_size` instead of a single request. Defaults to `64Mi`.
+  Smaller files are sent as one request, where the server's ETag is the
+  content MD5 immediately at upload time, while chunked files never carry a
+  content MD5 at upload time - see
+  [Chunked uploads](#chunked-uploads) below.
+- `--wopan-chunk_size`: chunk size for chunked uploads. Defaults to `8Mi`
+  (the minimum is `5Mi`; smaller chunks have triggered a server error at
+  upload completion). The last chunk absorbs the remainder and may reach
+  roughly twice this size, matching the official client.
+- `--wopan-upload_concurrency`: how many chunks of the same file are uploaded
+  concurrently. Defaults to `4` (the minimum is `1`). The server accepts
+  out-of-order parts within one upload session and assembles them by part
+  index - see [Chunked uploads](#chunked-uploads) below.
 - `--wopan-encoding`: the encoding for the backend. The default is `Standard`
   plus `EncodeInvalidUtf8` and should normally be left alone. The server
   stores file names verbatim (including trailing spaces, dots and tabs), so
@@ -101,14 +115,92 @@ is the recommended way to run sync and copy against wopan**; without it,
 rclone compares sizes and modification times.
 
 Files of 8 MiB or more are stored in server-side shards, however they were
-uploaded. The shard aggregate's ETag is not immediately the content MD5: for
-rclone's own uploads it settles to the real MD5 over a period that can run
-into minutes, while files uploaded by other clients as true multi-part
-uploads keep a multipart digest, which is not a content hash at all. rclone
-treats an unsettled or multipart ETag as "no hash available", so `--checksum`
-**silently degrades to size-only comparison** for those files and time
-windows - this is by design so that verification does not delete valid
-objects.
+uploaded, and the ETag depends on how many parts the upload had:
+
+- **Single-part uploads** (rclone uploads up to `--wopan-upload_cutoff`)
+  carry the true content MD5 in the ETag, ready within seconds of
+  completion. The download link can transiently fail for a few minutes
+  after a large upload; rclone tolerates that window instead of reporting
+  a missing hash.
+- **Multi-part uploads** - rclone uploads above the cutoff, and any file
+  uploaded by other clients as true multipart - keep an S3-style composite
+  ETag (`md5-N`) forever. Its MD5 part is a digest of the part digests,
+  never the content MD5.
+
+rclone reports a composite ETag as "no hash available", so `--checksum`
+**silently degrades to size-only comparison** for those files - this is by
+design so that verification does not delete valid objects.
+
+## Chunked uploads
+
+Files no larger than `--wopan-upload_cutoff` are sent as a single upload
+request. Larger files go through the service's chunked upload protocol:
+
+1. rclone splits the file locally into parts of `--wopan-chunk_size` with
+   the official client's floor-division rule; the last part absorbs any
+   leftover bytes and can reach roughly twice `chunk_size`. No upload plan
+   is fetched from the server.
+2. All parts travel through one upload session (a single `uniqueId`), posted
+   by `--wopan-upload_concurrency` workers. The source is read sequentially
+   and parts are posted concurrently, so arrival order is shuffled; the
+   server reassembles the file by part index, and out-of-order arrival has
+   been verified against the live service.
+3. When the final part is accepted the server assembles the file and returns
+   the finished file ID.
+
+Memory usage is about `chunk_size * upload_concurrency` per transferring
+file (and `--transfers` files may upload at once); each buffer is sized for
+the largest part, so it may reach twice `chunk_size`. A failure on any part
+aborts the whole upload and rclone surfaces the error for that file.
+Abandoned parts remain on the server side - invisible and not counted
+against quota - and the retry starts a new upload session with a fresh id.
+A transient server 5xx keeps the file retryable, so `--retries` re-runs the
+whole upload; a 4xx rejection is treated as deterministic and not retried.
+
+Chunked uploads leave the file in the server's shard storage with a
+composite ETag, which is never a content MD5 - the caveats in
+[Modified time and hashes](#modified-time-and-hashes) apply: `--checksum`
+treats these files as having no hash and compares by size only.
+
+### Tuning
+
+- Lower `--wopan-upload_cutoff` if you want MD5 available at upload time for
+  more files (single-request uploads carry it immediately).
+- Raise `--wopan-upload_concurrency` for large files if the network path
+  allows more than one stream to help - behind a reverse proxy or on a
+  high-latency link this can improve throughput; on a saturated access link
+  it changes little.
+- Raise `--wopan-chunk_size` to reduce request count for very large files,
+  at the cost of more memory per part.
+
+All three options work both as command line flags (`--wopan-chunk_size 16Mi`)
+and as config file keys (`chunk_size = 16Mi` under the remote's section),
+like every other rclone backend option. Invalid values (`chunk_size` below
+`5Mi`, `upload_concurrency` below `1`) fail fast when the remote is created.
+
+### Multi-thread copy
+
+The backend implements rclone's `OpenChunkWriter` interface, so when copying
+**from** a ranged-download source (S3, HTTP, another local, ...) to wopan,
+files at or above `--multi-thread-cutoff` (default `256Mi`) use rclone's
+multi-thread copy engine instead of a single download stream: the source is
+downloaded in parallel ranged streams and each chunk is handed directly to a
+wopan upload part of one upload session, so the file is never buffered on
+local disk.
+
+The wopan side controls the part layout: chunk boundaries follow
+`--wopan-chunk_size` (each engine chunk is one part, `partIndex` counting up
+to `totalPart`) and the server reassembles by part index, so shuffled
+arrival order is fine. The stream count comes from `--multi-thread-streams`
+(default `4`), raised to `--wopan-upload_concurrency` when that is higher.
+`--multi-thread-chunk_size` does not apply here because the destination
+supplies the chunk size.
+
+If the source server ignores a ranged request (rclone detects this and
+fails the chunk with `fs.ErrorRangeIgnored`), rclone logs
+`multi-thread copy: ...: downloading in a single stream` and re-runs the
+file through the normal single-stream path, so a misbehaving source or CDN
+degrades to the slower transfer instead of corrupting data.
 
 ## Restrictions
 
@@ -212,3 +304,10 @@ To share an account safely:
    share one token state and refresh in lockstep, so you can mix personal
    and family remotes freely; only *third party* programs need the
    coordination above.
+
+## Security notes
+
+The upload endpoint takes the `access_token` as a URL query parameter (a
+protocol constraint of the wopan upload channel), so `--dump requests`
+writes it into the log. Avoid `--dump requests` on shared terminals, and
+treat captured logs as credential material.
