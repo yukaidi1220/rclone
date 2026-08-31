@@ -510,10 +510,10 @@ func init() {
 			Advanced: true,
 		}, {
 			Name: "disable_http2",
-			Help: "Disable HTTP/2 for the upload connection pool.\n\n" +
-				"HTTP/2 multiplexes every concurrent part onto a single TCP connection, " +
-				"which caps aggregate upload throughput at one connection's worth of " +
-				"bandwidth. Set this to use HTTP/1.1 keep-alive instead, so the " +
+			Help: "Disable HTTP/2 for all wopan traffic.\n\n" +
+				"HTTP/2 multiplexes every concurrent part upload onto a single TCP " +
+				"connection, which caps aggregate upload throughput at one connection's " +
+				"worth of bandwidth. Set this to use HTTP/1.1 keep-alive instead, so the " +
 				"concurrent part uploads spread across multiple parallel TCP connections.",
 			Default:  false,
 			Advanced: true,
@@ -939,6 +939,17 @@ func (f *Fs) queryUserID(ctx context.Context) (string, error) {
 	return u.UserID, nil
 }
 
+// newHTTPClient builds the http client for the wopan backend, optionally
+// disabling HTTP/2 so concurrent part uploads spread across parallel TCP
+// connections instead of multiplexing onto a single one.
+func newHTTPClient(ctx context.Context, opt *Options) *http.Client {
+	return fshttp.NewClientCustom(ctx, func(t *http.Transport) {
+		if opt.DisableHTTP2 {
+			t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+		}
+	})
+}
+
 // newFs partially constructs Fs from the path
 //
 // It constructs a valid Fs but doesn't attempt to figure out whether
@@ -961,11 +972,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		root:       parsePath(root),
 		opt:        *opt,
 		m:          m,
-		httpClient: fshttp.NewClientCustom(ctx, func(t *http.Transport) {
-			if opt.DisableHTTP2 {
-				t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
-			}
-		}),
+		httpClient: newHTTPClient(ctx, opt),
 		spaceType:  spacePersonal,
 		zoneMu:     new(sync.Mutex),
 	}
