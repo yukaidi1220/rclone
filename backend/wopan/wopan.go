@@ -2051,7 +2051,10 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, zoneURL, dirID, name 
 		// isAuthInvalid while the message carries the part/session context.
 		return api.UploadData{}, fmt.Errorf("wopan: upload part %d/%d session %s: %w", plan.Index, total, uniqueID, &apiError{Code: ur.Code, Desc: ur.Msg})
 	}
-	fs.Debugf(f, "wopan: uploaded part %d/%d (%v) in session %s via %s -> %s (reused=%v) in %v", plan.Index, total, fs.SizeSuffix(plan.PartSize), uniqueID, zoneHost, peerAddr, reusedConn, time.Since(t0).Round(time.Millisecond))
+	elapsed := time.Since(t0)
+	fs.Debugf(f, "wopan: uploaded part %d/%d (%v) in session %s via %s -> %s (reused=%v) in %v (%s)",
+		plan.Index, total, fs.SizeSuffix(plan.PartSize), uniqueID, zoneHost, peerAddr, reusedConn,
+		elapsed.Round(time.Millisecond), fs.SizeSuffix(float64(plan.PartSize)/elapsed.Seconds()).ByteRateUnit())
 	return ur.Data, nil
 }
 
