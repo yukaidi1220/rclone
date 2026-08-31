@@ -4535,15 +4535,15 @@ func (o *Object) downloadPresigned(ctx context.Context, bucket, bucketPath strin
 	fs.FixRangeOption(options, o.bytes)
 
 	// Presigned URL must outlive the transfer. Estimate from the object
-	// size at ~10MB/s with 30% headroom, clamped to [1h, 12h].
-	expire := time.Hour
+	// size at ~5MB/s with 30% headroom, clamped to [2h, 72h].
+	expire := 2 * time.Hour
 	if o.bytes > 0 {
-		estimated := time.Duration(float64(o.bytes) / (10 << 20) * 1.3 * float64(time.Second))
+		estimated := time.Duration(float64(o.bytes) / (5 << 20) * 1.3 * float64(time.Second))
 		if estimated > expire {
 			expire = estimated
 		}
-		if expire > 12*time.Hour {
-			expire = 12 * time.Hour
+		if expire > 72*time.Hour {
+			expire = 72 * time.Hour
 		}
 	}
 

@@ -15,6 +15,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"path"
 	"strconv"
@@ -1990,6 +1991,26 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, zoneURL, dirID, name 
 	req.Header.Set("Referer", "https://pan.wo.cn/")
 	req.Header.Set("User-Agent", defaultUserAgent)
 
+	// Capture which endpoint (zone host + peer IP) actually served this part:
+	// with a CDN/reverse proxy in front of the upload zone the DNS answer
+	// rotates, so per-part attribution is the only way to correlate speed
+	// with the edge the request landed on.
+	zoneHost := zoneURL
+	if u, perr := url.Parse(zoneURL); perr == nil {
+		zoneHost = u.Host
+	}
+	var peerAddr string
+	var reusedConn bool
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			if info.Conn != nil {
+				peerAddr = info.Conn.RemoteAddr().String()
+			}
+			reusedConn = info.Reused
+		},
+	}))
+
+	t0 := time.Now()
 	res, err := f.httpClient.Do(req)
 	if err != nil {
 		return api.UploadData{}, err
@@ -2004,7 +2025,7 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, zoneURL, dirID, name 
 		// from the logs: the Put/Update path has no per-chunk logging above
 		// this layer (multi-thread's "chunk %d/%d failed" covers only that
 		// engine's path).
-		err := fmt.Errorf("wopan: upload: part %d/%d session %s: http %s: %s", plan.Index, total, uniqueID, res.Status, truncate(string(raw), 500))
+		err := fmt.Errorf("wopan: upload: part %d/%d session %s via %s -> %s: http %s: %s", plan.Index, total, uniqueID, zoneHost, peerAddr, res.Status, truncate(string(raw), 500))
 		// For single-part requests an HTTP-level rejection is deterministic
 		// for the given request - the server answers a bare 500 for file
 		// names it cannot store (manual test G7: certain special-symbol and
@@ -2030,7 +2051,7 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, zoneURL, dirID, name 
 		// isAuthInvalid while the message carries the part/session context.
 		return api.UploadData{}, fmt.Errorf("wopan: upload part %d/%d session %s: %w", plan.Index, total, uniqueID, &apiError{Code: ur.Code, Desc: ur.Msg})
 	}
-	fs.Debugf(f, "wopan: uploaded part %d/%d (%v) in session %s", plan.Index, total, fs.SizeSuffix(plan.PartSize), uniqueID)
+	fs.Debugf(f, "wopan: uploaded part %d/%d (%v) in session %s via %s -> %s (reused=%v) in %v", plan.Index, total, fs.SizeSuffix(plan.PartSize), uniqueID, zoneHost, peerAddr, reusedConn, time.Since(t0).Round(time.Millisecond))
 	return ur.Data, nil
 }
 
