@@ -140,7 +140,7 @@ func TestProbeCase58CopyFileOntoExistingName(t *testing.T) {
 		p := f.moveCopyParams(dirID, []string{}, []string{src.id})
 		return f.pacer.Call(func() (bool, error) {
 			_, err := f.call(ctx, chanWoHome, "CopyFile", p, map[string]any{"secret": true})
-			return shouldRetryCall(err)
+			return shouldRetryCall(ctx, err)
 		})
 	}
 
@@ -255,7 +255,7 @@ func TestProbeSpaceTypeRedundantFamilyId(t *testing.T) {
 	err := f.pacer.Call(func() (bool, error) {
 		data, err := f.call(ctx, chanWoHome, "CreateDirectory", p, map[string]any{"secret": true})
 		if err != nil {
-			return shouldRetryCall(err)
+			return shouldRetryCall(ctx, err)
 		}
 		return false, json.Unmarshal(data, &resp)
 	})

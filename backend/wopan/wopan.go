@@ -857,13 +857,21 @@ func (f *Fs) validateName(remote string) error {
 // and the caller would then report failure for an operation that actually
 // took effect (a deleted directory, say) - possibly many times over.
 //
+// A dead ctx also means no retry: the caller gave up (a concurrent hash-check
+// abort cancels the probe mid-flight, --max-duration expired, Ctrl+C), and
+// every further attempt would fail instantly, burning the whole
+// low-level-retries budget on log spam without a chance of success.
+//
 // Business errors arrive as HTTP 200 with a non-zero RSP_CODE, meaning the
 // request was understood and either took effect or never will, so retrying
 // them would only rotate tokens and duplicate side effects. Everything else is
 // treated as a transport level failure and retried.
-func shouldRetryCall(err error) (bool, error) {
+func shouldRetryCall(ctx context.Context, err error) (bool, error) {
 	if err == nil {
 		return false, nil
+	}
+	if ctx.Err() != nil {
+		return false, err
 	}
 	var ae *apiError
 	if asAPIError(err, &ae) {
@@ -1077,7 +1085,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, fn listAllFn) (found boo
 		err = f.pacer.Call(func() (bool, error) {
 			data, err := f.call(ctx, chanWoHome, "QueryAllFiles", p, map[string]any{"secret": true})
 			if err != nil {
-				return shouldRetryCall(err)
+				return shouldRetryCall(ctx, err)
 			}
 			// systemDirs is deliberately left out of this struct: those entries
 			// are not part of the user's tree, and returning them would make
@@ -1269,7 +1277,7 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 				resp.ID = id
 				return false, nil
 			}
-			return shouldRetryCall(err)
+			return shouldRetryCall(ctx, err)
 		}
 		if err := json.Unmarshal(data, &resp); err != nil {
 			return false, fmt.Errorf("wopan: decode create directory: %w", err)
@@ -1604,7 +1612,7 @@ func (f *Fs) deleteFile(ctx context.Context, id string) error {
 	p["fileList"] = []string{id}
 	if err := f.pacer.Call(func() (bool, error) {
 		_, err := f.call(ctx, chanWoHome, "DeleteFile", p, map[string]any{"secret": true})
-		return shouldRetryCall(err)
+		return shouldRetryCall(ctx, err)
 	}); err != nil {
 		return err
 	}
@@ -2170,7 +2178,7 @@ func (f *Fs) renameObject(ctx context.Context, id, name string) error {
 	p["name"] = name
 	return f.pacer.Call(func() (bool, error) {
 		_, err := f.call(ctx, chanWoHome, "RenameFileOrDirectory", p, map[string]any{"secret": true})
-		return shouldRetryCall(err)
+		return shouldRetryCall(ctx, err)
 	})
 }
 
@@ -2234,7 +2242,7 @@ func (f *Fs) fetchDownloadURL(ctx context.Context, fid string) (string, error) {
 	err := f.pacer.Call(func() (bool, error) {
 		data, err := f.call(ctx, chanWoHome, "GetDownloadUrlV2", p, map[string]any{"secret": true})
 		if err != nil {
-			return shouldRetryCall(err)
+			return shouldRetryCall(ctx, err)
 		}
 		if err := json.Unmarshal(data, &resp); err != nil {
 			return false, fmt.Errorf("wopan: decode download url: %w", err)
@@ -2383,7 +2391,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	p["fileList"] = []string{}
 	err = f.pacer.Call(func() (bool, error) {
 		_, err := f.call(ctx, chanWoHome, "DeleteFile", p, map[string]any{"secret": true})
-		return shouldRetryCall(err)
+		return shouldRetryCall(ctx, err)
 	})
 	if err != nil {
 		return err
@@ -2423,7 +2431,7 @@ func (f *Fs) listRecyclePage(ctx context.Context, pageNum int) ([]api.RecycleIte
 	err := f.pacer.Call(func() (bool, error) {
 		data, err := f.call(ctx, chanWoHome, "QueryRecycleData", p, map[string]any{"secret": true})
 		if err != nil {
-			return shouldRetryCall(err)
+			return shouldRetryCall(ctx, err)
 		}
 		if err := json.Unmarshal(data, &items); err != nil {
 			return false, fmt.Errorf("wopan: decode recycle listing: %w", err)
@@ -2530,7 +2538,7 @@ func (f *Fs) deleteRecycleNos(ctx context.Context, nos []string) error {
 	}
 	return f.pacer.Call(func() (bool, error) {
 		_, err := f.call(ctx, chanWoHome, "DeleteRecycleData", p, map[string]any{"secret": true})
-		return shouldRetryCall(err)
+		return shouldRetryCall(ctx, err)
 	})
 }
 
@@ -2737,7 +2745,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (dst fs.Obj
 	// copy.go falls back to a bandwidth copy when it sees the bare sentinel.
 	err = f.pacer.CallNoRetry(func() (bool, error) {
 		_, err := f.call(ctx, chanWoHome, "CopyFile", p, map[string]any{"secret": true})
-		return shouldRetryCall(err)
+		return shouldRetryCall(ctx, err)
 	})
 	fs.Debugf(f, "wopan: CopyFile took %s", time.Since(phaseStart).Round(time.Millisecond))
 	if err != nil {
@@ -2867,7 +2875,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (dst fs.Obj
 		p := f.moveCopyParams(dstDirID, []string{}, []string{srcObj.id})
 		if err := f.pacer.Call(func() (bool, error) {
 			_, err := f.call(ctx, chanWoHome, "MoveFile", p, map[string]any{"secret": true})
-			return shouldRetryCall(err)
+			return shouldRetryCall(ctx, err)
 		}); err != nil {
 			return nil, fmt.Errorf("wopan: move object: %w", err)
 		}
@@ -2979,7 +2987,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		p := f.moveCopyParams(dstDirectoryID, []string{srcID}, []string{})
 		if err := f.pacer.Call(func() (bool, error) {
 			_, err := f.call(ctx, chanWoHome, "MoveFile", p, map[string]any{"secret": true})
-			return shouldRetryCall(err)
+			return shouldRetryCall(ctx, err)
 		}); err != nil {
 			return fmt.Errorf("wopan: move directory: %w", err)
 		}
@@ -3002,7 +3010,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		rp["name"] = dstLeafEnc
 		if err := f.pacer.Call(func() (bool, error) {
 			_, err := f.call(ctx, chanWoHome, "RenameFileOrDirectory", rp, map[string]any{"secret": true})
-			return shouldRetryCall(err)
+			return shouldRetryCall(ctx, err)
 		}); err != nil {
 			return fmt.Errorf("wopan: rename directory: %w", err)
 		}
@@ -3027,7 +3035,7 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 	err = f.pacer.Call(func() (bool, error) {
 		data, err := f.call(ctx, chanWoHome, "QueryCloudUsageInfo", p, map[string]any{"secret": true})
 		if err != nil {
-			return shouldRetryCall(err)
+			return shouldRetryCall(ctx, err)
 		}
 		if err := json.Unmarshal(data, &resp); err != nil {
 			return false, fmt.Errorf("wopan: decode usage: %w", err)
