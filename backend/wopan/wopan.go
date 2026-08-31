@@ -89,10 +89,13 @@ const (
 	// not be ready, and an error would make verify delete the just-uploaded file.
 	hashGracePeriod = 60 * time.Second
 
-	// largeHashGracePeriod covers multi-shard objects: every file of 8 MiB
-	// or more is stored in server-side shards regardless of how it was
-	// uploaded, and the shard aggregate's ETag settles to the content MD5
-	// only after a settling period that can run into minutes.
+	// largeHashGracePeriod covers big uploads: every file of 8 MiB or
+	// more is stored server-side in shards and the download link can
+	// transiently fail for minutes after the upload. A single-part
+	// upload (everything rclone sends) has a true content-MD5 ETag
+	// within seconds of completion; multi-part uploads from other
+	// clients keep a composite ETag forever, which ContentETag reports
+	// as no hash rather than a wrong MD5.
 	largeHashGracePeriod = 10 * time.Minute
 
 	// dirFindAttempts/dirFindDelay bound the re-lookup when CreateDirectory
@@ -550,6 +553,7 @@ type Object struct {
 	thumbURL     string    // thumbnail URL
 
 	uploadedAt time.Time // when this object was last uploaded; guards Hash() against the visibility window
+	multipart  bool      // uploaded in several parts; the ETag never carries a content MD5
 
 	urlMu     sync.Mutex // protects url / urlExpiry
 	url       string     // cached download URL
@@ -1400,10 +1404,17 @@ func (o *Object) hashGrace() time.Duration {
 // suffix) is not a content hash, so it is reported as no-hash via an empty
 // string rather than an error, which would make verify treat the file as
 // corrupted. A transient error right after upload is also swallowed for the
-// same reason.
+// same reason. Objects uploaded in several parts skip the probe entirely,
+// since their ETag never carries a content MD5.
 func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	if t != hash.MD5 {
 		return "", hash.ErrUnsupported
+	}
+	// Multi-part uploads never carry a content MD5 in the ETag (confirmed for
+	// rclone-initiated sessions; external clients behave the same), so the
+	// probe is skipped and callers fall back to size-only comparisons.
+	if o.multipart {
+		return "", nil
 	}
 	url, err := o.downloadURL(ctx)
 	if err != nil {
@@ -1655,11 +1666,21 @@ func (f *Fs) uploadZone(ctx context.Context) (string, error) {
 	return f.zoneURL, nil
 }
 
-// uploadSingle uploads a file of known size as a single part.
+// singlePartMax caps the single-request upload fast path. Files above it go
+// as partSize chunks so the request body stays friendly to reverse proxies
+// with body limits.
+const singlePartMax = int64(64 << 20)
+
+// uploadSingle uploads a file of known size to the upload2C endpoint.
 //
-// D1 pins every upload to one part so the ETag is a real MD5. uniqueId is
-// generated once outside the (single-iteration) part loop because it must stay
-// stable across parts and retries.
+// Files up to singlePartMax are sent as one part, where the server's ETag is
+// the content MD5 immediately at upload time. Larger files are sent as
+// partSize chunks so the HTTP request body stays small enough for reverse
+// proxies with body limits, and each part is one POST; the last part carries
+// the remainder and its response holds the fid. uniqueId is generated once
+// per upload attempt because it must stay stable across parts, and changed
+// between attempts so a retried upload cannot mix with the orphaned parts of
+// the aborted session.
 func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string, size int64, src fs.ObjectInfo) (api.UploadData, error) {
 	zoneURL, err := f.uploadZone(ctx)
 	if err != nil {
@@ -1696,6 +1717,11 @@ func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string,
 	// --transfers > 1) could merge or clobber sessions. A timestamp alone is
 	// not enough (fifth round B4).
 	uniqueID := random.String(16)
+	plans := []api.PartPlan{{Index: 1, PartSize: size}}
+	if size > singlePartMax {
+		plans = api.PlanParts(size, partSize)
+	}
+	total := int64(len(plans))
 
 	var data api.UploadData
 	// The upload channel never goes through the dispatcher, so an expired
@@ -1706,21 +1732,46 @@ func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string,
 	// hit by the same expiry, and this file's error is reported as-is.
 	uploadStart := time.Now()
 	for attempt := 0; ; attempt++ {
-		err = f.pacer.CallNoRetry(func() (bool, error) {
-			d, err := f.uploadPart(ctx, in, zoneURL, dirID, name, size, fiEnc, uniqueID, token, 1, size)
-			if err != nil {
-				var ae *apiError
-				if asAPIError(err, &ae) {
-					// A business rejection never succeeds on retry.
-					return false, err
-				}
-				// A transport failure: signal the pacer to back off, but do not
-				// retry here - that is left to the outer copy retry loop.
-				return true, err
+		if attempt > 0 {
+			seeker, ok := in.(io.Seeker)
+			if !ok {
+				// ⚠️ X1 (sixth round): err is nil here (the re-encryption above
+				// succeeded), so returning it would report SUCCESS for an upload
+				// that never happened - and Update would then delete the old
+				// object. Fail loudly instead.
+				return api.UploadData{}, errors.New("wopan: cannot re-upload after token refresh: reader is not seekable")
 			}
-			data = d
-			return false, nil
-		})
+			if _, serr := seeker.Seek(0, io.SeekStart); serr != nil {
+				return api.UploadData{}, serr
+			}
+			uniqueID = random.String(16)
+			data = api.UploadData{}
+		}
+		for i := range plans {
+			p := plans[i]
+			err = f.pacer.CallNoRetry(func() (bool, error) {
+				d, err := f.uploadPart(ctx, io.LimitReader(in, p.PartSize), zoneURL, dirID, name, size, fiEnc, uniqueID, token, p, total)
+				if err != nil {
+					var ae *apiError
+					if asAPIError(err, &ae) {
+						// A business rejection never succeeds on retry.
+						return false, err
+					}
+					// A transport failure: signal the pacer to back off, but do not
+					// retry here - that is left to the outer copy retry loop.
+					return true, err
+				}
+				if d.Fid != "" {
+					// Intermediate parts answer with empty data; the last
+					// part carries the fid (and wcFileId).
+					data = d
+				}
+				return false, nil
+			})
+			if err != nil {
+				break
+			}
+		}
 		fs.Debugf(f, "wopan: upload attempt #%d took %s (err=%v)", attempt+1, time.Since(uploadStart).Round(time.Millisecond), err)
 		if err == nil || !isAuthInvalid(err) || attempt > 0 || f.opt.NoRefresh {
 			break
@@ -1732,17 +1783,6 @@ func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string,
 		fiEnc, err = aesEncrypt(fiJSON, aesKeyFor(chanWoHome, token))
 		if err != nil {
 			return api.UploadData{}, err
-		}
-		seeker, ok := in.(io.Seeker)
-		if !ok {
-			// ⚠️ X1 (sixth round): err is nil here (the re-encryption above
-			// succeeded), so returning it would report SUCCESS for an upload
-			// that never happened - and Update would then delete the old
-			// object. Fail loudly instead.
-			return api.UploadData{}, errors.New("wopan: cannot re-upload after token refresh: reader is not seekable")
-		}
-		if _, serr := seeker.Seek(0, io.SeekStart); serr != nil {
-			return api.UploadData{}, serr
 		}
 	}
 	if err != nil {
@@ -1757,19 +1797,20 @@ func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string,
 }
 
 // uploadPart sends one part to the upload2C endpoint and decodes the response.
-func (f *Fs) uploadPart(ctx context.Context, in io.Reader, zoneURL, dirID, name string, size int64, fileInfoEnc, uniqueID, token string, partIndex, partSize int64) (api.UploadData, error) {
+// in must yield exactly plan.PartSize bytes.
+func (f *Fs) uploadPart(ctx context.Context, in io.Reader, zoneURL, dirID, name string, size int64, fileInfoEnc, uniqueID, token string, plan api.PartPlan, total int64) (api.UploadData, error) {
 	params := url.Values{}
 	params.Set("uniqueId", uniqueID)
 	params.Set("accessToken", token)
 	params.Set("fileName", name)
 	params.Set("psToken", "undefined")
 	params.Set("fileSize", strconv.FormatInt(size, 10))
-	params.Set("totalPart", "1")
+	params.Set("totalPart", strconv.FormatInt(total, 10))
 	params.Set("channel", chanWoCloud)
 	params.Set("directoryId", dirID)
 	params.Set("fileInfo", fileInfoEnc)
-	params.Set("partSize", strconv.FormatInt(partSize, 10))
-	params.Set("partIndex", strconv.FormatInt(partIndex, 10))
+	params.Set("partSize", strconv.FormatInt(plan.PartSize, 10))
+	params.Set("partIndex", strconv.FormatInt(plan.Index, 10))
 
 	// ⚠️ MultipartUpload's third return value is the OVERHEAD only (form
 	// fields + part headers + closing boundary) - the godoc says "in addition
@@ -1788,7 +1829,7 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, zoneURL, dirID, name 
 		return api.UploadData{}, err
 	}
 	req.Header.Set("Content-Type", contentType)
-	req.ContentLength = overhead + size
+	req.ContentLength = overhead + plan.PartSize
 	req.Header.Set("Origin", "https://pan.wo.cn")
 	req.Header.Set("Referer", "https://pan.wo.cn/")
 	req.Header.Set("User-Agent", defaultUserAgent)
@@ -1998,6 +2039,9 @@ func (o *Object) refreshFromUpload(ctx context.Context, src fs.ObjectInfo, data 
 	// in-memory fingerprint identical to a fresh read (fstests CheckObjects).
 	o.shootingTime = src.ModTime(ctx).Truncate(time.Second)
 	o.uploadedAt = time.Now()
+	// Multi-part uploads never carry a content MD5 in the ETag, so remember
+	// the split and skip the probe in Hash().
+	o.multipart = size > singlePartMax
 	o.url = ""
 	o.urlExpiry = time.Time{}
 }
