@@ -500,21 +500,31 @@ func TestUnitPurgeRecycleBudgetExhausted(t *testing.T) {
 // wrapped a successful delete in RetryError(nil) ("needs retry") and repeated
 // it 30 times before reporting failure.
 func TestUnitShouldRetryCall(t *testing.T) {
+	ctx := context.Background()
+
 	// nil: success is never retryable.
-	retry, err := shouldRetryCall(nil)
+	retry, err := shouldRetryCall(ctx, nil)
 	assert.False(t, retry)
 	assert.NoError(t, err)
 
 	// A business error (HTTP 200 + RSP_CODE) is terminal.
 	be := &apiError{Code: "1000", Desc: "param"}
-	retry, err = shouldRetryCall(be)
+	retry, err = shouldRetryCall(ctx, be)
 	assert.False(t, retry)
 	assert.Same(t, be, err)
 
 	// A transport error is retryable.
 	te := errors.New("connection reset")
-	retry, err = shouldRetryCall(te)
+	retry, err = shouldRetryCall(ctx, te)
 	assert.True(t, retry)
+	assert.Same(t, te, err)
+
+	// A transport error with a dead ctx is terminal: the caller gave up and
+	// every retry would fail instantly (the hash-check abort storm).
+	deadCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	retry, err = shouldRetryCall(deadCtx, te)
+	assert.False(t, retry)
 	assert.Same(t, te, err)
 }
 
