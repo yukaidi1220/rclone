@@ -299,9 +299,9 @@ func (f *Fs) refreshToken(ctx context.Context) error {
 	if time.Until(expiry) > minTokenLifetime {
 		return nil
 	}
-	if time.Now().After(expiry) {
-		return errTokenExpired
-	}
+	// Within minTokenLifetime of expiry, or already past it: refresh.
+	// 139 rejects API calls with a fully-expired token, so refreshing
+	// after the deadline is the only path to a working session.
 
 	decoded, err := base64.StdEncoding.DecodeString(auth)
 	if err != nil {
