@@ -1053,9 +1053,15 @@ func (f *Fs) Precision() time.Duration { return time.Second }
 // Hashes returns the supported hash sets.
 // The personal-space listing carries a server-computed SHA-256
 // (contentHash) for every file, so SHA-256 is the native hash. The
-// family listing exposes no hash; Hash returns "" there and rclone
-// falls back to size+modtime comparison.
-func (f *Fs) Hashes() hash.Set { return hash.Set(hash.SHA256) }
+// family listing exposes no hash, so the family space advertises no
+// hashes and rclone falls back to size+modtime comparison (check
+// reports "no hashes supported" instead of aborting mid-way).
+func (f *Fs) Hashes() hash.Set {
+	if f.space == spaceFamily {
+		return hash.Set(0)
+	}
+	return hash.Set(hash.SHA256)
+}
 
 // DirCacheFlush resets the directory cache
 func (f *Fs) DirCacheFlush() { f.dirCache.ResetRoot() }
@@ -2236,8 +2242,38 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			fs.Errorf(o, "yun139: delete backup after update: %v", err)
 		}
 	}
+	// Clean up orphaned backups from a PREVIOUS killed run targeting the
+	// same file (a crash between pre-rename and the new upload leaves
+	// <name>.rclone-old-XXXX behind). Only touch entries whose base name
+	// starts with this object's leaf - never delete anything else.
+	o.fs.cleanupOldBackups(ctx, dirID, leaf)
 	o.fs.dirCache.FlushDir(path.Dir(o.remote))
 	return nil
+}
+
+// cleanupOldBackups deletes files in dirID whose names start with
+// leaf+".rclone-old-" - the leftovers of an Update that crashed after
+// renaming the old file away. The new file is already in place when
+// this runs, so the orphan is safe to remove.
+func (f *Fs) cleanupOldBackups(ctx context.Context, dirID, leaf string) {
+	prefix := leaf + ".rclone-old-"
+	var orphans []listEntry
+	err := f.listAll(ctx, dirID, func(e listEntry) bool {
+		if !e.isDir && strings.HasPrefix(e.name, prefix) {
+			orphans = append(orphans, e)
+		}
+		return false
+	})
+	if err != nil {
+		fs.Debugf(f, "yun139: orphan scan failed: %v", err)
+		return
+	}
+	for _, e := range orphans {
+		fs.Infof(f, "yun139: removing orphaned update backup %q", e.name)
+		if err := f.deleteObject(ctx, e.id, e.srvPath, f.space == spaceFamily); err != nil {
+			fs.Errorf(f, "yun139: remove orphaned backup %q: %v", e.name, err)
+		}
+	}
 }
 
 // findByNameInDir lists dirID and returns the first file id matching name.
