@@ -246,6 +246,7 @@ type Object struct {
 	modTime    time.Time // modification time
 	isDir      bool    // whether this is a directory
 	serverPath string  // family/group: server-side path (root:/...)
+	sha256     string  // personal space: contentHash from listing/upload
 
 	urlMu     *sync.Mutex // protects url / urlExpiry (pointer so Object copy stays lock-safe)
 	url       string      // cached download URL
@@ -1030,7 +1031,11 @@ func (f *Fs) Features() *fs.Features { return f.features }
 func (f *Fs) Precision() time.Duration { return time.Second }
 
 // Hashes returns the supported hash sets.
-func (f *Fs) Hashes() hash.Set { return hash.Set(hash.MD5) }
+// The personal-space listing carries a server-computed SHA-256
+// (contentHash) for every file, so SHA-256 is the native hash. The
+// family listing exposes no hash; Hash returns "" there and rclone
+// falls back to size+modtime comparison.
+func (f *Fs) Hashes() hash.Set { return hash.Set(hash.SHA256) }
 
 // DirCacheFlush resets the directory cache
 func (f *Fs) DirCacheFlush() { f.dirCache.ResetRoot() }
@@ -1045,6 +1050,7 @@ type listEntry struct {
 	isDir    bool
 	modTime  time.Time
 	srvPath  string // family/group server path of the parent dir
+	sha256   string // personal space: contentHash from the listing (empty if absent)
 }
 
 // listPersonal lists the entries of a personal-cloud directory.
@@ -1089,6 +1095,7 @@ func (f *Fs) listPersonal(ctx context.Context, dirID string, fn func(listEntry) 
 				size:    item.Size,
 				isDir:   item.Type == "folder",
 				modTime: modTime,
+				sha256:  item.ContentHash,
 			}
 			if fn(entry) {
 				return nil
@@ -1427,6 +1434,7 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, e listEntry) 
 		size:       e.size,
 		modTime:    e.modTime,
 		serverPath: e.srvPath,
+		sha256:     e.sha256,
 		urlMu:      &sync.Mutex{},
 	}
 	return o, nil
@@ -1501,40 +1509,41 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 
 // Hash returns the selected checksum of the file.
 //
-// The 139 personal cloud hides file metadata behind its CDN, so we cannot
-// query an MD5/SHA-256 in constant time. Single-part uploads' CDN ETag
-// is the content MD5; multi-part uploads (anything bigger than
-// upload_cutoff) get a composite ETag, which we report as an empty string
-// rather than a wrong hash so verify falls back to size comparison.
+// SHA-256 (native): the server computes it for every uploaded file and
+// returns it in the listing (contentHash). We cache it from the
+// listing and from the upload pipeline (we compute the same digest to
+// drive the upload), so no extra request is needed.
+//
+// Older note kept for history: the CDN pre-signed URLs reject HEAD
+// requests with 403 (the signature only covers GET), so the previous
+// ETag-based MD5 scheme never returned a hash in practice.
 func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
-	if t != hash.MD5 {
+	if t != hash.SHA256 {
 		return "", hash.ErrUnsupported
 	}
-	url, err := o.downloadURL(ctx)
-	if err != nil {
-		// Within the visibility window the URL may not exist yet;
-		// returning "" lets verify skip the hash check rather than
-		// delete the just-uploaded file.
-		return "", nil
+	if o.sha256 != "" {
+		return o.sha256, nil
 	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-	res, err := o.fs.httpClient.Do(req)
-	if err != nil {
-		return "", nil
+	// Not cached (e.g. the object was built from a listing that predates
+	// the field). Refetch the entry once.
+	if o.fs.space == spacePersonal {
+		leaf, dirID, err := o.fs.dirCache.FindPath(ctx, o.remote, false)
+		if err == nil {
+			var found string
+			err = o.fs.listAll(ctx, dirID, func(e listEntry) bool {
+				if !e.isDir && strings.EqualFold(e.name, path.Base(leaf)) {
+					found = e.sha256
+					return true
+				}
+				return false
+			})
+			if err == nil && found != "" {
+				o.sha256 = found
+				return found, nil
+			}
+		}
 	}
-	_ = res.Body.Close()
-	etag := res.Header.Get("ETag")
-	if etag == "" {
-		return "", nil
-	}
-	etag = strings.Trim(etag, `"`)
-	// Skip composite (multipart) ETags: they have a "-N" suffix and
-	// aren't a real content hash.
-	if i := strings.LastIndex(etag, "-"); i > 0 {
-		return "", nil
-	}
-	return etag, nil
+	return "", nil
 }
 
 // readMetaData reads the object metadata from its parent directory listing.
@@ -1771,6 +1780,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		id:      res.fileID,
 		size:    size,
 		modTime: src.ModTime(ctx),
+		sha256:  res.hashHex,
 		urlMu:   &sync.Mutex{},
 	}
 	return o, nil
@@ -1969,7 +1979,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	// exists under this name.
 	if resp.Success && resp.Data.FileID != "" &&
 		(resp.Data.RapidUpload || (resp.Data.Exists != nil && *resp.Data.Exists) || len(resp.Data.PartInfos) == 0) {
-		return &uploadResult{fileID: resp.Data.FileID, fileName: leaf}, nil
+		return &uploadResult{fileID: resp.Data.FileID, fileName: leaf, hashHex: hashHex}, nil
 	}
 	if !resp.Success {
 		return nil, &apiError{Code: resp.Code, Message: resp.Message}
@@ -2095,7 +2105,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	if !cmplResp.Success {
 		return nil, &apiError{Code: cmplResp.Code, Message: cmplResp.Message}
 	}
-	return &uploadResult{fileID: resp.Data.FileID, fileName: leaf}, nil
+	return &uploadResult{fileID: resp.Data.FileID, fileName: leaf, hashHex: hashHex}, nil
 }
 
 // putPart PUTs a single part to its pre-signed URL.
