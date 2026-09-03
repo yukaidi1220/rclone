@@ -1315,7 +1315,14 @@ func (o *Object) Storable() bool { return true }
 // ModTime returns the modification time of the object
 func (o *Object) ModTime(ctx context.Context) time.Time { return o.modTime }
 
-// SetModTime sets the modification time of the object
+// SetModTime sets the modification time of the object.
+//
+// 139 has no API to change mtime after upload (and the personal space
+// stamps the server clock on every upload, ignoring any client mtime -
+// verified live: 2001-02-03 mtime on a file came back as upload time).
+// wopan sidesteps this by remembering the upload-time mtime in
+// `shootingTime` and returning it from ModTime; on 139 the server
+// does not preserve that value, so we cannot mirror the trick.
 func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 	return fs.ErrorCantSetModTime
 }

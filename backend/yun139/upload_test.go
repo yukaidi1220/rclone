@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/rclone/rclone/backend/yun139/api"
 )
@@ -151,16 +150,15 @@ func TestBuildCreateBody_CapsAt100Parts(t *testing.T) {
 	for i := 1; i <= 116; i++ {
 		partInfos = append(partInfos, api.PartInfo{PartNumber: int64(i), PartSize: 5242880})
 	}
-	body := buildCreateBody("parent", "big.bin", 116*5242880, strings.Repeat("ab", 32), partInfos, time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC))
+	body := buildCreateBody("parent", "big.bin", 116*5242880, strings.Repeat("ab", 32), partInfos)
 	if len(body.PartInfos) != maxPartsPerRequest {
 		t.Fatalf("len(PartInfos) = %d, want %d", len(body.PartInfos), maxPartsPerRequest)
 	}
-	// Timestamps must be RFC3339 with milliseconds (server rejects other
-	// formats with '04000002: 本地更新时间格式不符合标准').
-	for _, ts := range []string{body.LocalCreatedAt, body.LocalUpdatedAt} {
-		if _, err := time.Parse("2006-01-02T15:04:05.000Z", ts); err != nil {
-			t.Errorf("timestamp %q not RFC3339-ms: %v", ts, err)
-		}
+	// The official client (and we, since the server ignores any client
+	// mtime and stamps the server clock) leaves both local timestamps
+	// empty. Live test: 2001-02-03 mtime came back as upload time.
+	if body.LocalCreatedAt != "" || body.LocalUpdatedAt != "" {
+		t.Errorf("LocalCreatedAt/LocalUpdatedAt = %q, %q; want both empty", body.LocalCreatedAt, body.LocalUpdatedAt)
 	}
 }
 
