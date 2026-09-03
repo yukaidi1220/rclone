@@ -108,17 +108,10 @@ type QueryRoutePolicyResp struct {
 
 // ---------------------------------------------------------- refresh ------
 
-// AuthTokenRefreshURL is the SSO token-refresh endpoint.
-const AuthTokenRefreshURL = "https://aas.caiyun.feixin.10086.cn:443/tellin/authTokenRefresh.do"
-
-// RefreshTokenResp is the XML response of the token-refresh endpoint.
-type RefreshTokenResp struct {
-	Return      string `xml:"return"`
-	Token       string `xml:"token"`
-	ExpireTime  int32  `xml:"expiretime"`
-	AccessToken string `xml:"accessToken"`
-	Desc        string `xml:"desc"`
-}
+// AuthTokenRefreshURL is the PC client's token-refresh endpoint
+// (captured 2026-09-03: POST note-njs.yun.139.com/yun-note/user/authTokenRefresh
+// with {"authToken":..., "userId":...}).
+const AuthTokenRefreshURL = "https://note-njs.yun.139.com/yun-note/user/authTokenRefresh"
 
 // ------------------------------------------------------- personal -------
 
@@ -528,6 +521,14 @@ type PersonalCreateReq struct {
 	PartInfos            []PartInfo `json:"partInfos"`
 	LocalCreatedAt       string     `json:"localCreatedAt"`
 	LocalUpdatedAt       string     `json:"localUpdatedAt"`
+	UserRegion           *Region    `json:"userRegion,omitempty"`
+}
+
+// Region is the userRegion object the client sends to help the server
+// route the upload to a nearby CDN.
+type Region struct {
+	CityCode     string `json:"cityCode"`
+	ProvinceCode string `json:"provinceCode"`
 }
 
 // PartUploadInfo is one part URL returned by /file/create.
