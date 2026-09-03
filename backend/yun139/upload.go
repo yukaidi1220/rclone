@@ -183,7 +183,8 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	}
 	// Limit the create payload to the first maxPartsPerRequest parts; the
 	// rest are covered by /hcy/file/getUploadUrl later (alist does the
-	// same 100-part batches).
+	// same 100-part batches). The full list is kept for the fetch step.
+	allPartInfos := partInfos
 	if len(partInfos) > maxPartsPerRequest {
 		partInfos = partInfos[:maxPartsPerRequest]
 	}
@@ -228,15 +229,54 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	if len(resp.Data.PartInfos) == 0 {
 		return nil, errors.New("create returned no upload URL")
 	}
-	// Then PUT every part in parallel.
+	// PUT every part in parallel, in batches of maxPartsPerRequest.
+	// The first batch's URLs came from /file/create; the rest come from
+	// /hcy/file/getUploadUrl (captured 2026-09-03: the client fetches
+	// part 101+ exactly this way, with parallelUpload:true and the same
+	// parallelHashCtx entries).
+	allParts := make([]api.PartUploadInfo, 0, len(parts))
+	allParts = append(allParts, resp.Data.PartInfos...)
+	for i := maxPartsPerRequest; i < len(parts); i += maxPartsPerRequest {
+		end := i + maxPartsPerRequest
+		if end > len(parts) {
+			end = len(parts)
+		}
+		// Reuse the precomputed partInfos (with parallelHashCtx) for
+		// parts 101+ - the official client sends the same entries to
+		// /hcy/file/getUploadUrl.
+		urlBody := map[string]any{
+			"fileId":         resp.Data.FileID,
+			"uploadId":       resp.Data.UploadID,
+			"parallelUpload": true,
+			"partInfos":      allPartInfos[i:end],
+		}
+		var urlResp struct {
+			api.BaseResp
+			Data struct {
+				PartInfos []api.PartUploadInfo `json:"partInfos"`
+			} `json:"data"`
+		}
+		if err := f.pacer.Call(func() (bool, error) {
+			err := f.personalCall(ctx, "/hcy/file/getUploadUrl", urlBody, &urlResp)
+			return shouldRetry(ctx, err)
+		}); err != nil {
+			return nil, fmt.Errorf("getUploadUrl: %w", err)
+		}
+		if !urlResp.Success {
+			return nil, &apiError{Code: urlResp.Code, Message: urlResp.Message}
+		}
+		allParts = append(allParts, urlResp.Data.PartInfos...)
+	}
 	var eg errgroup.Group
 	eg.SetLimit(f.opt.UploadConcurrency)
 	for i, p := range parts {
 		i, p := i, p
 		eg.Go(func() error {
-			pi := resp.Data.PartInfos[i]
+			if i >= len(allParts) {
+				return fmt.Errorf("yun139: no upload URL for part %d", p.index)
+			}
 			rdr := io.NewSectionReader(freader, p.offset, p.partSize)
-			return f.putPart(ctx, rdr, pi.UploadURL, p.partSize)
+			return f.putPart(ctx, rdr, allParts[i].UploadURL, p.partSize)
 		})
 	}
 	if err := eg.Wait(); err != nil {

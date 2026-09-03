@@ -21,7 +21,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -101,6 +100,7 @@ type Options struct {
 	Space         string `config:"space"`
 	FamilyID      string `config:"family_id"`
 	RootFolderID  string `config:"root_folder_id"`
+	UserDomainID  string `config:"user_domain_id"` // 1301956522699563527-style id, optional
 	HardDelete    bool   `config:"hard_delete"`
 	PartSize      fs.SizeSuffix `config:"part_size"`
 	UploadConcurrency int       `config:"upload_concurrency"`
@@ -138,6 +138,13 @@ func init() {
 			Help:      "ID of the root folder. Leave blank for the top level.",
 			Advanced:  true,
 			Sensitive: true,
+		}, {
+			Name: "user_domain_id",
+			Help: "The 1301956522699563527-style user domain id.\\n\\n" +
+				"Found in the official client's request URLs ('u=' query param, " +
+				"also returned by user/getUser and queryFamilyCloud). Optional: " +
+				"when blank, the phone number is used where the server accepts it.",
+			Advanced: true,
 		}, {
 			Name: "hard_delete",
 			Help: "Delete permanently instead of moving files to the recycle bin.\n\n" +
@@ -325,13 +332,27 @@ func (f *Fs) refreshToken(ctx context.Context) error {
 	}
 	token := parts[2]
 
-	reqBody := "<root><token>" + token + "</token><account>" + account + "</account><clienttype>656</clienttype></root>"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, api.AuthTokenRefreshURL, strings.NewReader(reqBody))
+	// The PC client refreshes with a JSON heartbeat
+	// {"authToken":..., "userId":...} to note-njs.yun.139.com
+	// (captured 2026-09-03). The response is a user profile; it does
+	// NOT contain a new token, so a 200 means the token is still valid
+	// (its window was extended server-side).
+	userID := f.userDomainID
+	if userID == "" {
+		userID = account
+	}
+	reqBody, err := json.Marshal(map[string]string{"authToken": token, "userId": userID})
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/xml")
-	req.Header.Set("User-Agent", defaultUserAgent)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, api.AuthTokenRefreshURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+	req.Header.Set("User-Agent", pcUserAgentShort)
+	req.Header.Set("APP_CP", "pc")
+	req.Header.Set("CP_VERSION", pcAppVersion)
 
 	res, err := f.httpClient.Do(req)
 	if err != nil {
@@ -345,25 +366,21 @@ func (f *Fs) refreshToken(ctx context.Context) error {
 	if res.StatusCode >= 300 {
 		return fmt.Errorf("yun139: refresh token: http %s: %s", res.Status, truncate(string(body), 200))
 	}
-	var resp api.RefreshTokenResp
-	if err := xml.Unmarshal(body, &resp); err != nil {
+	// A 200 body that parses as JSON means the token is still good.
+	// The response is a user profile (userphone/username/...), not an
+	// envelope, so any 200 with JSON is success.
+	var env struct {
+		Success bool   `json:"success"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
 		return fmt.Errorf("yun139: refresh token: decode %w", err)
 	}
-	if resp.Return != "0" {
-		return fserrors.NoRetryError(fmt.Errorf("yun139: refresh token: %s", resp.Desc))
-	}
-	if resp.Token == "" {
-		return errors.New("yun139: refresh token: empty token in response")
-	}
-
-	// Rebuild the authorization with the new token.
-	prefix := parts[0]
-	newAuth := base64.StdEncoding.EncodeToString([]byte(prefix + ":" + account + ":" + resp.Token))
-	f.tokMu.Lock()
-	f.auth = newAuth
-	f.tokMu.Unlock()
-	if f.m != nil {
-		f.m.Set("authorization", newAuth)
+	if !env.Success && env.Message != "" {
+		// An explicit error envelope (e.g. {"success":false,...})
+		// means the token is dead.
+		return fserrors.NoRetryError(fmt.Errorf("yun139: refresh token: %s %s", env.Code, env.Message))
 	}
 	return nil
 }
@@ -582,11 +599,16 @@ func (f *Fs) call(ctx context.Context, url string, body any, out any) error {
 	} else if f.space == spacePersonal {
 		// Personal space always speaks as the official PC client
 		// (captured 2026-09-03, client 8.8.6.20260829). The native
-		// upload module sends a lean header set on /hcy/file/create;
-		// every other call comes from the Electron main process with
-		// the full browser-like set.
-		if strings.HasSuffix(strings.SplitN(url, "?", 2)[0], "/hcy/file/create") && strings.Contains(string(payload), `"partInfos"`) {
+		// upload module sends a lean header set on /hcy/file/create
+		// and /hcy/file/getDownloadUrl; every other call comes from
+		// the Electron main process with the full browser-like set.
+		p := strings.SplitN(url, "?", 2)[0]
+		if (strings.HasSuffix(p, "/hcy/file/create") && strings.Contains(string(payload), `"partInfos"`)) ||
+			strings.HasSuffix(p, "/hcy/file/getDownloadUrl") {
 			headers = pcHeaders(auth, f.account, ts, randStr, sign, f.svcType)
+			if strings.HasSuffix(p, "/hcy/file/getDownloadUrl") {
+				headers["x-yun-url-type"] = "3"
+			}
 		} else {
 			headers = pcHeadersFull(auth, f.account, md5hex(f.account)+"-ENDIN")
 		}
@@ -786,6 +808,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		return nil, err
 	}
 	f.account = account
+	f.userDomainID = opt.UserDomainID
 
 	f.features = (&fs.Features{
 		CaseInsensitive:         true,
@@ -1373,7 +1396,10 @@ func (f *Fs) getURL(ctx context.Context, url string, headers map[string]string) 
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", defaultUserAgent)
+	// The CDN download (ykj-eos-*.eos.yun.139.com) accepts the short UA
+	// the official client sends (captured 2026-09-03). Avoid the long
+	// Chrome UA - no reason to look like a browser.
+	req.Header.Set("User-Agent", "Mozilla/5.0")
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
