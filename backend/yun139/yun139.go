@@ -158,7 +158,15 @@ func init() {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
-			Default:  encoder.Standard | encoder.EncodeInvalidUtf8,
+			// 139 rejects names with leading/trailing whitespace, control
+			// chars, leading tilde/period, and invalid UTF-8, with
+			// '04000002: 文件名称不符合标准'. Encode them on the wire so
+			// every fstests encoding case round-trips.
+			Default: encoder.Standard | encoder.EncodeInvalidUtf8 |
+				encoder.EncodeLeftSpace | encoder.EncodeLeftTilde |
+				encoder.EncodeLeftCrLfHtVt | encoder.EncodeRightSpace |
+				encoder.EncodeRightCrLfHtVt | encoder.EncodeLeftPeriod |
+				encoder.EncodeRightPeriod,
 		}},
 	})
 }
@@ -1125,7 +1133,11 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		// misleading error); the family root cannot be deleted anyway.
 		return errors.New("yun139: cannot remove the family root")
 	}
-	return f.deleteObject(ctx, dirID, "", true)
+	if err := f.deleteObject(ctx, dirID, "", false); err != nil {
+		return err
+	}
+	f.dirCache.FlushDir(dir)
+	return nil
 }
 
 // ------------------------------------------------------------ objects ----
@@ -1320,9 +1332,17 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 		if err != nil {
 			return err
 		}
-		return f.deleteObject(ctx, dirID, "", true)
+		if err := f.deleteObject(ctx, dirID, "", true); err != nil {
+			return err
+		}
+		f.dirCache.FlushDir(dir)
+		return nil
 	}
-	return f.deleteObject(ctx, dirID, "", false)
+	if err := f.deleteObject(ctx, dirID, "", false); err != nil {
+		return err
+	}
+	f.dirCache.FlushDir(dir)
+	return nil
 }
 
 // purgeFamilyDir removes a non-empty family directory by walking its children
