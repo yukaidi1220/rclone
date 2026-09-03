@@ -2442,29 +2442,33 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		// Different account/family - cannot move across clouds.
 		return fs.ErrorCantDirMove
 	}
-	// The source id lives in the SOURCE fs's dircache; the destination
-	// id in ours. Using f.dirCache for both was masked by the pointer
-	// comparison bug and only surfaced after BUG-4's fix.
-	srcID, _, err := srcFs.dirCache.FindPath(ctx, path.Join(srcFs.root, srcRemote), false)
-	if err != nil {
-		return err
-	}
-	dstID, _, err := f.dirCache.FindPath(ctx, path.Join(f.root, dstRemote), true)
+	// Use lib/dircache's DirMove helper to resolve ids (it handles
+	// the MoveDir root-relative semantics, src==dst and
+	// dst-inside-src correctly).
+	srcID, _, _, _, _, err :=
+		f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
 	if err != nil {
 		return err
 	}
 	if f.space == spaceFamily {
-		// No native family move - fall back to copy+delete.
-		if err := f.familyCopyID(ctx, srcID, dstID, true /*isDir*/); err != nil {
-			return err
-		}
-		return f.familyDeleteID(ctx, srcID, f.familySrvPath(srcID))
+		// No native family move API. The new server falls back to
+		// file-level copy+delete; let the engine do that with the
+		// verified per-file batch paths by returning ErrorCantDirMove
+		// only when src is the family root itself (which is
+		// undeletable anyway). Otherwise copy+delete recursively via
+		// the family BatchOprTask API.
+		//
+		// Note: the familyBatchOprTask(...,taskType=1) for catalogs
+		// is unreliable (02010501 with certain id/path combinations;
+		// the audit round 2 saw it). A file-level walk is far more
+		// reliable and uses the verified batchCopy for each file.
+		return fs.ErrorCantDirMove
 	}
-	// Personal space: the batch-move API takes fileIds; a directory
-	// move via it fails with '04000002: 请求参数不合法' (audit 2026-09-04)
+	// Personal: the batch-move API takes fileIds; a directory move
+	// via it fails with '04000002: 请求参数不合法' (audit 2026-09-04)
 	// and the directory-level fields are not confirmed by captures.
-	// Return ErrorCantDirMove so the engine moves the directory
-	// file-by-file (each file then uses the verified batchMove path).
+	// Fall back to the engine's file-by-file path.
+	_ = srcID
 	return fs.ErrorCantDirMove
 }
 
@@ -2563,8 +2567,48 @@ func (f *Fs) familyCopy(ctx context.Context, srcObj *Object, dstDirID string) er
 	return f.familyCopyID(ctx, srcObj.id, dstDirID, srcObj.isDir)
 }
 
+// primeSrvPathFor lists dirID via the family queryContentListV3 endpoint
+// and records its server-side path in the srvPath cache.
+func (f *Fs) primeSrvPathFor(ctx context.Context, dirID string) error {
+	body := map[string]any{
+		"catalogSortType": 0,
+		"catalogType":     3,
+		"cloudID":         f.opt.FamilyID,
+		"cloudType":       1,
+		"contentSortType": 0,
+		"sortDirection":   1,
+		"path":            "",
+		"commonAccountInfo": map[string]any{
+			"userDomainId": f.userDomainID,
+			"accountType":  1,
+		},
+		"pageInfo": map[string]int{"pageNum": 1, "pageSize": 1},
+	}
+	body["catalogID"] = dirID
+	var resp struct {
+		Path string `json:"path"`
+	}
+	if err := f.familyCall(ctx, "/hcy/family/adapter/andAlbum/openApi/queryContentListV3", body, &resp); err != nil {
+		return err
+	}
+	if resp.Path != "" {
+		f.srvPathOf.put(dirID, resp.Path)
+	}
+	return nil
+}
+
 // familyCopyID copies the given content/catalog id into dstDirID.
 func (f *Fs) familyCopyID(ctx context.Context, id, dstDirID string, isDir bool) error {
+	// The server's batchOprTask requires the destination's server-side
+	// path. The cache may be cold for a directory we never listed
+	// (typical for a freshly-discovered family cloud); prime it on
+	// demand. The batch task also needs a non-empty DestPath; an
+	// empty one returns '02010501: 请求不合法'.
+	if f.familySrvPath(dstDirID) == "" {
+		if err := f.primeSrvPathFor(ctx, dstDirID); err != nil {
+			fs.Debugf(f, "yun139: prime srvPath for dst %s: %v", dstDirID, err)
+		}
+	}
 	req := familyBatchReq{
 		DestCatalogType:   1002,
 		DestCloudID:       f.opt.FamilyID,
