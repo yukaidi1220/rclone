@@ -195,7 +195,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		return &uploadResult{fileID: resp.Data.FileID, fileName: leaf}, nil
 	}
 	if !resp.Success {
-		return nil, fmt.Errorf("create failed: %s %s", resp.Code, resp.Message)
+		return nil, &apiError{Code: resp.Code, Message: resp.Message}
 	}
 	if len(resp.Data.PartInfos) == 0 {
 		return nil, errors.New("create returned no upload URL")
@@ -226,7 +226,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		return nil, fmt.Errorf("complete: %w", err)
 	}
 	if !cmplResp.Success {
-		return nil, fmt.Errorf("complete failed: %s %s", cmplResp.Code, cmplResp.Message)
+		return nil, &apiError{Code: cmplResp.Code, Message: cmplResp.Message}
 	}
 	return &uploadResult{fileID: resp.Data.FileID, fileName: leaf}, nil
 }
