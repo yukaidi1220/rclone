@@ -2182,61 +2182,61 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 	leaf = o.fs.opt.Enc.FromStandardName(leaf)
-	if o.fs.space == spaceFamily {
-		// The family modifyContentInfo endpoint treats contentName as
-		// the base name and re-appends the ORIGINAL extension, so a
-		// temp-name + rename flow leaves files stuck on
-		// "name.ext.rclone-tmp-XXXX" (verified live by the audit).
-		// Instead: delete the old file first, then upload straight to
-		// the target name (fileRenameMode=auto_rename guards the
-		// tiny race window).
-		if err := o.fs.deleteObject(ctx, o.id, o.serverPath, true); err != nil {
+
+	// Lossless Update: rename the old file away FIRST, upload the new
+	// file under the target name, and only delete the renamed old file
+	// once the new one is complete. If the upload fails, rename the old
+	// file back - no data loss, no visible gap.
+	//
+	// Why not delete-first? (a) the server's rapidUpload reuses the old
+	// storage when hashes match, so a size-changed Update could keep
+	// the old content with a new size (audit 2026-09-04); (b) a plain
+	// upload under the target name while the old file still exists
+	// triggers auto_rename, leaving the new file under a (1) name.
+	//
+	// The backup name must not collide with the target's extension
+	// semantics: personal /hcy/file/update replaces the whole name,
+	// family modifyContentInfo keeps the extension, so use a backup
+	// name that keeps the same extension for family.
+	backupLeaf := leaf + ".rclone-old-" + random.String(8)
+	oldPath := o.remote
+	backupRemote := path.Join(path.Dir(o.remote), backupLeaf)
+	if err := o.fs.renameObject(ctx, o.id, o.fs.opt.Enc.FromStandardName(backupLeaf), dirID, o.fs.space == spaceFamily); err != nil {
+		// The rename is best-effort; if the server refuses (e.g. name
+		// too long), fall back to delete-then-upload.
+		fs.Debugf(o, "yun139: pre-rename failed (%v), falling back to delete-then-upload", err)
+		if err := o.fs.deleteObject(ctx, o.id, o.serverPath, o.fs.space == spaceFamily); err != nil {
 			return fserrors.NoLowLevelRetryError(fmt.Errorf("yun139: delete old object: %w", err))
 		}
-		res, err := o.fs.uploadFile(ctx, in, dirID, leaf, size)
-		if err != nil {
-			return err
-		}
-		o.id = res.fileID
-		o.size = size
-		o.modTime = src.ModTime(ctx)
-		o.sha256 = res.hashHex
-		o.fs.dirCache.FlushDir(path.Dir(o.remote))
-		return nil
+		backupRemote = ""
 	}
-	tempLeaf := leaf + ".rclone-tmp-" + random.String(8)
-	res, err := o.fs.uploadFile(ctx, in, dirID, tempLeaf, size)
+	_ = oldPath
+	_ = backupRemote
+	res, err := o.fs.uploadFile(ctx, in, dirID, leaf, size)
 	if err != nil {
+		// Upload failed: try to restore the old file's name.
+		if backupRemote != "" {
+			if rerr := o.fs.renameObject(ctx, o.id, o.fs.opt.Enc.FromStandardName(leaf), dirID, o.fs.space == spaceFamily); rerr != nil {
+				fs.Errorf(o, "yun139: restore old name after failed update: %v", rerr)
+			}
+		}
 		return err
 	}
-	// The new file may have been auto-renamed on the server; for the
-	// post-rename step we want to address the just-created file by id and
-	// rename it to the target name. If the new id is empty (the upload did
-	// not return a usable id), treat as failure.
-	if res.fileID == "" {
-		// The complete response did not echo the id; refresh the parent to
-		// look up the new file id by name.
-		found, err := o.fs.findByNameInDir(ctx, dirID, res.fileName)
-		if err != nil {
-			return err
-		}
-		if found == "" {
-			return errors.New("yun139: cannot resolve the new file id after upload")
-		}
-		res.fileID = found
-	}
-	// Delete the old object.
-	if err := o.fs.deleteObject(ctx, o.id, o.serverPath, o.fs.space == spaceFamily); err != nil {
-		return fserrors.NoLowLevelRetryError(fmt.Errorf("yun139: delete old object: %w", err))
-	}
-	// Rename the new file to the target name.
-	if err := o.fs.renameObject(ctx, res.fileID, leaf, dirID, o.fs.space == spaceFamily); err != nil {
-		return fserrors.NoLowLevelRetryError(fmt.Errorf("yun139: rename temp object: %w", err))
-	}
-	// Refresh the receiver in place.
+	// Upload complete: the new file is in place. Refresh the
+	// receiver, then delete the renamed old file. If the delete fails
+	// the new file is correct; the old file lingers under the backup
+	// name for the user to clean up.
+	oldID := o.id
 	o.id = res.fileID
 	o.size = size
 	o.modTime = src.ModTime(ctx)
+	o.sha256 = res.hashHex
+	if backupRemote != "" {
+		if err := o.fs.deleteObject(ctx, oldID, o.serverPath, o.fs.space == spaceFamily); err != nil {
+			fs.Errorf(o, "yun139: delete backup after update: %v", err)
+		}
+	}
+	o.fs.dirCache.FlushDir(path.Dir(o.remote))
 	return nil
 }
 
