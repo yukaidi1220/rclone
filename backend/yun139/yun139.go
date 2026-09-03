@@ -865,8 +865,17 @@ func (f *Fs) familyRoot(ctx context.Context) (string, error) {
 // ------------------------------------------------------------ NewFs -------
 
 // parsePath parses a remote path
+//
+// path.Clean normalises ".", ".." and duplicate slashes so
+// "a/../b" does not create a literal full-width dot directory on the
+// server (audit BUG-5: the encoder would otherwise turn "." into "．").
 func parsePath(p string) (root string) {
-	return strings.Trim(p, "/")
+	p = strings.ReplaceAll(p, "\\", "/")
+	clean := path.Clean(p)
+	if clean == "." || clean == "/" {
+		return ""
+	}
+	return strings.Trim(clean, "/")
 }
 
 // newFs constructs an Fs from the path
@@ -2344,33 +2353,56 @@ func (o *Object) Remove(ctx context.Context) error {
 }
 
 // Move a file or directory
-func (f *Fs) Move(ctx context.Context, src fs.Object, dst fs.Fs, dstDir string) error {
-	if dst != f {
-		return fs.ErrorCantMove
-	}
+// Move a file using the server-side batch-move API.
+//
+// Signature follows fs.Mover: destination is a full remote path.
+// Same-directory moves are a rename (batchMove with a changed name);
+// cross-directory moves use the batch-move task. Returns the new
+// object, or ErrorCantMove so the engine falls back to copy+delete.
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	srcObj, ok := src.(*Object)
 	if !ok {
-		return fs.ErrorCantMove
+		return nil, fs.ErrorCantMove
 	}
-	dstDirID, _, err := f.dirCache.FindPath(ctx, path.Join(f.root, dstDir), true)
+	if srcObj.fs != f && !srcObj.fs.sameCloud(f) {
+		return nil, fs.ErrorCantMove
+	}
+	dstLeaf, dstDirID, err := f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	srcLeaf := srcObj.leaf()
 	if f.space == spaceFamily {
-		// The PC client no longer has a "move" button inside the family
-		// cloud (transfers are copy + manual delete). rclone's Move
-		// falls back to "copy then delete" which the server surfaces
-		// as taskType 1 (copy) followed by taskType 2 (delete).
+		// No native family move (new PC client has no move button).
+		// Fall back to copy + delete (safe: the engine does the same
+		// when we return ErrorCantMove).
 		if err := f.familyCopy(ctx, srcObj, dstDirID); err != nil {
-			return err
+			return nil, err
 		}
-		return f.deleteObject(ctx, srcObj.id, srcObj.serverPath, true)
+		if err := f.deleteObject(ctx, srcObj.id, srcObj.serverPath, true); err != nil {
+			return nil, err
+		}
+		return f.NewObject(ctx, remote)
 	}
 	taskID, err := f.moveTaskID(ctx, srcObj.id, dstDirID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return f.taskGet(ctx, taskID, "move")
+	if err := f.taskGet(ctx, taskID, "move"); err != nil {
+		return nil, err
+	}
+	// The batch-move keeps the id; if the leaf changed (rename-in-move),
+	// the server-side move does not rename, so issue an update.
+	if dstLeaf != "" && dstLeaf != srcLeaf {
+		if err := f.renameObject(ctx, srcObj.id, f.opt.Enc.FromStandardName(dstLeaf), dstDirID, false); err != nil {
+			return nil, err
+		}
+	}
+	o, err := f.NewObject(ctx, remote)
+	if err != nil {
+		return nil, err
+	}
+	return o, nil
 }
 
 // moveTaskID is a helper that performs one batchMove and returns the task id.
@@ -2400,10 +2432,14 @@ func (f *Fs) moveTaskID(ctx context.Context, id, dstDirID string) (string, error
 // DirMove moves a directory
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
 	srcFs, ok := src.(*Fs)
-	if !ok || srcFs != f {
+	if !ok || !srcFs.sameCloud(f) {
+		// Different account/family - cannot move across clouds.
 		return fs.ErrorCantDirMove
 	}
-	srcID, _, err := f.dirCache.FindPath(ctx, path.Join(f.root, srcRemote), false)
+	// The source id lives in the SOURCE fs's dircache; the destination
+	// id in ours. Using f.dirCache for both was masked by the pointer
+	// comparison bug and only surfaced after BUG-4's fix.
+	srcID, _, err := srcFs.dirCache.FindPath(ctx, path.Join(srcFs.root, srcRemote), false)
 	if err != nil {
 		return err
 	}
@@ -2418,35 +2454,101 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		}
 		return f.familyDeleteID(ctx, srcID, f.familySrvPath(srcID))
 	}
-	taskID, err := f.moveTaskID(ctx, srcID, dstID)
-	if err != nil {
-		return err
-	}
-	return f.taskGet(ctx, taskID, "dirmove")
+	// Personal space: the batch-move API takes fileIds; a directory
+	// move via it fails with '04000002: 请求参数不合法' (audit 2026-09-04)
+	// and the directory-level fields are not confirmed by captures.
+	// Return ErrorCantDirMove so the engine moves the directory
+	// file-by-file (each file then uses the verified batchMove path).
+	return fs.ErrorCantDirMove
 }
 
-// Copy a file
-func (f *Fs) Copy(ctx context.Context, src fs.Object, dst fs.Fs, dstDir string) error {
-	if dst != f {
-		return fs.ErrorCantCopy
-	}
+// Copy a file using the server-side batch-copy API.
+//
+// Signature follows fs.Copier (wopan/drive): the destination is a full
+// remote path. Returns the new object; the caller falls back to a
+// bandwidth copy when ErrorCantCopy is returned.
+func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	srcObj, ok := src.(*Object)
 	if !ok {
-		return fs.ErrorCantCopy
+		return nil, fs.ErrorCantCopy
 	}
-	dstDirID, _, err := f.dirCache.FindPath(ctx, path.Join(f.root, dstDir), true)
+	if srcObj.fs != f && !srcObj.fs.sameCloud(f) {
+		// Different account/family - the API cannot server-side copy.
+		return nil, fs.ErrorCantCopy
+	}
+	dstLeaf, dstDirID, err := f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	_ = dstLeaf // copy lands under srcLeaf; the engine handles leaf changes
 	if f.space == spaceFamily {
-		return f.familyCopy(ctx, srcObj, dstDirID)
+		if err := f.familyCopy(ctx, srcObj, dstDirID); err != nil {
+			return nil, err
+		}
+		// The family copy task has no direct id echo; re-resolve.
+		return f.NewObject(ctx, remote)
 	}
 	taskID, err := f.copyTaskID(ctx, srcObj.id, dstDirID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return f.taskGet(ctx, taskID, "copy")
+	if err := f.taskGet(ctx, taskID, "copy"); err != nil {
+		return nil, err
+	}
+	// The copy task has no direct id echo; re-resolve. A same-directory
+	// copy gets auto-renamed by the server (name(1).ext), so also scan
+	// the parent for a fresh entry that is not the source.
+	o, err := f.NewObject(ctx, remote)
+	if err == nil {
+		return o, nil
+	}
+	if o, err2 := f.findNewCopy(ctx, srcObj, dstDirID); err2 == nil {
+		return o, nil
+	}
+	return nil, err
 }
+
+// findNewCopy lists dstDirID and returns the first file entry that is
+// not srcObj, matches its size, and appeared after the copy started.
+// The family copy task does not echo the new id, and a same-directory
+// copy is auto-renamed by the server, so this is the only reliable way
+// to resolve the copy result.
+func (f *Fs) findNewCopy(ctx context.Context, srcObj *Object, dstDirID string) (fs.Object, error) {
+	var found listEntry
+	start := time.Now().Add(-2 * time.Minute)
+	err := f.listAll(ctx, dstDirID, func(e listEntry) bool {
+		if e.isDir || e.id == srcObj.id || e.size != srcObj.size {
+			return false
+		}
+		if e.modTime.Before(start) {
+			return false
+		}
+		found = e
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	if found.id == "" {
+		return nil, fs.ErrorObjectNotFound
+	}
+	return f.newObjectWithInfo(ctx, path.Join(f.root, found.name), found)
+}
+
+// sameCloud reports whether fs belongs to the same 139 account (and, for
+// family, the same family cloud), so ids are interchangeable.
+func (f *Fs) sameCloud(other *Fs) bool {
+	if f.space != other.space {
+		return false
+	}
+	if f.space == spaceFamily && f.opt.FamilyID != other.opt.FamilyID {
+		return false
+	}
+	return true
+}
+
+// leaf returns the base name of the object's remote path.
+func (o *Object) leaf() string { return path.Base(o.remote) }
 
 // familyCopy copies srcObj (file or dir) into dstDirID inside the family
 // cloud via createBatchOprTaskV2 taskType=1, then polls the task
