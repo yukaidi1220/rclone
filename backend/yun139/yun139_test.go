@@ -120,3 +120,25 @@ func TestSrvPathCache_FamilyAndPersonal(t *testing.T) {
 		t.Error("get(nope) should miss")
 	}
 }
+
+// TestParsePath_CleansDotDot pins BUG-5: "a/../b" must resolve to "b",
+// not create a literal "．．" (full-width dot) directory on the server.
+func TestParsePath_CleansDotDot(t *testing.T) {
+	cases := map[string]string{
+		"":          "",
+		"a":         "a",
+		"a/":        "a",
+		"a//b":      "a/b",
+		"a/../b":    "b",
+		"a/./b":     "a/b",
+		"../b":      "b",
+		"a/b/..":    "a",
+		"a/b/../..": "",
+		`a\b`:       "a/b",
+	}
+	for in, want := range cases {
+		if got := parsePath(in); got != want {
+			t.Errorf("parsePath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
