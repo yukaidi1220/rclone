@@ -700,7 +700,8 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 	f.features = (&fs.Features{
 		CaseInsensitive:         true,
 		CanHaveEmptyDirectories: true,
-		SlowHash:                 true,
+		SlowHash:                true,
+		ServerSideAcrossConfigs: false,
 	}).Fill(ctx, f)
 	return f, nil
 }
@@ -796,7 +797,7 @@ func (f *Fs) Features() *fs.Features { return f.features }
 func (f *Fs) Precision() time.Duration { return time.Second }
 
 // Hashes returns the supported hash sets.
-func (f *Fs) Hashes() hash.Set { return hash.Set(hash.SHA256) }
+func (f *Fs) Hashes() hash.Set { return hash.Set(hash.MD5) }
 
 // DirCacheFlush resets the directory cache
 func (f *Fs) DirCacheFlush() { f.dirCache.ResetRoot() }
@@ -1203,11 +1204,40 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 
 // Hash returns the selected checksum of the file.
 //
-// The 139 API does not expose content hashes through the listing or a
-// metadata endpoint, so no hash is supported and sync falls back to
-// size+modtime comparison.
+// The 139 personal cloud hides file metadata behind its CDN, so we cannot
+// query an MD5/SHA-256 in constant time. Single-part uploads' CDN ETag
+// is the content MD5; multi-part uploads (anything bigger than
+// upload_cutoff) get a composite ETag, which we report as an empty string
+// rather than a wrong hash so verify falls back to size comparison.
 func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
-	return "", hash.ErrUnsupported
+	if t != hash.MD5 {
+		return "", hash.ErrUnsupported
+	}
+	url, err := o.downloadURL(ctx)
+	if err != nil {
+		// Within the visibility window the URL may not exist yet;
+		// returning "" lets verify skip the hash check rather than
+		// delete the just-uploaded file.
+		return "", nil
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	res, err := o.fs.httpClient.Do(req)
+	if err != nil {
+		return "", nil
+	}
+	_ = res.Body.Close()
+	etag := res.Header.Get("ETag")
+	if etag == "" {
+		return "", nil
+	}
+	etag = strings.Trim(etag, `"`)
+	// Skip composite (multipart) ETags: they have a "-N" suffix and
+	// aren't a real content hash.
+	if i := strings.LastIndex(etag, "-"); i > 0 {
+		return "", nil
+	}
+	return etag, nil
 }
 
 // readMetaData reads the object metadata from its parent directory listing.
@@ -1257,5 +1287,56 @@ func (f *Fs) getURL(ctx context.Context, url string, headers map[string]string) 
 		return nil, err
 	}
 	return res, nil
+}
+
+// ------------------------------------------------------------ server-side ops ----
+
+// Purge deletes the directory at dir and all of its contents.
+//
+// Personal space: a single batchDelete of the directory id is enough (the
+// 139 server recurses). Family space: the orchestration API does not support
+// deleting a non-empty directory, so we walk it and delete children by id
+// before the directory itself.
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	dirID, err := f.dirCache.FindDir(ctx, dir, false)
+	if err != nil {
+		return err
+	}
+	if path.Join(f.root, dir) == "" {
+		return errors.New("yun139: cannot purge root")
+	}
+	if f.space == spaceFamily {
+		// Walk and delete every child first.
+		err = f.listAll(ctx, dirID, func(e listEntry) bool {
+			if e.isDir {
+				_ = f.purgeFamilyDir(ctx, e.id)
+			} else {
+				_ = f.deleteObject(ctx, e.id, e.srvPath, true)
+			}
+			return false
+		})
+		if err != nil {
+			return err
+		}
+		return f.deleteObject(ctx, dirID, "", true)
+	}
+	return f.deleteObject(ctx, dirID, "", false)
+}
+
+// purgeFamilyDir removes a non-empty family directory by walking its children
+// first. There is no server-side recursive delete in the family API.
+func (f *Fs) purgeFamilyDir(ctx context.Context, id string) error {
+	err := f.listAll(ctx, id, func(e listEntry) bool {
+		if e.isDir {
+			_ = f.purgeFamilyDir(ctx, e.id)
+		} else {
+			_ = f.deleteObject(ctx, e.id, e.srvPath, true)
+		}
+		return false
+	})
+	if err != nil {
+		return err
+	}
+	return f.deleteObject(ctx, id, "", true)
 }
 

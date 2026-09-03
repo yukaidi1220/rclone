@@ -802,10 +802,25 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, dst fs.Fs, dstDir string) 
 	})
 }
 
-// OpenChunkWriter is not implemented yet: the 139 create/upload pipeline
-// needs the whole-file SHA-256 before any part can be PUT, so the chunked
-// copy engine cannot interleave with the upload. rclone falls back to Put
-// automatically when OpenChunkWriter returns fs.ErrorNotImplemented.
+// OpenChunkWriter is not implemented. 139's upload protocol needs the
+// whole-file SHA-256 *before* /file/create can return the part upload
+// URLs, so the chunked copy engine (which calls WriteChunk per part with
+// a fresh io.ReadSeeker each time) cannot drive the upload without
+// knowing the hash up front. rclone's fs.ObjectInfo interface does not
+// give us a reader either, so we cannot pre-hash inside this method.
+//
+// The equivalent concurrency is exposed via PutUnchecked → Put, which
+// runs the upload as temp-file + SHA-256 + parallel part PUTs (see
+// uploadFromRandom).  Set --yun139-upload-concurrency to tune the
+// per-file part PUT parallelism (default 4).
 func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
 	return info, nil, fs.ErrorNotImplemented
+}
+
+// PutUnchecked aliases Put: 139's /file/create handles the
+// "file already exists" case via its fileRenameMode field, so Put
+// already does the right thing for the chunked copy engine's
+// "I have already confirmed the target will be overwritten" path.
+func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	return f.Put(ctx, in, src, options...)
 }
