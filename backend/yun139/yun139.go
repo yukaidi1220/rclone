@@ -379,6 +379,7 @@ func commonHeaders() map[string]string {
 // newHeaders returns the header set for the PersonalNew API (web client).
 func newHeaders(auth, ts, randStr, sign, svcType string) map[string]string {
 	h := map[string]string{
+		"Accept":               "application/json, text/plain, */*",
 		"Caller":               "web",
 		"CMS-DEVICE":           "default",
 		"Mcloud-Channel":       "1000101",
@@ -398,6 +399,7 @@ func newHeaders(auth, ts, randStr, sign, svcType string) map[string]string {
 		"X-Yun-Client-Info":    deviceInfo + "dW5kZWZpbmVk||",
 		"X-Yun-Module-Type":    "100",
 		"X-Yun-Svc-Type":       svcType,
+		"User-Agent":           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 		"Inner-Hcy-Router-Https": "1",
 		"Content-Type":         "application/json",
 	}

@@ -20,12 +20,14 @@ func TestPersonalCall_HeaderShape(t *testing.T) {
 	h := pcHeaders(auth, "13800138000", ts, randStr, sign, "1")
 
 	mustHeaderContains := []string{
+		"Accept",
 		"Authorization",
 		"Mcloud-Sign",
 		"x-SvcType",
 		"x-yun-device-id",
 		"x-yun-app-channel",
 		"x-m4c-caller",
+		"User-Agent",
 		"Content-Type",
 	}
 	for _, k := range mustHeaderContains {
