@@ -118,13 +118,14 @@ const AuthTokenRefreshURL = "https://note-njs.yun.139.com/yun-note/user/authToke
 
 // PersonalFileItem is one entry in the PersonalNew listing.
 type PersonalFileItem struct {
-	FileId     string              `json:"fileId"`
-	Name       string              `json:"name"`
-	Size       int64               `json:"size"`
-	Type       string              `json:"type"` // "folder" or "file"
-	CreatedAt  string              `json:"createdAt"`
-	UpdatedAt  string              `json:"updatedAt"`
-	Thumbnails []PersonalThumbnail `json:"thumbnailUrls"`
+	FileId       string              `json:"fileId"`
+	Name         string              `json:"name"`
+	Size         int64               `json:"size"`
+	Type         string              `json:"type"` // "folder" or "file"
+	CreatedAt    string              `json:"createdAt"`
+	UpdatedAt    string              `json:"updatedAt"`
+	ContentHash  string              `json:"contentHash"` // sha256 (lowercase) of files; empty for folders
+	Thumbnails   []PersonalThumbnail `json:"thumbnailUrls"`
 }
 
 // PersonalThumbnail is one thumbnail URL variant.
