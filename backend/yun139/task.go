@@ -19,7 +19,28 @@ type taskPollResult struct {
 	} `json:"data"`
 }
 
-// taskGet polls /hcy/task/get until the asynchronous operation finishes.
+// taskStatusDone reports whether a task/get status means the operation
+// completed. The official client emits "Succeed"; "" appears when the
+// response omits taskInfo.status (synchronous completion).
+func taskStatusDone(status string) bool {
+	switch status {
+	case "Succeed", "SUCCESS", "success", "":
+		return true
+	}
+	return false
+}
+
+// taskStatusFailed reports whether a task/get status means the operation
+// failed.
+func taskStatusFailed(status string) bool {
+	switch status {
+	case "Failed", "Failure", "failed":
+		return true
+	}
+	return false
+}
+
+// taskGet polls /hcy/task/get until the task finishes.
 //
 // Delete / move / copy on 139 are task-based: the mutating call returns
 // a taskId immediately and the change happens in the background. rclone
@@ -41,10 +62,10 @@ func (f *Fs) taskGet(ctx context.Context, taskID, what string) error {
 		if !out.Success {
 			return &apiError{Code: out.Code, Message: out.Message}
 		}
-		switch out.Data.TaskInfo.Status {
-		case "Succeed", "SUCCESS", "":
+		switch {
+		case taskStatusDone(out.Data.TaskInfo.Status):
 			return nil
-		case "Failed", "Failure", "failed":
+		case taskStatusFailed(out.Data.TaskInfo.Status):
 			return fmt.Errorf("yun139: %s task %s failed", what, taskID)
 		}
 		if time.Now().After(deadline) {

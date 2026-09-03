@@ -146,6 +146,38 @@ func (f *Fs) uploadFile(ctx context.Context, in io.Reader, dirID, leaf string, s
 	return res, err
 }
 
+// buildCreateBody assembles the /hcy/file/create payload exactly as the
+// official PC client posts it (captured 2026-09-03, v8.8.6.20260829):
+// contentHash + contentHashAlgorithm:SHA256 + contentType + parallelUpload:true
+// + partInfos[:100] + fileRenameMode:auto_rename + localCreatedAt/localUpdatedAt
+// in RFC3339 millisecond UTC.
+func buildCreateBody(dirID, leaf string, size int64, hashHex string, partInfos []api.PartInfo) api.PersonalCreateReq {
+	body := api.PersonalCreateReq{
+		CommonUpload: api.CommonUpload{
+			ParentID: dirID,
+			Name:     leaf,
+			Size:     size,
+			Type:     "file",
+		},
+		FileRenameMode: "auto_rename",
+	}
+	body.ContentHash = hashHex
+	body.ContentHashAlgorithm = "SHA256"
+	body.ContentType = "application/octet-stream"
+	body.ParallelUpload = true
+	body.PartInfos = partInfos
+	// The official client stamps local timestamps in RFC3339 UTC with
+	// milliseconds, e.g. "2026-09-03T08:06:36.784Z". The server rejects
+	// other formats with '04000002: 本地更新时间格式不符合标准'.
+	now := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+	body.LocalCreatedAt = now
+	body.LocalUpdatedAt = now
+	if len(body.PartInfos) > maxPartsPerRequest {
+		body.PartInfos = body.PartInfos[:maxPartsPerRequest]
+	}
+	return body
+}
+
 // uploadFromRandom drives a multi-part upload for data already on disk in
 // the given *os.File (positioned at offset 0). The same file is used both
 // for hashing (already done) and for reading each part on demand via
@@ -188,29 +220,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	if len(partInfos) > maxPartsPerRequest {
 		partInfos = partInfos[:maxPartsPerRequest]
 	}
-	body := api.PersonalCreateReq{
-		CommonUpload: api.CommonUpload{
-			ParentID: dirID,
-			Name:     leaf,
-			Size:     size,
-			Type:     "file",
-		},
-		FileRenameMode: "auto_rename",
-	}
-	body.ContentHash = hashHex
-	body.ContentHashAlgorithm = "SHA256"
-	body.ContentType = "application/octet-stream"
-	body.ParallelUpload = true
-	body.PartInfos = partInfos
-	// The official client stamps local timestamps in RFC3339 UTC with
-	// milliseconds, e.g. "2026-09-03T08:06:36.784Z". The server rejects
-	// other formats with '04000002: 本地更新时间格式不符合标准'.
-	now := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
-	body.LocalCreatedAt = now
-	body.LocalUpdatedAt = now
-	if len(body.PartInfos) > maxPartsPerRequest {
-		body.PartInfos = body.PartInfos[:maxPartsPerRequest]
-	}
+	body := buildCreateBody(dirID, leaf, size, hashHex, partInfos)
 	var resp api.PersonalCreateResp
 	if err := f.personalCall(ctx, "/hcy/file/create", body, &resp); err != nil {
 		return nil, fmt.Errorf("create: %w", err)
@@ -651,19 +661,145 @@ func (f *Fs) copyTaskID(ctx context.Context, id, dstDirID string) (string, error
 	return out.Data.TaskID, nil
 }
 
-// OpenChunkWriter is not implemented. 139's upload protocol needs the
-// whole-file SHA-256 *before* /file/create can return the part upload
-// URLs, so the chunked copy engine (which calls WriteChunk per part with
-// a fresh io.ReadSeeker each time) cannot drive the upload without
-// knowing the hash up front. rclone's fs.ObjectInfo interface does not
-// give us a reader either, so we cannot pre-hash inside this method.
+// OpenChunkWriter supports the multi-thread copy engine by staging
+// chunks in a temp file and running the real upload at Close.
 //
-// The equivalent concurrency is exposed via PutUnchecked → Put, which
-// runs the upload as temp-file + SHA-256 + parallel part PUTs (see
-// uploadFromRandom).  Set --yun139-upload-concurrency to tune the
-// per-file part PUT parallelism (default 4).
+// 139's protocol needs the whole-file SHA-256 *before* /file/create can
+// return the part upload URLs, so the chunked copy engine cannot drive
+// the parts directly. Instead, WriteChunk stages each chunk into a temp
+// file at its part offset (safe under concurrent out-of-order writes),
+// and Close hashes the file and runs the same pipeline as Put
+// (temp file + SHA-256 + /hcy/file/create + parallel part PUTs).
+// The cost vs Put is one extra disk round-trip.
 func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
-	return info, nil, fs.ErrorNotImplemented
+	size := src.Size()
+	if size < 0 {
+		return info, nil, errors.New("yun139: can't upload files of unknown size")
+	}
+	leaf, dirID, err := f.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return info, nil, err
+	}
+	leaf = f.opt.Enc.FromStandardName(leaf)
+	chunkSize := int64(f.opt.PartSize)
+	if chunkSize <= 0 {
+		chunkSize = api.DefaultChunkSize
+	}
+	if size < chunkSize {
+		chunkSize = size
+	}
+	if size == 0 {
+		chunkSize = 1 // zero-size files still need a temp file to hash
+	}
+	tmp, err := os.CreateTemp("", "yun139-chunkwriter-")
+	if err != nil {
+		return info, nil, fmt.Errorf("yun139: chunk writer temp: %w", err)
+	}
+	// Preallocate so WriteAt never hits EOF errors on sparse regions.
+	if err := tmp.Truncate(size); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return info, nil, fmt.Errorf("yun139: chunk writer truncate: %w", err)
+	}
+	w := &yun139ChunkWriter{
+		f:         f,
+		tmp:       tmp,
+		path:      tmp.Name(),
+		dirID:     dirID,
+		leaf:      leaf,
+		size:      size,
+		chunkSize: chunkSize,
+		total:     (size + chunkSize - 1) / chunkSize,
+	}
+	info = fs.ChunkWriterInfo{
+		ChunkSize:   chunkSize,
+		Concurrency: f.opt.UploadConcurrency,
+	}
+	return info, w, nil
+}
+
+// yun139ChunkWriter stages chunks into a temp file for OpenChunkWriter.
+type yun139ChunkWriter struct {
+	f         *Fs
+	tmp       *os.File
+	path      string
+	dirID     string
+	leaf      string
+	size      int64
+	chunkSize int64
+	total     int64
+	closed    bool
+}
+
+// WriteChunk writes chunkNumber at chunkNumber*chunkSize in the temp
+// file. The copy engine seeks the reader to the chunk start before
+// calling; concurrent out-of-order calls are safe because WriteAt is
+// position-addressed.
+func (w *yun139ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
+	if w.closed {
+		return 0, errors.New("yun139: chunk writer closed")
+	}
+	if int64(chunkNumber) >= w.total {
+		return 0, fmt.Errorf("yun139: chunk %d out of range (total %d)", chunkNumber, w.total)
+	}
+	offset := int64(chunkNumber) * w.chunkSize
+	// Read exactly this chunk's worth (the last chunk may be short).
+	limit := w.chunkSize
+	if remaining := w.size - offset; remaining < limit {
+		limit = remaining
+	}
+	// The engine positions the reader at the chunk start; read from the
+	// current position.
+	buf := make([]byte, limit)
+	m, err := io.ReadFull(reader, buf)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return 0, err
+	}
+	if _, err := w.tmp.WriteAt(buf[:m], offset); err != nil {
+		return 0, err
+	}
+	return int64(m), nil
+}
+
+// Close hashes the staged file and runs the standard upload pipeline.
+func (w *yun139ChunkWriter) Close(ctx context.Context) error {
+	if w.closed {
+		return errors.New("yun139: chunk writer already closed")
+	}
+	w.closed = true
+	defer func() {
+		_ = w.tmp.Close()
+		_ = os.Remove(w.path)
+	}()
+	if err := w.tmp.Sync(); err != nil {
+		return err
+	}
+	h := sha256.New()
+	if _, err := w.tmp.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if _, err := io.Copy(h, w.tmp); err != nil {
+		return fmt.Errorf("yun139: chunk writer hash: %w", err)
+	}
+	if _, err := w.tmp.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	_, err := w.f.uploadFromRandom(ctx, w.tmp, w.dirID, w.leaf, w.size, hex.EncodeToString(h.Sum(nil)))
+	if err != nil {
+		return fmt.Errorf("yun139: chunk writer upload: %w", err)
+	}
+	return nil
+}
+
+// Abort removes the temp file without uploading.
+func (w *yun139ChunkWriter) Abort(ctx context.Context) error {
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	_ = w.tmp.Close()
+	_ = os.Remove(w.path)
+	return nil
 }
 
 // PutUnchecked aliases Put: 139's /file/create handles the

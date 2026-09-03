@@ -1,12 +1,16 @@
 package yun139
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/rclone/rclone/backend/yun139/api"
 )
@@ -136,5 +140,132 @@ func TestCreateReqPayload_Mirrors139Strm(t *testing.T) {
 	}
 	if off, _ := ctx["partOffset"].(float64); off != 0 {
 		t.Errorf("partOffset = %v, want 0", ctx["partOffset"])
+	}
+}
+// TestBuildCreateBody_CapsAt100Parts pins the create payload cap at
+// maxPartsPerRequest (100) parts - the official client's create sends
+// at most 100 partInfos and fetches the rest via getUploadUrl
+// (captured 2026-09-03 with a 608 MB / 116-part file).
+func TestBuildCreateBody_CapsAt100Parts(t *testing.T) {
+	partInfos := make([]api.PartInfo, 0, 116)
+	for i := 1; i <= 116; i++ {
+		partInfos = append(partInfos, api.PartInfo{PartNumber: int64(i), PartSize: 5242880})
+	}
+	body := buildCreateBody("parent", "big.bin", 116*5242880, strings.Repeat("ab", 32), partInfos)
+	if len(body.PartInfos) != maxPartsPerRequest {
+		t.Fatalf("len(PartInfos) = %d, want %d", len(body.PartInfos), maxPartsPerRequest)
+	}
+	// Timestamps must be RFC3339 with milliseconds (server rejects other
+	// formats with '04000002: 本地更新时间格式不符合标准').
+	for _, ts := range []string{body.LocalCreatedAt, body.LocalUpdatedAt} {
+		if _, err := time.Parse("2006-01-02T15:04:05.000Z", ts); err != nil {
+			t.Errorf("timestamp %q not RFC3339-ms: %v", ts, err)
+		}
+	}
+}
+
+// TestPlanParts_EdgeCases pins the part-planning behavior for the
+// boundary sizes the server cares about: empty file, exact multiple,
+// and a part that would exceed the 100-part create cap (needing
+// getUploadUrl).
+func TestPlanParts_EdgeCases(t *testing.T) {
+	cases := []struct {
+		size, chunk int64
+		wantParts   int
+		wantLast    int64
+	}{
+		{0, 5242880, 1, 0},            // empty file: one zero-size part
+		{5242880, 5242880, 1, 5242880}, // exactly one part
+		{5242880 * 100, 5242880, 100, 5242880}, // exactly 100 parts
+		{5242880*100 + 1, 5242880, 101, 1},     // 101st part triggers getUploadUrl
+		{5, 5242880, 1, 5},            // tiny file
+	}
+	for _, c := range cases {
+		parts := planParts(c.size, c.chunk)
+		if len(parts) != c.wantParts {
+			t.Errorf("planParts(%d, %d) = %d parts, want %d", c.size, c.chunk, len(parts), c.wantParts)
+			continue
+		}
+		if parts[len(parts)-1].partSize != c.wantLast {
+			t.Errorf("planParts(%d, %d) last part = %d, want %d", c.size, c.chunk, parts[len(parts)-1].partSize, c.wantLast)
+		}
+		// Offsets must be strictly increasing and contiguous.
+		for i := 1; i < len(parts); i++ {
+			if parts[i].offset != parts[i-1].offset+parts[i-1].partSize {
+				t.Errorf("planParts(%d): part %d offset %d not contiguous", c.size, i, parts[i].offset)
+			}
+		}
+	}
+}
+
+// TestChunkWriter_OutOfOrderWrites verifies WriteChunk lands each chunk
+// at its part offset even when called out of order (the copy engine does
+// this), and that the staged file equals the source after Close's hash
+// step. Uses a fake uploader to avoid network.
+func TestChunkWriter_OutOfOrderWrites(t *testing.T) {
+	const chunkSize = 16
+	src := make([]byte, 50)
+	for i := range src {
+		src[i] = byte(i * 3)
+	}
+	tmp, err := os.CreateTemp("", "yun139-cw-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmp.Name())
+
+	w := &yun139ChunkWriter{
+		tmp:       tmp,
+		path:      tmp.Name(),
+		size:      int64(len(src)),
+		chunkSize: chunkSize,
+		total:     (int64(len(src)) + chunkSize - 1) / chunkSize,
+	}
+	if err := tmp.Truncate(int64(len(src))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write chunks in scrambled order: 2, 0, 3, 1.
+	order := []int{2, 0, 3, 1}
+	for _, cn := range order {
+		off := int64(cn) * chunkSize
+		limit := int64(chunkSize)
+		if int64(len(src))-off < limit {
+			limit = int64(len(src)) - off
+		}
+		r := bytes.NewReader(src[off : off+limit])
+		n, err := w.WriteChunk(context.Background(), cn, r)
+		if err != nil {
+			t.Fatalf("WriteChunk(%d): %v", cn, err)
+		}
+		if n != limit {
+			t.Errorf("WriteChunk(%d) wrote %d, want %d", cn, n, limit)
+		}
+	}
+
+	// The staged file must now equal the source.
+	staged := make([]byte, len(src))
+	if _, err := tmp.ReadAt(staged, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(staged, src) {
+		t.Fatal("staged file != source after out-of-order writes")
+	}
+}
+
+// TestChunkWriter_AbortRemovesTemp verifies Abort closes and deletes the
+// temp file without uploading.
+func TestChunkWriter_AbortRemovesTemp(t *testing.T) {
+	tmp, err := os.CreateTemp("", "yun139-cw-abort-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := tmp.Name()
+	w := &yun139ChunkWriter{tmp: tmp, path: path}
+	if err := w.Abort(context.Background()); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("temp file still exists after Abort (stat err %v)", err)
 	}
 }

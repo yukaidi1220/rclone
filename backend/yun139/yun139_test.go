@@ -75,3 +75,48 @@ func TestMd5hex(t *testing.T) {
 		t.Errorf("md5hex(hello) = %q, want %q", got, want)
 	}
 }
+
+// TestQuotaToUsage pins the MiB->bytes conversion against a real
+// captured quota response (2026-09-03: 701440 MiB total, 367136 MiB
+// free for a ~685 GiB free-tier account).
+func TestQuotaToUsage(t *testing.T) {
+	u := quotaToUsage(701440, 367136)
+	if u.Total == nil || u.Free == nil {
+		t.Fatal("nil Total/Free")
+	}
+	if *u.Total != 701440*1024*1024 {
+		t.Errorf("Total = %d, want %d", *u.Total, int64(701440)*1024*1024)
+	}
+	if *u.Free != 367136*1024*1024 {
+		t.Errorf("Free = %d, want %d", *u.Free, int64(367136)*1024*1024)
+	}
+}
+
+// TestQuotaToUsage_ZeroAccount pins the degenerate case: a brand-new
+// account with zero quota must not produce negative/overflow values.
+func TestQuotaToUsage_ZeroAccount(t *testing.T) {
+	u := quotaToUsage(0, 0)
+	if u.Total == nil || *u.Total != 0 {
+		t.Errorf("Total = %v, want 0", u.Total)
+	}
+	if u.Free == nil || *u.Free != 0 {
+		t.Errorf("Free = %v, want 0", u.Free)
+	}
+}
+
+// TestSrvPathCache_FamilyAndPersonal pins the id->path cache used to
+// translate family-space directory ids to server paths.
+func TestSrvPathCache_FamilyAndPersonal(t *testing.T) {
+	c := newSrvPathCache()
+	c.put("fam1", "root:/a/b")
+	if got, ok := c.get("fam1"); !ok || got != "root:/a/b" {
+		t.Errorf("get(fam1) = %q, %v; want root:/a/b, true", got, ok)
+	}
+	c.put("fam1", "root:/a/b/c")
+	if got, _ := c.get("fam1"); got != "root:/a/b/c" {
+		t.Errorf("after update get(fam1) = %q, want root:/a/b/c", got)
+	}
+	if _, ok := c.get("nope"); ok {
+		t.Error("get(nope) should miss")
+	}
+}
