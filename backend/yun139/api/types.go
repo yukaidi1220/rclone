@@ -505,13 +505,18 @@ type CommonUpload struct {
 }
 
 // PersonalCreateReq is the request for POST /file/create (regular file).
+// Field names mirror what alist/139Strm post: contentHash (not "sha256"),
+// parallelHashCtx per part, and an explicit type:"file". The server
+// decides 秒传 automatically from contentHash - we do NOT set a
+// rapidUpload flag.
 type PersonalCreateReq struct {
 	CommonUpload
-	FileRenameMode string `json:"fileRenameMode"`
-	// rapidUpload=true with SHA256 triggers 秒传 on the server.
-	RapidUpload bool `json:"rapidUpload"`
-	// auto_rename / refuse / replace (server-side; auto_rename is the safe default).
-	// ResType: 1 = success.
+	FileRenameMode       string     `json:"fileRenameMode"`
+	ContentHash          string     `json:"contentHash"`
+	ContentHashAlgorithm string     `json:"contentHashAlgorithm"`
+	ContentType          string     `json:"contentType"`
+	ParallelUpload       bool       `json:"parallelUpload"`
+	PartInfos            []PartInfo `json:"partInfos"`
 }
 
 // PartUploadInfo is one part URL returned by /file/create.
@@ -524,11 +529,12 @@ type PartUploadInfo struct {
 type PersonalCreateResp struct {
 	BaseResp
 	Data struct {
-		FileID    string           `json:"fileId"`
-		FileName  string           `json:"fileName"`
-		PartInfos []PartUploadInfo `json:"partInfos"`
-		UploadID  string           `json:"uploadId"`
-		Exists    bool             `json:"exists"`
+		FileID      string           `json:"fileId"`
+		FileName    string           `json:"fileName"`
+		PartInfos   []PartUploadInfo `json:"partInfos"`
+		UploadID    string           `json:"uploadId"`
+		Exists      bool             `json:"exists"`
+		RapidUpload bool             `json:"rapidUpload"`
 	} `json:"data"`
 }
 

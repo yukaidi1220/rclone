@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -152,6 +153,18 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	}
 	parts := planParts(size, chunkSize)
 	// First, ask the server to create (or rapid-upload) the file.
+	// The payload mirrors alist/139Strm: contentHash + type:file, no
+	// rapidUpload flag (the server decides instant-upload by hash).
+	partInfos := make([]api.PartInfo, 0, len(parts))
+	for _, p := range parts {
+		partInfos = append(partInfos, api.PartInfo{
+			PartNumber: p.index,
+			PartSize:   p.partSize,
+			ParallelHashCtx: &api.ParallelHashCtx{
+				PartOffset: p.offset,
+			},
+		})
+	}
 	body := api.PersonalCreateReq{
 		CommonUpload: api.CommonUpload{
 			ParentID: dirID,
@@ -159,15 +172,28 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 			SHA256:   hashHex,
 			Size:     size,
 			MD5:      "",
+			Type:     "file",
 		},
 		FileRenameMode: "auto_rename",
+	}
+	body.ContentHash = hashHex
+	body.ContentHashAlgorithm = "SHA256"
+	body.ContentType = "application/octet-stream"
+	body.ParallelUpload = false
+	body.PartInfos = partInfos
+	if len(body.PartInfos) > maxPartsPerRequest {
+		body.PartInfos = body.PartInfos[:maxPartsPerRequest]
 	}
 	var resp api.PersonalCreateResp
 	if err := f.personalCall(ctx, "/file/create", body, &resp); err != nil {
 		return nil, fmt.Errorf("create: %w", err)
 	}
-	// rapidUpload success path
-	if resp.Success && resp.Data.FileID != "" && len(resp.Data.PartInfos) == 0 {
+	fs.Debugf(f, "yun139: create returned %d part URLs, rapid=%v exists=%v", len(resp.Data.PartInfos), resp.Data.RapidUpload, resp.Data.Exists)
+	// rapidUpload success path: server already has the content (no part
+	// URLs to fetch and no upload body to send), or the file already
+	// exists under this name.
+	if resp.Success && resp.Data.FileID != "" &&
+		(resp.Data.RapidUpload || resp.Data.Exists || len(resp.Data.PartInfos) == 0) {
 		return &uploadResult{fileID: resp.Data.FileID, fileName: leaf}, nil
 	}
 	if !resp.Success {
@@ -184,7 +210,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		eg.Go(func() error {
 			pi := resp.Data.PartInfos[i]
 			rdr := io.NewSectionReader(freader, p.offset, p.partSize)
-			return f.putPart(ctx, rdr, pi.UploadURL)
+			return f.putPart(ctx, rdr, pi.UploadURL, p.partSize)
 		})
 	}
 	if err := eg.Wait(); err != nil {
@@ -466,7 +492,7 @@ func (f *Fs) uploadParts(ctx context.Context, data []byte, parts []partPlan, url
 		p := parts[i]
 		u := urls[i]
 		g.Go(func() error {
-			err := f.putPart(gctx, bytes.NewReader(data[p.offset:p.offset+p.partSize]), u.UploadURL)
+			err := f.putPart(gctx, bytes.NewReader(data[p.offset:p.offset+p.partSize]), u.UploadURL, p.partSize)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -504,7 +530,7 @@ func (f *Fs) uploadPartsRandom(ctx context.Context, in io.ReaderAt, parts []part
 		u := urls[i]
 		g.Go(func() error {
 			section := io.NewSectionReader(in, p.offset, p.partSize)
-			err := f.putPart(gctx, section, u.UploadURL)
+			err := f.putPart(gctx, section, u.UploadURL, p.partSize)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -521,7 +547,7 @@ func (f *Fs) uploadPartsRandom(ctx context.Context, in io.ReaderAt, parts []part
 }
 
 // putPart PUTs a single part to its pre-signed URL.
-func (f *Fs) putPart(ctx context.Context, r io.Reader, url string) error {
+func (f *Fs) putPart(ctx context.Context, r io.Reader, url string, size int64) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, r)
 	if err != nil {
 		return err
@@ -530,8 +556,13 @@ func (f *Fs) putPart(ctx context.Context, r io.Reader, url string) error {
 	req.Header.Set("Origin", yunBaseURL)
 	req.Header.Set("Referer", yunBaseURL+"/")
 	req.Header.Set("User-Agent", defaultUserAgent)
-	// Setting Content-Length for the underlying ReadSeeker improves CDN
-	// behaviour. The part is finite and the reader knows its size.
+	// Content-Length is part of the CDN's S3 signature: leaving it out
+	// makes the server reject the part with SignatureDoesNotMatch once
+	// it tries to verify the body. The caller must know the part size.
+	if size > 0 {
+		req.ContentLength = size
+		req.Header.Set("Content-Length", strconv.FormatInt(size, 10))
+	}
 	res, err := f.httpClient.Do(req)
 	if err != nil {
 		return err
