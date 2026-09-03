@@ -100,7 +100,7 @@ type Options struct {
 	Space         string `config:"space"`
 	FamilyID      string `config:"family_id"`
 	RootFolderID  string `config:"root_folder_id"`
-	UserDomainID  string `config:"user_domain_id"` // 1301956522699563527-style id, optional
+	UserDomainID  string `config:"user_domain_id"` // <user-domain-id>-style id, optional
 	HardDelete    bool   `config:"hard_delete"`
 	PartSize      fs.SizeSuffix `config:"part_size"`
 	UploadConcurrency int       `config:"upload_concurrency"`
@@ -140,7 +140,7 @@ func init() {
 			Sensitive: true,
 		}, {
 			Name: "user_domain_id",
-			Help: "The 1301956522699563527-style user domain id.\\n\\n" +
+			Help: "The <user-domain-id>-style user domain id.\\n\\n" +
 				"Found in the official client's request URLs ('u=' query param, " +
 				"also returned by user/getUser and queryFamilyCloud). Optional: " +
 				"when blank, the phone number is used where the server accepts it.",
@@ -241,7 +241,7 @@ type Fs struct {
 	familyRootMu *sync.Mutex
 	familyRootID string // server-side root catalog ID of the family cloud
 
-	userDomainID string // 1301956522699563527-style domain id, learned from queryFamilyCloud
+	userDomainID string // <user-domain-id>-style domain id, learned from queryFamilyCloud
 }
 
 // Object describes a yun139 object

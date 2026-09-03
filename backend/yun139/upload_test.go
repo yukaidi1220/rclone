@@ -151,7 +151,7 @@ func TestBuildCreateBody_CapsAt100Parts(t *testing.T) {
 	for i := 1; i <= 116; i++ {
 		partInfos = append(partInfos, api.PartInfo{PartNumber: int64(i), PartSize: 5242880})
 	}
-	body := buildCreateBody("parent", "big.bin", 116*5242880, strings.Repeat("ab", 32), partInfos)
+	body := buildCreateBody("parent", "big.bin", 116*5242880, strings.Repeat("ab", 32), partInfos, time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC))
 	if len(body.PartInfos) != maxPartsPerRequest {
 		t.Fatalf("len(PartInfos) = %d, want %d", len(body.PartInfos), maxPartsPerRequest)
 	}

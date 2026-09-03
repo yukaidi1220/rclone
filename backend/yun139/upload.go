@@ -82,7 +82,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		return nil, err
 	}
 	leaf = f.opt.Enc.FromStandardName(leaf)
-	res, err := f.uploadFile(ctx, in, dirID, leaf, size)
+	res, err := f.uploadFile(ctx, in, dirID, leaf, size, src.ModTime(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +104,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 // random-access SectionReader handles. This caps memory use to one
 // part (chunkSize) regardless of the file size, and the single pass
 // doubles as the midstate scan for parallelUpload.
-func (f *Fs) uploadFile(ctx context.Context, in io.Reader, dirID, leaf string, size int64) (*uploadResult, error) {
+func (f *Fs) uploadFile(ctx context.Context, in io.Reader, dirID, leaf string, size int64, modTime time.Time) (*uploadResult, error) {
 	if size <= 0 {
 		return nil, errors.New("yun139: size must be > 0")
 	}
@@ -115,7 +115,7 @@ func (f *Fs) uploadFile(ctx context.Context, in io.Reader, dirID, leaf string, s
 		if _, err := io.ReadFull(io.TeeReader(in, h), data); err != nil {
 			return nil, fmt.Errorf("yun139: read: %w", err)
 		}
-		return f.uploadFromRandom(ctx, bytes.NewReader(data), dirID, leaf, size, hex.EncodeToString(h.Sum(nil)))
+		return f.uploadFromRandom(ctx, bytes.NewReader(data), dirID, leaf, size, hex.EncodeToString(h.Sum(nil)), modTime)
 	}
 	// Streaming path for large files: stream the data through a temp file
 	// while hashing it, then drive /hcy/file/create + parallel part PUTs
@@ -141,7 +141,7 @@ func (f *Fs) uploadFile(ctx context.Context, in io.Reader, dirID, leaf string, s
 		_ = tmp.Close()
 		return nil, err
 	}
-	res, err := f.uploadFromRandom(ctx, tmp, dirID, leaf, size, hex.EncodeToString(h.Sum(nil)))
+	res, err := f.uploadFromRandom(ctx, tmp, dirID, leaf, size, hex.EncodeToString(h.Sum(nil)), modTime)
 	_ = tmp.Close()
 	return res, err
 }
@@ -151,7 +151,7 @@ func (f *Fs) uploadFile(ctx context.Context, in io.Reader, dirID, leaf string, s
 // contentHash + contentHashAlgorithm:SHA256 + contentType + parallelUpload:true
 // + partInfos[:100] + fileRenameMode:auto_rename + localCreatedAt/localUpdatedAt
 // in RFC3339 millisecond UTC.
-func buildCreateBody(dirID, leaf string, size int64, hashHex string, partInfos []api.PartInfo) api.PersonalCreateReq {
+func buildCreateBody(dirID, leaf string, size int64, hashHex string, partInfos []api.PartInfo, modTime time.Time) api.PersonalCreateReq {
 	body := api.PersonalCreateReq{
 		CommonUpload: api.CommonUpload{
 			ParentID: dirID,
@@ -166,12 +166,18 @@ func buildCreateBody(dirID, leaf string, size int64, hashHex string, partInfos [
 	body.ContentType = "application/octet-stream"
 	body.ParallelUpload = true
 	body.PartInfos = partInfos
-	// The official client stamps local timestamps in RFC3339 UTC with
-	// milliseconds, e.g. "2026-09-03T08:06:36.784Z". The server rejects
-	// other formats with '04000002: 本地更新时间格式不符合标准'.
-	now := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
-	body.LocalCreatedAt = now
-	body.LocalUpdatedAt = now
+	// The official client leaves localCreatedAt/localUpdatedAt empty
+	// (captured 2026-09-03), but the server may honour a client mtime
+	// if one is supplied. Pass the source's modTime (the rclone engine
+	// sets it from the local file) - if the server ignores it, the
+	// object falls back to server-side time, which is what the official
+	// client gets anyway.
+	ts := modTime.UTC().Format("2006-01-02T15:04:05.000Z")
+	if modTime.IsZero() {
+		ts = ""
+	}
+	body.LocalCreatedAt = ts
+	body.LocalUpdatedAt = ts
 	if len(body.PartInfos) > maxPartsPerRequest {
 		body.PartInfos = body.PartInfos[:maxPartsPerRequest]
 	}
@@ -182,7 +188,7 @@ func buildCreateBody(dirID, leaf string, size int64, hashHex string, partInfos [
 // the given *os.File (positioned at offset 0). The same file is used both
 // for hashing (already done) and for reading each part on demand via
 // io.SectionReader, so memory use is bounded by chunkSize.
-func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, leaf string, size int64, hashHex string) (*uploadResult, error) {
+func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, leaf string, size int64, hashHex string, modTime time.Time) (*uploadResult, error) {
 	chunkSize := int64(f.opt.PartSize)
 	if chunkSize <= 0 {
 		chunkSize = api.DefaultChunkSize
@@ -220,7 +226,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	if len(partInfos) > maxPartsPerRequest {
 		partInfos = partInfos[:maxPartsPerRequest]
 	}
-	body := buildCreateBody(dirID, leaf, size, hashHex, partInfos)
+	body := buildCreateBody(dirID, leaf, size, hashHex, partInfos, modTime)
 	var resp api.PersonalCreateResp
 	if err := f.personalCall(ctx, "/hcy/file/create", body, &resp); err != nil {
 		return nil, fmt.Errorf("create: %w", err)
@@ -365,7 +371,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 	leaf = o.fs.opt.Enc.FromStandardName(leaf)
 	tempLeaf := leaf + ".rclone-tmp-" + random.String(8)
-	res, err := o.fs.uploadFile(ctx, in, dirID, tempLeaf, size)
+	res, err := o.fs.uploadFile(ctx, in, dirID, tempLeaf, size, src.ModTime(ctx))
 	if err != nil {
 		return err
 	}
@@ -640,7 +646,7 @@ func (f *Fs) copyTaskID(ctx context.Context, id, dstDirID string) (string, error
 	}
 	err := f.pacer.Call(func() (bool, error) {
 		// The official client sends userId = userDomainId (the
-		// 1301956522699563527-style id) for copy; we only know the
+		// <user-domain-id>-style id) for copy; we only know the
 		// phone number at this point, so fall back to it. If the server
 		// rejects it, userDomainID discovery is needed.
 		userID := f.userDomainID
@@ -710,6 +716,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		size:      size,
 		chunkSize: chunkSize,
 		total:     (size + chunkSize - 1) / chunkSize,
+		modTime:   src.ModTime(ctx),
 	}
 	info = fs.ChunkWriterInfo{
 		ChunkSize:   chunkSize,
@@ -728,6 +735,7 @@ type yun139ChunkWriter struct {
 	size      int64
 	chunkSize int64
 	total     int64
+	modTime   time.Time
 	closed    bool
 }
 
@@ -784,7 +792,7 @@ func (w *yun139ChunkWriter) Close(ctx context.Context) error {
 	if _, err := w.tmp.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	_, err := w.f.uploadFromRandom(ctx, w.tmp, w.dirID, w.leaf, w.size, hex.EncodeToString(h.Sum(nil)))
+	_, err := w.f.uploadFromRandom(ctx, w.tmp, w.dirID, w.leaf, w.size, hex.EncodeToString(h.Sum(nil)), w.modTime)
 	if err != nil {
 		return fmt.Errorf("yun139: chunk writer upload: %w", err)
 	}
