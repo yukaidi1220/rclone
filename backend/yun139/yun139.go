@@ -872,7 +872,13 @@ func (f *Fs) familyRoot(ctx context.Context) (string, error) {
 func parsePath(p string) (root string) {
 	p = strings.ReplaceAll(p, "\\", "/")
 	clean := path.Clean(p)
-	if clean == "." || clean == "/" {
+	// path.Clean keeps a leading ".." (e.g. "../b"); strip any leading
+	// ".." segments so a root of "../b" resolves to "b".
+	for strings.HasPrefix(clean, "../") {
+		clean = strings.TrimPrefix(clean, "../")
+	}
+	clean = strings.TrimPrefix(clean, "..")
+	if clean == "." || clean == "/" || clean == "" {
 		return ""
 	}
 	return strings.Trim(clean, "/")
