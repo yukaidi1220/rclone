@@ -1504,10 +1504,17 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	}
 	// The server reports MiB units (701440 MiB ≈ 685 GiB); rclone's
 	// Usage is in bytes.
-	total := resp.Data.DiskSize * 1024 * 1024
-	free := resp.Data.FreeDiskSize * 1024 * 1024
+	return quotaToUsage(resp.Data.DiskSize, resp.Data.FreeDiskSize), nil
+}
+
+// quotaToUsage converts the server's MiB disk/free values to byte-based
+// fs.Usage. A captured response (2026-09-03) reported
+// {"diskSize":701440,"freeDiskSize":367136} for a ~685 GiB account.
+func quotaToUsage(diskMiB, freeMiB int64) *fs.Usage {
+	total := diskMiB * 1024 * 1024
+	free := freeMiB * 1024 * 1024
 	return &fs.Usage{
 		Total: &total,
 		Free:  &free,
-	}, nil
+	}
 }
