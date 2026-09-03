@@ -752,20 +752,6 @@ func (f *Fs) personalCloudHost(ctx context.Context) (string, error) {
 	return "", errors.New("yun139: no personal cloud host in route policy response")
 }
 
-// callHost returns the host the family / personal upload pipeline
-// (create / getUploadUrl / complete) should hit. Captured
-// 2026-09-03: personal uses the per-account personal-kd-*.yun.139.com
-// host; family uses the fixed group.yun.139.com.
-func (f *Fs) callHost() string {
-	if f.space == spaceFamily {
-		return api.FamilyBaseURL
-	}
-	if f.personalHost != "" {
-		return f.personalHost
-	}
-	return yunBaseURL
-}
-
 // queryFamilyCloud returns the user's family cloud list from
 // POST /hcy/family/adapter/andAlbum/openApi/queryFamilyCloud.
 //
@@ -1968,8 +1954,14 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	} else {
 		callPath = "/hcy/file/create"
 	}
-	if err := f.familyCall(ctx, callPath, callBody, &resp); err != nil {
-		return nil, fmt.Errorf("create: %w", err)
+	if f.space == spaceFamily {
+		if err := f.familyCall(ctx, callPath, callBody, &resp); err != nil {
+			return nil, fmt.Errorf("create: %w", err)
+		}
+	} else {
+		if err := f.personalCall(ctx, callPath, callBody, &resp); err != nil {
+			return nil, fmt.Errorf("create: %w", err)
+		}
 	}
 	fs.Debugf(f, "yun139: create returned %d part URLs, rapid=%v exists=%v", len(resp.Data.PartInfos), resp.Data.RapidUpload, resp.Data.Exists)
 	// rapidUpload success path: server already has the content (no part
@@ -2021,8 +2013,22 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		if f.space == spaceFamily {
 			urlPath = "/hcy/group/dynamic/file/getUploadUrl"
 		}
+		callURL := func() (string, error) {
+			if f.space == spaceFamily {
+				return api.FamilyBaseURL + urlPath, nil
+			}
+			host, err := f.personalCloudHost(ctx)
+			if err != nil {
+				return "", err
+			}
+			return host + urlPath, nil
+		}
 		if err := f.pacer.Call(func() (bool, error) {
-			err := f.call(ctx, f.callHost()+urlPath, urlBody, &urlResp)
+			u, err := callURL()
+			if err != nil {
+				return false, err
+			}
+			err = f.call(ctx, u, urlBody, &urlResp)
 			return shouldRetry(ctx, err)
 		}); err != nil {
 			return nil, fmt.Errorf("getUploadUrl: %w", err)
@@ -2075,7 +2081,15 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		cmplPath = "/hcy/group/dynamic/file/complete"
 	}
 	var cmplResp api.PersonalCompleteResp
-	if err := f.call(ctx, f.callHost()+cmplPath, cmpl, &cmplResp); err != nil {
+	cmplHost := api.FamilyBaseURL
+	if f.space != spaceFamily {
+		var err error
+		cmplHost, err = f.personalCloudHost(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := f.call(ctx, cmplHost+cmplPath, cmpl, &cmplResp); err != nil {
 		return nil, fmt.Errorf("complete: %w", err)
 	}
 	if !cmplResp.Success {
@@ -2240,19 +2254,41 @@ func (f *Fs) deleteTask(ctx context.Context, endpoint, id string) error {
 }
 
 // renameObject renames a file or folder.
+//
+// Family (captured 2026-09-03, PC client 8.8.6.20260829):
+//   - file:   POST .../modifyContentInfo
+//     {cloudID, contentID, contentName, path:<srvPath of the file>,
+//     commonAccountInfo:{userDomainId, accountType:"1"}}
+//   - folder: POST .../modifyCloudDocV2
+//     {catalogType:3, cloudID, docLibName, docLibraryID, manualRename:0,
+//     path:<srvPath of the folder>, commonAccountInfo:{...}}
+//
+// Personal: POST /hcy/file/update {fileId, name}.
 func (f *Fs) renameObject(ctx context.Context, id, newName, dirID string, family bool) error {
 	if family {
-		body := api.FamilyModifyDocV2Req{}
-		body.FamilyCommon.CloudID = f.opt.FamilyID
-		body.FamilyCommon.CommonAccountInfo.Account = f.account
-		body.FamilyCommon.CommonAccountInfo.AccountType = 1
-		body.CatalogType = 3
-		body.DocLibName = newName
-		body.DocLibraryID = id
-		// Path of the parent dir (dircache stores the family dirId here).
-		_ = dirID
+		srvPath := f.familySrvPath(id)
+		body := map[string]any{
+			"cloudID": f.opt.FamilyID,
+			"commonAccountInfo": map[string]any{
+				"userDomainId": f.userDomainID,
+				"accountType":  "1",
+			},
+		}
+		path := "/hcy/family/adapter/andAlbum/openApi/modifyContentInfo"
+		if srvPath != "" {
+			// The server-side path of a catalog entry is
+			// "root:/<parentId...>/<own id>"; the cache stores the
+			// entry's own path after a parent listing. The Update
+			// flow renames a freshly-uploaded file whose path has
+			// not been cached yet, so fall back to the parent path.
+			body["path"] = srvPath
+		} else {
+			body["path"] = f.familySrvPath(dirID)
+		}
+		body["contentID"] = id
+		body["contentName"] = newName
 		return f.pacer.Call(func() (bool, error) {
-			err := f.familyCall(ctx, "/modifyCloudDocV2", body, nil)
+			err := f.familyCall(ctx, path, body, nil)
 			return shouldRetry(ctx, err)
 		})
 	}
