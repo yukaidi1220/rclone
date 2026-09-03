@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -594,8 +595,17 @@ func (f *Fs) call(ctx context.Context, url string, body any, out any) error {
 	f.tokMu.Unlock()
 
 	var headers map[string]string
+	host := strings.SplitN(url, "/", 4)[2]
+	p := strings.SplitN(url, "?", 2)[0]
 	if strings.HasPrefix(url, yunBaseURL+"/orchestration") {
 		headers = legacyHeaders(auth, ts, randStr, sign, f.svcType)
+	} else if host == "group.yun.139.com" || strings.HasSuffix(p, "/hcy/group/dynamic/file/create") {
+		// Family space: lean header set, short UA, x-yun-url-type:3 on
+		// every call (captured 2026-09-03, family cloud).
+		headers = pcHeaders(auth, f.account, ts, randStr, sign, f.svcType)
+		headers["x-yun-url-type"] = "3"
+		headers["Accept"] = "*/*"
+		headers["x-DeviceInfo"] = f.deviceInfoHeader()
 	} else if f.space == spacePersonal {
 		// Personal space always speaks as the official PC client
 		// (captured 2026-09-03, client 8.8.6.20260829). The native
@@ -647,7 +657,20 @@ func (f *Fs) call(ctx context.Context, url string, body any, out any) error {
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return fmt.Errorf("yun139: decode envelope: %w (body %s)", err, truncate(string(raw), 500))
 	}
-	if !env.Success {
+	// Family adapter endpoints (group.yun.139.com/hcy/family/adapter/*)
+	// have no top-level success/code; their envelope is
+	// {result:{resultCode,resultDesc}} (captured 2026-09-03).
+	var famEnv struct {
+		Result struct {
+			ResultCode string `json:"resultCode"`
+			ResultDesc string `json:"resultDesc"`
+		} `json:"result"`
+	}
+	_ = json.Unmarshal(raw, &famEnv)
+	if famEnv.Result.ResultCode != "" && famEnv.Result.ResultCode != "0" {
+		return &apiError{Code: famEnv.Result.ResultCode, Message: famEnv.Result.ResultDesc}
+	}
+	if env.Code != "" && !env.Success {
 		// Some endpoints reply success=false but carry a nested
 		// resultCode=0 payload that actually succeeded (family move);
 		// surface the message but keep it non-retryable.
@@ -672,7 +695,37 @@ func (f *Fs) personalCall(ctx context.Context, pathname string, body any, out an
 
 // familyCall issues a family-cloud orchestration request.
 func (f *Fs) familyCall(ctx context.Context, pathname string, body any, out any) error {
-	return f.call(ctx, yunBaseURL+pathname, body, out)
+	return f.call(ctx, api.FamilyBaseURL+pathname, body, out)
+}
+
+// deviceInfoHeader returns the x-DeviceInfo value the official client
+// posts on every /hcy/group/dynamic/* call. The string has the shape
+//   "||<clientInfo>|<osInfo>|<screen>|<localeBase64>|||<osLocale>|"
+// with the fields delimited by "||".
+//
+// The fifth clientInfo field is a 16-byte hex device id. The official
+// client derives it from the install (persistent per account on a
+// given machine); we derive it deterministically from the phone
+// number so the same account on a re-run keeps the same value, while
+// a different account gets a different one. The server uses it only
+// for soft device-fingerprinting, so a stable per-account hash is
+// good enough (live test: family uploads accept any plausible
+// x-DeviceInfo value).
+func (f *Fs) deviceInfoHeader() string {
+	sum := md5.Sum([]byte(f.account))
+	deviceID := strings.ToUpper(hex.EncodeToString(sum[:8])) // 16 hex chars
+	return "||11|8.8.6.20260829|PC|REVTS1RPUC1CUklONDBD|" + deviceID + "|| Windows 11 (10.0.26200.8246)|1024X720|Q2hpbmVzZSAoU2ltcGxpZmllZCk=|||"
+}
+
+// familySeqNo returns a 32-char hex string the family-cloud create
+// endpoint expects in seqNo. The server uses it as a deduplication
+// key for batch operations; the value can be random.
+func familySeqNo() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return strings.Repeat("0", 32)
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // personalCloudHost discovers and caches the per-account personal cloud host.
@@ -707,13 +760,61 @@ func (f *Fs) personalCloudHost(ctx context.Context) (string, error) {
 	return "", errors.New("yun139: no personal cloud host in route policy response")
 }
 
+// callHost returns the host the family / personal upload pipeline
+// (create / getUploadUrl / complete) should hit. Captured
+// 2026-09-03: personal uses the per-account personal-kd-*.yun.139.com
+// host; family uses the fixed group.yun.139.com.
+func (f *Fs) callHost() string {
+	if f.space == spaceFamily {
+		return api.FamilyBaseURL
+	}
+	if f.personalHost != "" {
+		return f.personalHost
+	}
+	return yunBaseURL
+}
+
+// queryFamilyCloud returns the user's family cloud list from
+// POST /hcy/family/adapter/andAlbum/openApi/queryFamilyCloud.
+//
+// The official client (captured 2026-09-03) accepts an empty
+// userDomainId input (the server falls back to the phone number from
+// the auth header) and responds with the user's accountUserId plus
+// every family cloud the account belongs to. We use this both to
+// auto-discover userDomainId and to auto-pick a family_id when the
+// user did not set one.
+func (f *Fs) queryFamilyCloud(ctx context.Context) ([]api.FamilyCloud, string, error) {
+	body := map[string]any{
+		"commonAccountInfo": map[string]any{
+			// Empty userDomainId is accepted; the server resolves
+			// the account from the auth header. Sending the
+			// accountType matches the official client.
+			"accountType": 1,
+		},
+		"pageInfo": map[string]int{"pageNum": 1, "pageSize": 100},
+	}
+	var resp struct {
+		FamilyCloudList []api.FamilyCloud `json:"familyCloudList"`
+	}
+	if err := f.familyCall(ctx, "/hcy/family/adapter/andAlbum/openApi/queryFamilyCloud", body, &resp); err != nil {
+		return nil, "", fmt.Errorf("yun139: queryFamilyCloud: %w", err)
+	}
+	accountUserID := ""
+	for _, fc := range resp.FamilyCloudList {
+		if fc.CommonAccountInfo.AccountUserID != "" {
+			accountUserID = fc.CommonAccountInfo.AccountUserID
+			break
+		}
+	}
+	return resp.FamilyCloudList, accountUserID, nil
+}
+
 // familyRoot discovers the server-side root catalog ID of the family cloud.
 //
-// The family_id option is required: 139's family API does not expose a
-// "list my families" endpoint, so the only way for the backend to learn
-// the cloud id is from the config. An empty or wrong family_id makes the
-// first family endpoint call return '1010220314: 家庭云不存在' which we
-// surface verbatim to the user.
+// The official client reads the root from the first entry of the
+// queryContentListV3 response (`data.path` is "root:/<id>"). On
+// first call, we also auto-discover the family_id from
+// queryFamilyCloud when the user did not set it.
 func (f *Fs) familyRoot(ctx context.Context) (string, error) {
 	f.familyRootMu.Lock()
 	defer f.familyRootMu.Unlock()
@@ -721,31 +822,47 @@ func (f *Fs) familyRoot(ctx context.Context) (string, error) {
 		return f.familyRootID, nil
 	}
 	if f.opt.FamilyID == "" {
-		return "", errors.New("yun139: family_id is required when space=family; find it in the 139 client's family settings")
+		clouds, _, err := f.queryFamilyCloud(ctx)
+		if err != nil {
+			return "", err
+		}
+		if len(clouds) == 0 {
+			return "", errors.New("yun139: account has no family cloud; set --yun139-family-id or create one in the 139 client")
+		}
+		f.opt.FamilyID = clouds[0].CloudID
 	}
-	req := api.QueryContentListReq{}
-	req.FamilyCommon.CloudID = f.opt.FamilyID
-	req.FamilyCommon.CommonAccountInfo.Account = f.account
-	req.FamilyCommon.CommonAccountInfo.AccountType = 1
-	req.PageInfo.PageSize = 1
-	req.PageInfo.PageNum = 1
-	req.ContentSortType = 0
-	req.SortDirection = 1
-	var resp api.QueryContentListResp
-	if err := f.familyCall(ctx, "/orchestration/familyCloud-rebuild/content/v1.2/queryContentList", req, &resp); err != nil {
+	body := map[string]any{
+		"catalogSortType": 0,
+		"catalogType":     3,
+		"cloudID":         f.opt.FamilyID,
+		"cloudType":       1,
+		"contentSortType": 0,
+		"sortDirection":   1,
+		"path":            "",
+		"commonAccountInfo": map[string]any{
+			"userDomainId": f.userDomainID,
+			"accountType":  1,
+		},
+		"pageInfo": map[string]int{"pageNum": 1, "pageSize": 1},
+	}
+	var resp struct {
+		Path               string `json:"path"`
+		CloudCatalogList   []struct {
+			CatalogID string `json:"catalogID"`
+		} `json:"cloudCatalogList"`
+	}
+	if err := f.familyCall(ctx, "/hcy/family/adapter/andAlbum/openApi/queryContentListV3", body, &resp); err != nil {
 		return "", err
 	}
 	// The root path arrives as "root:/<id>"; strip the prefix.
-	p := strings.TrimSpace(resp.Data.Path)
+	p := strings.TrimSpace(resp.Path)
 	p = strings.TrimPrefix(p, "root:/")
 	p = strings.TrimPrefix(p, "root:")
 	if p == "" {
-		// Fall back to the first catalog's path.
-		for _, c := range resp.Data.CloudCatalogList {
-			if c.CatalogID != "" {
-				f.familyRootID = c.CatalogID
-				return f.familyRootID, nil
-			}
+		// Fall back to the first catalog's id.
+		if len(resp.CloudCatalogList) > 0 && resp.CloudCatalogList[0].CatalogID != "" {
+			f.familyRootID = resp.CloudCatalogList[0].CatalogID
+			return f.familyRootID, nil
 		}
 		return "", errors.New("yun139: no path in family root response")
 	}
@@ -775,9 +892,8 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 	default:
 		return nil, fmt.Errorf("yun139: space must be %q or %q, got %q", spacePersonal, spaceFamily, opt.Space)
 	}
-	if opt.Space == spaceFamily && opt.FamilyID == "" {
-		return nil, errors.New("yun139: family_id is required when space is family")
-	}
+	// (family_id is auto-discovered in NewFs via queryFamilyCloud when
+	// not set; personal space needs no extra config.)
 	if opt.PartSize < 1024*1024 {
 		return nil, fmt.Errorf("yun139: part_size must be at least 1Mi, got %s", opt.PartSize)
 	}
@@ -839,6 +955,19 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Validate the token and refresh if it is close to expiry.
 	if err := f.refreshToken(ctx); err != nil {
 		return nil, err
+	}
+
+	// Auto-discover the userDomainId (the <digits> id batchCopy and
+	// quota need) from queryFamilyCloud. The official client caches
+	// this from login; we learn it in one extra request. An explicit
+	// --yun139-user-domain-id still wins.
+	if f.userDomainID == "" {
+		if _, accountUserID, err := f.queryFamilyCloud(ctx); err == nil && accountUserID != "" {
+			f.userDomainID = accountUserID
+		}
+		// A failure here is not fatal: personal-space operations
+		// that do not need the domain id keep working (the quota
+		// call falls back to the phone number).
 	}
 
 	rootID := f.opt.RootFolderID
@@ -990,36 +1119,55 @@ func (f *Fs) listFamily(ctx context.Context, dirID string, fn func(listEntry) bo
 	}
 	pageNum := 1
 	for page := 0; page < maxListPages; page++ {
-		body := api.QueryContentListReq{}
-		body.FamilyCommon.CloudID = f.opt.FamilyID
-		body.FamilyCommon.CommonAccountInfo.Account = f.account
-		body.FamilyCommon.CommonAccountInfo.AccountType = 1
-		body.ContentSortType = 0
-		body.SortDirection = 1
-		body.PageInfo.PageNum = pageNum
-		body.PageInfo.PageSize = listPageSize
-		if dirID != rootID {
-			body.CatalogID = dirID
+		body := map[string]any{
+			"catalogSortType": 0,
+			"catalogType":     3,
+			"cloudID":         f.opt.FamilyID,
+			"cloudType":       1,
+			"contentSortType": 0,
+			"sortDirection":   1,
+			"path":            "",
+			"commonAccountInfo": map[string]any{
+				"userDomainId": f.userDomainID,
+				"accountType":  1,
+			},
+			"pageInfo": map[string]int{"pageNum": pageNum, "pageSize": listPageSize},
 		}
-		var resp api.QueryContentListResp
+		if dirID != rootID {
+			body["catalogID"] = dirID
+			body["path"] = f.familySrvPath(dirID)
+		}
+		var resp struct {
+			Path             string `json:"path"`
+			TotalCount       int    `json:"totalCount"`
+			CloudCatalogList []struct {
+				CatalogID      string `json:"catalogID"`
+				CatalogName    string `json:"catalogName"`
+				LastUpdateTime string `json:"lastUpdateTime"`
+			} `json:"cloudCatalogList"`
+			CloudContentList []struct {
+				ContentID      string `json:"contentID"`
+				ContentName    string `json:"contentName"`
+				ContentSize    int64  `json:"contentSize"`
+				LastUpdateTime string `json:"lastUpdateTime"`
+			} `json:"cloudContentList"`
+		}
 		err := f.pacer.Call(func() (bool, error) {
-			err := f.familyCall(ctx, "/orchestration/familyCloud-rebuild/content/v1.2/queryContentList", body, &resp)
+			err := f.familyCall(ctx, "/hcy/family/adapter/andAlbum/openApi/queryContentListV3", body, &resp)
 			return shouldRetry(ctx, err)
 		})
 		if err != nil {
 			return err
 		}
-		if resp.Data.Result.ResultCode != "0" && resp.Data.Result.ResultCode != "" {
-			return &apiError{Code: resp.Data.Result.ResultCode, Message: resp.Data.Result.ResultDesc}
-		}
-		dirPath := resp.Data.Path
+		dirPath := resp.Path
 		f.srvPathOf.put(dirID, dirPath)
 		if dirPath == "" {
-			f.srvPathOf.put(dirID, "root:/")
+			dirPath = "root:/"
+			f.srvPathOf.put(dirID, dirPath)
 		}
 		n := 0
-		for i := range resp.Data.CloudCatalogList {
-			c := &resp.Data.CloudCatalogList[i]
+		for i := range resp.CloudCatalogList {
+			c := &resp.CloudCatalogList[i]
 			if c.CatalogID == "" {
 				continue
 			}
@@ -1038,8 +1186,8 @@ func (f *Fs) listFamily(ctx context.Context, dirID string, fn func(listEntry) bo
 				return nil
 			}
 		}
-		for i := range resp.Data.CloudContentList {
-			c := &resp.Data.CloudContentList[i]
+		for i := range resp.CloudContentList {
+			c := &resp.CloudContentList[i]
 			if c.ContentID == "" {
 				continue
 			}
@@ -1058,8 +1206,7 @@ func (f *Fs) listFamily(ctx context.Context, dirID string, fn func(listEntry) bo
 			}
 		}
 		// totalCount counts the entries of this dir; stop when we have them all.
-		total := resp.Data.TotalCount
-		if total > 0 && n >= total {
+		if resp.TotalCount > 0 && n >= resp.TotalCount {
 			return nil
 		}
 		if n < listPageSize {
@@ -1131,26 +1278,51 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
 	leaf = f.opt.Enc.FromStandardName(leaf)
 	if f.space == spaceFamily {
-		body := api.FamilyCreateFolderReq{}
-		body.FamilyCommon.CloudID = f.opt.FamilyID
-		body.FamilyCommon.CommonAccountInfo.Account = f.account
-		body.FamilyCommon.CommonAccountInfo.AccountType = 1
-		body.DocLibName = leaf
-		// The server needs the parent's server-side path; the dircache holds IDs.
-		// For creation the parent path of the family root is the root itself.
 		srvPath := ""
-		if pathID != "" && pathID != f.opt.RootFolderID {
+		// The dircache remembers the root id; only fall back to
+		// looking up a server-side path when the parent is NOT the
+		// root. We use the dirCache root rather than the (possibly
+		// empty) opt.RootFolderID.
+		rootID, errRoot := f.familyRoot(ctx)
+		if errRoot != nil {
+			return "", errRoot
+		}
+		if pathID != "" && pathID != rootID {
 			srvPath = f.familySrvPath(pathID)
 		}
-		body.Path = srvPath
-		var resp api.FamilyCreateFolderResp
-		if err := f.familyCall(ctx, "/orchestration/familyCloud-rebuild/cloudCatalog/v1.0/createCloudDoc", body, &resp); err != nil {
+		// POST .../createCloudDocV2 (captured 2026-09-03) accepts
+		// {catalogType, cloudID, docLibName, manualRename, path,
+		//  commonAccountInfo} and returns {catalogInfo.catalogID}.
+		body := map[string]any{
+			"catalogType": 3,
+			"cloudID":     f.opt.FamilyID,
+			"docLibName":  leaf,
+			"manualRename": 0,
+			"path":        srvPath,
+			"commonAccountInfo": map[string]any{
+				"userDomainId": f.userDomainID,
+				"accountType":  1,
+			},
+		}
+		var resp struct {
+			Result struct {
+				ResultCode string `json:"resultCode"`
+				ResultDesc string `json:"resultDesc"`
+			} `json:"result"`
+			CatalogInfo struct {
+				CatalogID string `json:"catalogID"`
+			} `json:"catalogInfo"`
+		}
+		if err := f.familyCall(ctx, "/hcy/family/adapter/andAlbum/openApi/createCloudDocV2", body, &resp); err != nil {
 			return "", err
 		}
-		if resp.Data.Result.ResultCode != "0" {
-			return "", &apiError{Code: resp.Data.Result.ResultCode, Message: resp.Data.Result.ResultDesc}
+		if resp.Result.ResultCode != "0" {
+			return "", &apiError{Code: resp.Result.ResultCode, Message: resp.Result.ResultDesc}
 		}
-		// createCloudDoc returns no ID; find it by listing the parent.
+		if resp.CatalogInfo.CatalogID != "" {
+			return resp.CatalogInfo.CatalogID, nil
+		}
+		// Fall back to listing the parent.
 		return f.findDirID(ctx, pathID, leaf)
 	}
 	// The official client posts exactly {"name","type":"folder",
@@ -1233,9 +1405,18 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return fs.ErrorDirectoryNotEmpty
 	}
 	if f.space == spaceFamily {
-		// Deletion of family folders is not supported (the API returns a
-		// misleading error); the family root cannot be deleted anyway.
-		return errors.New("yun139: cannot remove the family root")
+		// Deleting the family root is not allowed.
+		rootID, err := f.familyRoot(ctx)
+		if err != nil {
+			return err
+		}
+		if dirID == rootID {
+			return errors.New("yun139: cannot remove the family root")
+		}
+		// Sub-folder deletion goes through the batch task pipeline
+		// (createBatchOprTaskV2 with taskType=2 and the catalogList
+		// field set to the dir id).
+		return f.familyDeleteID(ctx, dirID, f.familySrvPath(dirID))
 	}
 	if err := f.deleteObject(ctx, dirID, "", false); err != nil {
 		return err

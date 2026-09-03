@@ -20,6 +20,7 @@
 package api
 
 import (
+	"encoding/json"
 	"time"
 )
 
@@ -196,6 +197,31 @@ type PersonalUploadURLResp struct {
 }
 
 // ---------------------------------------------------------- family -------
+
+// FamilyBaseURL is the host every family-cloud API lives on
+// (captured 2026-09-03, PC client 8.8.6.20260829). The new family API
+// moved from yun.139.com/orchestration/familyCloud-rebuild/* to
+// group.yun.139.com/hcy/family/adapter/andAlbum/openApi/*, with the
+// upload pipeline on group.yun.139.com/hcy/group/dynamic/*.
+const FamilyBaseURL = "https://group.yun.139.com"
+
+// FamilyCloud is one entry in the queryFamilyCloud response. Captured
+// 2026-09-03 from the official PC client.
+type FamilyCloud struct {
+	CommonAccountInfo struct {
+		Account       string      `json:"account"`
+		AccountUserID string      `json:"accountUserId"`
+		AccountType   json.Number  `json:"accountType"` // server sends "1" or 1
+	} `json:"commonAccountInfo"`
+	Nickname      string `json:"nickname"`
+	CloudNickName string `json:"cloudNickName"`
+	CloudID       string `json:"cloudID"`
+	CloudName     string `json:"cloudName"`
+	CloudDesc     string `json:"cloudDesc"`
+	CloudType     int    `json:"cloudType"`
+	CreateTime    string `json:"createTime"`
+	LastUpdateTime string `json:"lastUpdateTime"`
+}
 
 // FamilyCommon is the envelope shared by every family-cloud orchestration
 // request.
@@ -531,10 +557,14 @@ type Region struct {
 	ProvinceCode string `json:"provinceCode"`
 }
 
-// PartUploadInfo is one part URL returned by /file/create.
+// PartUploadInfo is one part URL returned by /file/create and
+// /file/getUploadUrl. The server sends "uploadUrl" (lowercase l) and
+// does NOT order partInfos by partNumber in the getUploadUrl response
+// (captured 2026-09-03: [110, 111, 112, 101, 113, ...]) - match by
+// PartNumber, never by slice index.
 type PartUploadInfo struct {
 	PartNumber int    `json:"partNumber"`
-	UploadURL  string `json:"uploadURL"`
+	UploadURL  string `json:"uploadUrl"`
 }
 
 // PersonalCreateResp is the response of POST /file/create.
@@ -550,14 +580,18 @@ type PersonalCreateResp struct {
 	} `json:"data"`
 }
 
-// PersonalCompleteReq is the request for POST /hcy/file/complete.
-// Mirrors the official client (captured 2026-09-03):
-// {contentHash, contentHashAlgorithm, fileId, uploadId} - no size.
+// PersonalCompleteReq is the request for POST /hcy/file/complete
+// (personal) or /hcy/group/dynamic/file/complete (family).
+// Mirrors the official client (captured 2026-09-03): for personal
+// {contentHash, contentHashAlgorithm, fileId, uploadId}; family adds
+// {groupId, accountUserId}.
 type PersonalCompleteReq struct {
 	FileID               string `json:"fileId"`
 	UploadID             string `json:"uploadId"`
 	ContentHash          string `json:"contentHash"`
 	ContentHashAlgorithm string `json:"contentHashAlgorithm"`
+	GroupID              string `json:"groupId,omitempty"`
+	AccountUserID        string `json:"accountUserId,omitempty"`
 }
 
 // PersonalCompleteResp is the response of POST /file/complete.
