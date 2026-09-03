@@ -169,9 +169,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		CommonUpload: api.CommonUpload{
 			ParentID: dirID,
 			Name:     leaf,
-			SHA256:   hashHex,
 			Size:     size,
-			MD5:      "",
 			Type:     "file",
 		},
 		FileRenameMode: "auto_rename",

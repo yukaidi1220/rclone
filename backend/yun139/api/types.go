@@ -494,13 +494,13 @@ type AndAlbumCopyReq struct {
 const DefaultChunkSize int64 = 100 * 1024 * 1024
 
 // CommonUpload groups the fields shared by /file/create across the file
-// types (regular, folder, etc.).
+// types (regular, folder, etc.). The hash lives in PersonalCreateReq's
+// ContentHash (set explicitly so it serialises as "contentHash", not
+// "sha256" or "md5", which the server reads as legacy and can reject).
 type CommonUpload struct {
 	ParentID string `json:"parentFileId"`
 	Name     string `json:"name"`
-	SHA256   string `json:"sha256"`
 	Size     int64  `json:"size"`
-	MD5      string `json:"md5"`
 	Type     string `json:"type,omitempty"`
 }
 
