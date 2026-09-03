@@ -40,24 +40,43 @@ func (o *Object) invalidateURL() {
 // fetchDownloadURL requests a fresh download URL for the object.
 func (f *Fs) fetchDownloadURL(ctx context.Context, o *Object) (string, error) {
 	if f.space == spaceFamily {
-		body := api.FamilyDownloadReq{}
-		body.FamilyCommon.CloudID = f.opt.FamilyID
-		body.FamilyCommon.CommonAccountInfo.Account = f.account
-		body.FamilyCommon.CommonAccountInfo.AccountType = 1
-		body.ContentID = o.id
-		body.Path = o.serverPath
-		var resp api.FamilyDownloadResp
+		// POST .../getFileDownLoadURLV2 (captured 2026-09-03). The
+		// server returns a single "downloadURL" string.
+		body := map[string]any{
+			"catalogType": 3,
+			"cloudID":     f.opt.FamilyID,
+			"cloudType":   1,
+			"commonAccountInfo": map[string]any{
+				"account":     f.account,
+				"accountType": "1",
+			},
+			"contentID": o.id,
+			"extInfo": map[string]string{
+				"isReturnCdnDownloadUrl": "1",
+			},
+			"path": o.serverPath,
+		}
+		var resp struct {
+			Result struct {
+				ResultCode string `json:"resultCode"`
+				ResultDesc string `json:"resultDesc"`
+			} `json:"result"`
+			DownloadURL string `json:"downloadURL"`
+		}
 		err := f.pacer.Call(func() (bool, error) {
-			err := f.familyCall(ctx, "/orchestration/familyCloud-rebuild/content/v1.0/getFileDownLoadURL", body, &resp)
+			err := f.familyCall(ctx, "/hcy/family/adapter/andAlbum/openApi/getFileDownLoadURLV2", body, &resp)
 			return shouldRetry(ctx, err)
 		})
 		if err != nil {
 			return "", err
 		}
-		if resp.Data.DownloadURL == "" {
+		if resp.Result.ResultCode != "0" {
+			return "", &apiError{Code: resp.Result.ResultCode, Message: resp.Result.ResultDesc}
+		}
+		if resp.DownloadURL == "" {
 			return "", fmt.Errorf("yun139: no download URL returned for %q", o.remote)
 		}
-		return resp.Data.DownloadURL, nil
+		return resp.DownloadURL, nil
 	}
 	// The official client requests a 24h link (expireSec:86400).
 	body := map[string]any{"fileId": o.id, "expireSec": 86400}

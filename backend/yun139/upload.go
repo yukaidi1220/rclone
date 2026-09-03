@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rclone/rclone/backend/yun139/api"
 	"github.com/rclone/rclone/fs"
@@ -165,14 +166,17 @@ func buildCreateBody(dirID, leaf string, size int64, hashHex string, partInfos [
 	body.ContentType = "application/octet-stream"
 	body.ParallelUpload = true
 	body.PartInfos = partInfos
-	// The official client sends localCreatedAt/localUpdatedAt as empty
-	// strings (captured 2026-09-03, v8.8.6.20260829) and the server
-	// ignores any client-supplied value anyway - it stamps the server
-	// clock as the file time. Live test with a 2001-02-03 mtime: the
-	// object came back with the upload time. So we mirror the official
-	// client and send empty strings.
-	body.LocalCreatedAt = ""
-	body.LocalUpdatedAt = ""
+	// The official client sends localCreatedAt/localUpdatedAt as
+	// RFC3339 UTC with milliseconds (captured 2026-09-03,
+	// v8.8.6.20260829 - e.g. "2026-09-03T08:06:36.784Z"). The server
+	// REJECTS empty strings with '04000002: 本地创建时间格式不符合标准',
+	// but ignores the actual value in favour of its own clock. So we
+	// send a valid-format stamp from time.Now() and let the server
+	// overwrite the read-back value (mirrors official client + keeps
+	// us within the format spec).
+	now := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+	body.LocalCreatedAt = now
+	body.LocalUpdatedAt = now
 	if len(body.PartInfos) > maxPartsPerRequest {
 		body.PartInfos = body.PartInfos[:maxPartsPerRequest]
 	}
@@ -222,8 +226,56 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		partInfos = partInfos[:maxPartsPerRequest]
 	}
 	body := buildCreateBody(dirID, leaf, size, hashHex, partInfos)
-	var resp api.PersonalCreateResp
-	if err := f.personalCall(ctx, "/hcy/file/create", body, &resp); err != nil {
+	// Family space uses a different create endpoint
+	// (/hcy/group/dynamic/file/create, captured 2026-09-03) on the
+	// group.yun.139.com host, with extra fields {groupId, groupType,
+	// seqNo, expireSec}. The response envelope is the same shape
+	// (fileId / uploadId / partInfos / rapidUpload) but inside data
+	// plus an extra "file" object. We treat the two flows as parallel
+	// by mapping both into a unified PartInfos[] result.
+	var resp struct {
+		api.BaseResp
+		Data struct {
+			FileID      string               `json:"fileId"`
+			FileName    string               `json:"fileName"`
+			UploadID    string               `json:"uploadId"`
+			RapidUpload bool                 `json:"rapidUpload"`
+			Exists      *bool                `json:"exist"`
+			PartInfos   []api.PartUploadInfo `json:"partInfos"`
+		} `json:"data"`
+	}
+	var callPath string
+	var callBody any = body
+	if f.space == spaceFamily {
+		callPath = "/hcy/group/dynamic/file/create"
+		fb := map[string]any{
+			"contentHash":          body.ContentHash,
+			"contentHashAlgorithm": body.ContentHashAlgorithm,
+			"expireSec":            86400,
+			"fileRenameMode":       body.FileRenameMode,
+			"groupId":              f.opt.FamilyID,
+			"groupType":            1,
+			"localCreatedAt":       body.LocalCreatedAt,
+			"localUpdatedAt":       body.LocalUpdatedAt,
+			"name":                 body.Name,
+			"parallelUpload":       body.ParallelUpload,
+			"parentFileId":         body.ParentID,
+			"partInfos":            partInfos,
+			"seqNo":                familySeqNo(),
+			"size":                 body.Size,
+			"type":                 body.Type,
+		}
+		if body.UserRegion != nil {
+			fb["userRegion"] = map[string]any{
+				"cityCode":     body.UserRegion.CityCode,
+				"provinceCode": body.UserRegion.ProvinceCode,
+			}
+		}
+		callBody = fb
+	} else {
+		callPath = "/hcy/file/create"
+	}
+	if err := f.familyCall(ctx, callPath, callBody, &resp); err != nil {
 		return nil, fmt.Errorf("create: %w", err)
 	}
 	fs.Debugf(f, "yun139: create returned %d part URLs, rapid=%v exists=%v", len(resp.Data.PartInfos), resp.Data.RapidUpload, resp.Data.Exists)
@@ -231,7 +283,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	// URLs to fetch and no upload body to send), or the file already
 	// exists under this name.
 	if resp.Success && resp.Data.FileID != "" &&
-		(resp.Data.RapidUpload || resp.Data.Exists || len(resp.Data.PartInfos) == 0) {
+		(resp.Data.RapidUpload || (resp.Data.Exists != nil && *resp.Data.Exists) || len(resp.Data.PartInfos) == 0) {
 		return &uploadResult{fileID: resp.Data.FileID, fileName: leaf}, nil
 	}
 	if !resp.Success {
@@ -254,12 +306,17 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		}
 		// Reuse the precomputed partInfos (with parallelHashCtx) for
 		// parts 101+ - the official client sends the same entries to
-		// /hcy/file/getUploadUrl.
+		// /hcy/file/getUploadUrl (personal) or
+		// /hcy/group/dynamic/file/getUploadUrl (family).
 		urlBody := map[string]any{
 			"fileId":         resp.Data.FileID,
 			"uploadId":       resp.Data.UploadID,
 			"parallelUpload": true,
 			"partInfos":      allPartInfos[i:end],
+		}
+		if f.space == spaceFamily {
+			urlBody["groupId"] = f.opt.FamilyID
+			urlBody["groupType"] = 1
 		}
 		var urlResp struct {
 			api.BaseResp
@@ -267,8 +324,12 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 				PartInfos []api.PartUploadInfo `json:"partInfos"`
 			} `json:"data"`
 		}
+		urlPath := "/hcy/file/getUploadUrl"
+		if f.space == spaceFamily {
+			urlPath = "/hcy/group/dynamic/file/getUploadUrl"
+		}
 		if err := f.pacer.Call(func() (bool, error) {
-			err := f.personalCall(ctx, "/hcy/file/getUploadUrl", urlBody, &urlResp)
+			err := f.call(ctx, f.callHost()+urlPath, urlBody, &urlResp)
 			return shouldRetry(ctx, err)
 		}); err != nil {
 			return nil, fmt.Errorf("getUploadUrl: %w", err)
@@ -278,16 +339,27 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		}
 		allParts = append(allParts, urlResp.Data.PartInfos...)
 	}
+	// The server does not guarantee partInfos ordering in the
+	// getUploadUrl response (captured 2026-09-03: [110, 111, 112, 101,
+	// 113, ...]), so index-aligning allParts with parts would put
+	// chunks on the wrong URLs. Match by partNumber instead.
+	urlOfPart := make(map[int]string, len(parts))
+	for _, pi := range allParts {
+		if pi.PartNumber > 0 {
+			urlOfPart[pi.PartNumber] = pi.UploadURL
+		}
+	}
 	var eg errgroup.Group
 	eg.SetLimit(f.opt.UploadConcurrency)
-	for i, p := range parts {
-		i, p := i, p
+	for _, p := range parts {
+		p := p
 		eg.Go(func() error {
-			if i >= len(allParts) {
+			url, ok := urlOfPart[int(p.index)]
+			if !ok {
 				return fmt.Errorf("yun139: no upload URL for part %d", p.index)
 			}
 			rdr := io.NewSectionReader(freader, p.offset, p.partSize)
-			return f.putPart(ctx, rdr, allParts[i].UploadURL, p.partSize)
+			return f.putPart(ctx, rdr, url, p.partSize)
 		})
 	}
 	if err := eg.Wait(); err != nil {
@@ -301,8 +373,16 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		ContentHash:          hashHex,
 		ContentHashAlgorithm: "SHA256",
 	}
+	if f.space == spaceFamily {
+		cmpl.GroupID = f.opt.FamilyID
+		cmpl.AccountUserID = f.userDomainID
+	}
+	cmplPath := "/hcy/file/complete"
+	if f.space == spaceFamily {
+		cmplPath = "/hcy/group/dynamic/file/complete"
+	}
 	var cmplResp api.PersonalCompleteResp
-	if err := f.personalCall(ctx, "/hcy/file/complete", cmpl, &cmplResp); err != nil {
+	if err := f.call(ctx, f.callHost()+cmplPath, cmpl, &cmplResp); err != nil {
 		return nil, fmt.Errorf("complete: %w", err)
 	}
 	if !cmplResp.Success {
@@ -420,19 +500,23 @@ func (f *Fs) findByNameInDir(ctx context.Context, dirID, name string) (string, e
 // /recyclebin/batchTrash (or /file/batchDelete if hard_delete is on).
 func (f *Fs) deleteObject(ctx context.Context, id, srvPath string, family bool) error {
 	if family {
-		body := api.FamilyDeleteReq{}
-		body.FamilyCommon.CloudID = f.opt.FamilyID
-		body.FamilyCommon.CommonAccountInfo.Account = f.account
-		body.FamilyCommon.CommonAccountInfo.AccountType = 1
-		body.ContentList = []string{id}
-		body.SourceCloudID = f.opt.FamilyID
-		body.SourceCatalogType = 1002
-		body.TaskType = 2
-		body.Path = srvPath
-		return f.pacer.Call(func() (bool, error) {
-			err := f.familyCall(ctx, "/orchestration/familyCloud-rebuild/batchOprTask/v1.0/createBatchOprTask", body, nil)
-			return shouldRetry(ctx, err)
+		taskID, err := f.familyBatchOprTask(ctx, familyBatchReq{
+			ContentList:       []string{id},
+			DestCloudID:       "",    // delete - no dest
+			DestCatalogType:   1002,
+			DestType:          "1",
+			DestPath:          "",
+			SourceCatalogType: 1002,
+			SourceCloudID:     f.opt.FamilyID,
+			SourceType:        "1",
+			Path:              srvPath,
+			TaskType:          2, // delete
+			BusinessType:      2,
 		})
+		if err != nil {
+			return err
+		}
+		return f.familyTaskPoll(ctx, taskID)
 	}
 	if f.opt.HardDelete {
 		return f.deleteTask(ctx, "/hcy/file/batchDelete", id)
@@ -507,24 +591,14 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, dst fs.Fs, dstDir string) 
 		return err
 	}
 	if f.space == spaceFamily {
-		body := api.IsboBatchOprTaskReq{}
-		body.AccountInfo.AccountName = f.account
-		body.AccountInfo.AccountType = "1"
-		body.DestCatalogID = dstDirID
-		body.DestGroupID = f.opt.FamilyID
-		body.DestType = 0
-		body.SrcGroupID = f.opt.FamilyID
-		body.SrcType = 0
-		body.TaskType = 3
-		if srcObj.isDir {
-			body.CatalogList = []string{srcObj.serverPath}
-		} else {
-			body.ContentList = []string{path.Join(srcObj.serverPath, srcObj.id)}
+		// The PC client no longer has a "move" button inside the family
+		// cloud (transfers are copy + manual delete). rclone's Move
+		// falls back to "copy then delete" which the server surfaces
+		// as taskType 1 (copy) followed by taskType 2 (delete).
+		if err := f.familyCopy(ctx, srcObj, dstDirID); err != nil {
+			return err
 		}
-		return f.pacer.Call(func() (bool, error) {
-			err := f.familyCall(ctx, "/orchestration/familyCloud-rebuild/batchOprTask/v1.0/createBatchOprTask", body, nil)
-			return shouldRetry(ctx, err)
-		})
+		return f.deleteObject(ctx, srcObj.id, srcObj.serverPath, true)
 	}
 	taskID, err := f.moveTaskID(ctx, srcObj.id, dstDirID)
 	if err != nil {
@@ -572,20 +646,11 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return err
 	}
 	if f.space == spaceFamily {
-		body := api.IsboBatchOprTaskReq{}
-		body.AccountInfo.AccountName = f.account
-		body.AccountInfo.AccountType = "1"
-		body.CatalogList = []string{srcID}
-		body.DestCatalogID = dstID
-		body.DestGroupID = f.opt.FamilyID
-		body.DestType = 0
-		body.SrcGroupID = f.opt.FamilyID
-		body.SrcType = 0
-		body.TaskType = 3
-		return f.pacer.Call(func() (bool, error) {
-			err := f.familyCall(ctx, "/orchestration/familyCloud-rebuild/batchOprTask/v1.0/createBatchOprTask", body, nil)
-			return shouldRetry(ctx, err)
-		})
+		// No native family move - fall back to copy+delete.
+		if err := f.familyCopyID(ctx, srcID, dstID, true /*isDir*/); err != nil {
+			return err
+		}
+		return f.familyDeleteID(ctx, srcID, f.familySrvPath(srcID))
 	}
 	taskID, err := f.moveTaskID(ctx, srcID, dstID)
 	if err != nil {
@@ -608,27 +673,65 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, dst fs.Fs, dstDir string) 
 		return err
 	}
 	if f.space == spaceFamily {
-		body := api.AndAlbumCopyReq{}
-		body.CommonAccountInfo.AccountType = "1"
-		body.CommonAccountInfo.AccountUserId = f.account
-		body.DestCatalogID = dstDirID
-		body.DestCloudID = f.opt.FamilyID
-		body.SourceCloudID = f.opt.FamilyID
-		if srcObj.isDir {
-			body.SourceCatalogIDs = []string{srcObj.id}
-		} else {
-			body.SourceContentIDs = []string{srcObj.id}
-		}
-		return f.pacer.Call(func() (bool, error) {
-			err := f.familyCall(ctx, "/copyContentCatalog", body, nil)
-			return shouldRetry(ctx, err)
-		})
+		return f.familyCopy(ctx, srcObj, dstDirID)
 	}
 	taskID, err := f.copyTaskID(ctx, srcObj.id, dstDirID)
 	if err != nil {
 		return err
 	}
 	return f.taskGet(ctx, taskID, "copy")
+}
+
+// familyCopy copies srcObj (file or dir) into dstDirID inside the family
+// cloud via createBatchOprTaskV2 taskType=1, then polls the task
+// (captured 2026-09-03).
+func (f *Fs) familyCopy(ctx context.Context, srcObj *Object, dstDirID string) error {
+	return f.familyCopyID(ctx, srcObj.id, dstDirID, srcObj.isDir)
+}
+
+// familyCopyID copies the given content/catalog id into dstDirID.
+func (f *Fs) familyCopyID(ctx context.Context, id, dstDirID string, isDir bool) error {
+	req := familyBatchReq{
+		DestCatalogType:   1002,
+		DestCloudID:       f.opt.FamilyID,
+		DestPath:          f.familySrvPath(dstDirID),
+		DestType:          "1",
+		Path:              "",
+		SourceCatalogType: 1002,
+		SourceCloudID:     f.opt.FamilyID,
+		SourceType:        "1",
+		TaskType:          1, // copy
+		BusinessType:      2,
+	}
+	if isDir {
+		req.CatalogList = []string{id}
+	} else {
+		req.ContentList = []string{id}
+	}
+	taskID, err := f.familyBatchOprTask(ctx, req)
+	if err != nil {
+		return err
+	}
+	return f.familyTaskPoll(ctx, taskID)
+}
+
+// familyDeleteID deletes the given family catalog id (taskType=2).
+func (f *Fs) familyDeleteID(ctx context.Context, id, srvPath string) error {
+	taskID, err := f.familyBatchOprTask(ctx, familyBatchReq{
+		CatalogList:       []string{id},
+		DestCatalogType:   1002,
+		DestType:          "1",
+		Path:              srvPath,
+		SourceCatalogType: 1002,
+		SourceCloudID:     f.opt.FamilyID,
+		SourceType:        "1",
+		TaskType:          2, // delete
+		BusinessType:      2,
+	})
+	if err != nil {
+		return err
+	}
+	return f.familyTaskPoll(ctx, taskID)
 }
 
 // copyTaskID performs one batchCopy and returns the task id.

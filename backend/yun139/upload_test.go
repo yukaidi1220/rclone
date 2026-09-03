@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rclone/rclone/backend/yun139/api"
 )
@@ -154,11 +155,16 @@ func TestBuildCreateBody_CapsAt100Parts(t *testing.T) {
 	if len(body.PartInfos) != maxPartsPerRequest {
 		t.Fatalf("len(PartInfos) = %d, want %d", len(body.PartInfos), maxPartsPerRequest)
 	}
-	// The official client (and we, since the server ignores any client
-	// mtime and stamps the server clock) leaves both local timestamps
-	// empty. Live test: 2001-02-03 mtime came back as upload time.
-	if body.LocalCreatedAt != "" || body.LocalUpdatedAt != "" {
-		t.Errorf("LocalCreatedAt/LocalUpdatedAt = %q, %q; want both empty", body.LocalCreatedAt, body.LocalUpdatedAt)
+	// The server requires RFC3339 UTC with milliseconds (rejects other
+	// formats with '04000002: 本地创建时间格式不符合标准'); the value
+	// itself is ignored in favour of the server clock.
+	if body.LocalCreatedAt == "" || body.LocalUpdatedAt == "" {
+		t.Error("LocalCreatedAt/LocalUpdatedAt must be non-empty RFC3339")
+	}
+	for _, ts := range []string{body.LocalCreatedAt, body.LocalUpdatedAt} {
+		if _, err := time.Parse("2006-01-02T15:04:05.000Z", ts); err != nil {
+			t.Errorf("timestamp %q not RFC3339-ms: %v", ts, err)
+		}
 	}
 }
 
