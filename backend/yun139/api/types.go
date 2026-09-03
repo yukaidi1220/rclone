@@ -393,33 +393,40 @@ type DiskQuotaDetailResp struct {
 
 // ------------------------------------------------------- mutations ------
 
-// PersonalCreateFolderReq is the request for creating a folder on the
-// PersonalNew API (POST /file/create with type=folder).
+// PersonalCreateFolderReq is the request for POST /hcy/file/create with
+// type=folder. The official client sends exactly {name, type, parentFileId}.
 type PersonalCreateFolderReq struct {
-	ParentFileID   string `json:"parentFileId"`
-	Name           string `json:"name"`
-	Description    string `json:"description"`
-	Type           string `json:"type"`
-	FileRenameMode string `json:"fileRenameMode"`
+	ParentFileID string `json:"parentFileId"`
+	Name         string `json:"name"`
+	Type         string `json:"type"`
 }
 
-// PersonalBatchMoveReq is the request for POST /file/batchMove.
+// PersonalBatchMoveReq is the request for POST /hcy/file/batchMove.
+// Mirrors the official client (captured 2026-09-03):
+// {fileIds, toParentFileId, userId, eventType:"move", businessType:0}.
 type PersonalBatchMoveReq struct {
 	FileIds        []string `json:"fileIds"`
 	ToParentFileID string   `json:"toParentFileId"`
+	UserID         string   `json:"userId"`
+	EventType      string   `json:"eventType"`
+	BusinessType   int      `json:"businessType"`
 }
 
-// PersonalBatchCopyReq is the request for POST /file/batchCopy.
+// PersonalBatchCopyReq is the request for POST /hcy/file/batchCopy.
+// Mirrors the official client (captured 2026-09-03):
+// {userId, userDomainId, fileIds, toParentFileId}.
 type PersonalBatchCopyReq struct {
 	FileIds        []string `json:"fileIds"`
 	ToParentFileID string   `json:"toParentFileId"`
+	UserID         string   `json:"userId"`
+	UserDomainID   string   `json:"userDomainId"`
 }
 
-// PersonalUpdateReq is the request for POST /file/update (rename).
+// PersonalUpdateReq is the request for POST /hcy/file/update (rename).
+// The official client sends exactly {fileId, name} (captured 2026-09-03).
 type PersonalUpdateReq struct {
-	FileId      string `json:"fileId"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
+	FileId string `json:"fileId"`
+	Name   string `json:"name"`
 }
 
 // PersonalTrashReq is the request for POST /hcy/recyclebin/batchTrash.

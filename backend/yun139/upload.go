@@ -384,15 +384,31 @@ func (f *Fs) deleteObject(ctx context.Context, id, srvPath string, family bool) 
 		})
 	}
 	if f.opt.HardDelete {
-		return f.pacer.Call(func() (bool, error) {
-			err := f.personalCall(ctx, "/hcy/file/batchDelete", api.PersonalTrashReq{FileIds: []string{id}}, nil)
-			return shouldRetry(ctx, err)
-		})
+		return f.deleteTask(ctx, "/hcy/file/batchDelete", id)
 	}
-	return f.pacer.Call(func() (bool, error) {
-		err := f.personalCall(ctx, "/hcy/recyclebin/batchTrash", api.PersonalTrashReq{FileIds: []string{id}}, nil)
+	return f.deleteTask(ctx, "/hcy/recyclebin/batchTrash", id)
+}
+
+// deleteTask performs one batch-delete call and polls the returned task.
+func (f *Fs) deleteTask(ctx context.Context, endpoint, id string) error {
+	var out struct {
+		api.BaseResp
+		Data struct {
+			TaskID string `json:"taskId"`
+		} `json:"data"`
+	}
+	err := f.pacer.Call(func() (bool, error) {
+		err := f.personalCall(ctx, endpoint, api.PersonalTrashReq{FileIds: []string{id}, BusinessType: 0}, &out)
 		return shouldRetry(ctx, err)
 	})
+	if err != nil {
+		return err
+	}
+	if out.Data.TaskID == "" {
+		// Some endpoints complete synchronously; nothing to poll.
+		return nil
+	}
+	return f.taskGet(ctx, out.Data.TaskID, "delete")
 }
 
 // renameObject renames a file or folder.
@@ -414,9 +430,8 @@ func (f *Fs) renameObject(ctx context.Context, id, newName, dirID string, family
 	}
 	return f.pacer.Call(func() (bool, error) {
 		err := f.personalCall(ctx, "/hcy/file/update", api.PersonalUpdateReq{
-			FileId:      id,
-			Name:        newName,
-			Description: "",
+			FileId: id,
+			Name:   newName,
 		}, nil)
 		return shouldRetry(ctx, err)
 	})
@@ -460,13 +475,35 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, dst fs.Fs, dstDir string) 
 			return shouldRetry(ctx, err)
 		})
 	}
-	return f.pacer.Call(func() (bool, error) {
+	taskID, err := f.moveTaskID(ctx, srcObj.id, dstDirID)
+	if err != nil {
+		return err
+	}
+	return f.taskGet(ctx, taskID, "move")
+}
+
+// moveTaskID is a helper that performs one batchMove and returns the task id.
+func (f *Fs) moveTaskID(ctx context.Context, id, dstDirID string) (string, error) {
+	var out struct {
+		api.BaseResp
+		Data struct {
+			TaskID string `json:"taskId"`
+		} `json:"data"`
+	}
+	err := f.pacer.Call(func() (bool, error) {
 		err := f.personalCall(ctx, "/hcy/file/batchMove", api.PersonalBatchMoveReq{
-			FileIds:        []string{srcObj.id},
+			FileIds:        []string{id},
 			ToParentFileID: dstDirID,
-		}, nil)
+			UserID:         f.account,
+			EventType:      "move",
+			BusinessType:   0,
+		}, &out)
 		return shouldRetry(ctx, err)
 	})
+	if err != nil {
+		return "", err
+	}
+	return out.Data.TaskID, nil
 }
 
 // DirMove moves a directory
@@ -499,13 +536,11 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 			return shouldRetry(ctx, err)
 		})
 	}
-	return f.pacer.Call(func() (bool, error) {
-		err := f.personalCall(ctx, "/hcy/file/batchMove", api.PersonalBatchMoveReq{
-			FileIds:        []string{srcID},
-			ToParentFileID: dstID,
-		}, nil)
-		return shouldRetry(ctx, err)
-	})
+	taskID, err := f.moveTaskID(ctx, srcID, dstID)
+	if err != nil {
+		return err
+	}
+	return f.taskGet(ctx, taskID, "dirmove")
 }
 
 // Copy a file
@@ -538,13 +573,42 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, dst fs.Fs, dstDir string) 
 			return shouldRetry(ctx, err)
 		})
 	}
-	return f.pacer.Call(func() (bool, error) {
+	taskID, err := f.copyTaskID(ctx, srcObj.id, dstDirID)
+	if err != nil {
+		return err
+	}
+	return f.taskGet(ctx, taskID, "copy")
+}
+
+// copyTaskID performs one batchCopy and returns the task id.
+func (f *Fs) copyTaskID(ctx context.Context, id, dstDirID string) (string, error) {
+	var out struct {
+		api.BaseResp
+		Data struct {
+			TaskID string `json:"taskId"`
+		} `json:"data"`
+	}
+	err := f.pacer.Call(func() (bool, error) {
+		// The official client sends userId = userDomainId (the
+		// 1301956522699563527-style id) for copy; we only know the
+		// phone number at this point, so fall back to it. If the server
+		// rejects it, userDomainID discovery is needed.
+		userID := f.userDomainID
+		if userID == "" {
+			userID = f.account
+		}
 		err := f.personalCall(ctx, "/hcy/file/batchCopy", api.PersonalBatchCopyReq{
-			FileIds:        []string{srcObj.id},
+			FileIds:        []string{id},
 			ToParentFileID: dstDirID,
-		}, nil)
+			UserID:         userID,
+			UserDomainID:   userID,
+		}, &out)
 		return shouldRetry(ctx, err)
 	})
+	if err != nil {
+		return "", err
+	}
+	return out.Data.TaskID, nil
 }
 
 // OpenChunkWriter is not implemented. 139's upload protocol needs the

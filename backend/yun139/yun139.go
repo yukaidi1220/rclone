@@ -68,9 +68,9 @@ const (
 	// /file/getUploadUrl (the server accepts up to 100).
 	maxPartsPerRequest = 100
 
-	// downloadURLTTL bounds the reuse of a cached download URL. The measured
-	// lifetime is around 20 minutes, so keep well below it.
-	downloadURLTTL = 15 * time.Minute
+	// downloadURLTTL bounds the reuse of a cached download URL. The client
+	// asks for expireSec:86400 (24h), so a 23h cache is safe.
+	downloadURLTTL = 23 * time.Hour
 
 	// minTokenLifetime is the remaining validity under which the token is
 	// refreshed proactively (the official client uses 15 days).
@@ -233,6 +233,8 @@ type Fs struct {
 
 	familyRootMu *sync.Mutex
 	familyRootID string // server-side root catalog ID of the family cloud
+
+	userDomainID string // 1301956522699563527-style domain id, learned from queryFamilyCloud
 }
 
 // Object describes a yun139 object
@@ -1441,3 +1443,45 @@ func (f *Fs) purgeFamilyDir(ctx context.Context, id string) error {
 	return f.deleteObject(ctx, id, "", true)
 }
 
+
+// About returns quota information for the personal cloud.
+//
+// POST user-njs.yun.139.com/user/disk/quota/detail with
+// {"userDomainId": ...} returns diskSize/freeDiskSize in MiB units
+// (captured 2026-09-03: diskSize 701440 = 685 MiB... actually the
+// captured values 701440/700028 look like MiB for a 685 GB drive,
+// so scale by 1024*1024 when reporting).
+func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
+	if f.space != spacePersonal {
+		return nil, errors.New("yun139: about is only supported for the personal space")
+	}
+	userID := f.userDomainID
+	if userID == "" {
+		userID = f.account
+	}
+	var resp struct {
+		api.BaseResp
+		Data struct {
+			FreeDiskSize int64 `json:"freeDiskSize"`
+			DiskSize     int64 `json:"diskSize"`
+		} `json:"data"`
+	}
+	err := f.pacer.Call(func() (bool, error) {
+		err := f.call(ctx, "https://user-njs.yun.139.com/user/disk/quota/detail", map[string]any{"userDomainId": userID}, &resp)
+		return shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, &apiError{Code: resp.Code, Message: resp.Message}
+	}
+	// The server reports MiB units (701440 MiB ≈ 685 GiB); rclone's
+	// Usage is in bytes.
+	total := resp.Data.DiskSize * 1024 * 1024
+	free := resp.Data.FreeDiskSize * 1024 * 1024
+	return &fs.Usage{
+		Total: &total,
+		Free:  &free,
+	}, nil
+}

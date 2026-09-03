@@ -59,7 +59,8 @@ func (f *Fs) fetchDownloadURL(ctx context.Context, o *Object) (string, error) {
 		}
 		return resp.Data.DownloadURL, nil
 	}
-	body := map[string]any{"fileId": o.id}
+	// The official client requests a 24h link (expireSec:86400).
+	body := map[string]any{"fileId": o.id, "expireSec": 86400}
 	var resp api.PersonalDownloadResp
 	err := f.pacer.Call(func() (bool, error) {
 		err := f.personalCall(ctx, "/hcy/file/getDownloadUrl", body, &resp)
