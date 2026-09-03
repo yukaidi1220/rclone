@@ -2162,6 +2162,28 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 	leaf = o.fs.opt.Enc.FromStandardName(leaf)
+	if o.fs.space == spaceFamily {
+		// The family modifyContentInfo endpoint treats contentName as
+		// the base name and re-appends the ORIGINAL extension, so a
+		// temp-name + rename flow leaves files stuck on
+		// "name.ext.rclone-tmp-XXXX" (verified live by the audit).
+		// Instead: delete the old file first, then upload straight to
+		// the target name (fileRenameMode=auto_rename guards the
+		// tiny race window).
+		if err := o.fs.deleteObject(ctx, o.id, o.serverPath, true); err != nil {
+			return fserrors.NoLowLevelRetryError(fmt.Errorf("yun139: delete old object: %w", err))
+		}
+		res, err := o.fs.uploadFile(ctx, in, dirID, leaf, size)
+		if err != nil {
+			return err
+		}
+		o.id = res.fileID
+		o.size = size
+		o.modTime = src.ModTime(ctx)
+		o.sha256 = res.hashHex
+		o.fs.dirCache.FlushDir(path.Dir(o.remote))
+		return nil
+	}
 	tempLeaf := leaf + ".rclone-tmp-" + random.String(8)
 	res, err := o.fs.uploadFile(ctx, in, dirID, tempLeaf, size)
 	if err != nil {
