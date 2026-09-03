@@ -422,9 +422,11 @@ type PersonalUpdateReq struct {
 	Description string `json:"description"`
 }
 
-// PersonalTrashReq is the request for POST /recyclebin/batchTrash.
+// PersonalTrashReq is the request for POST /hcy/recyclebin/batchTrash.
+// businessType:0 is what the official client sends.
 type PersonalTrashReq struct {
-	FileIds []string `json:"fileIds"`
+	FileIds      []string `json:"fileIds"`
+	BusinessType int      `json:"businessType"`
 }
 
 // FamilyModifyContentReq is the request for renaming a family file
@@ -490,8 +492,9 @@ type AndAlbumCopyReq struct {
 }
 
 // DefaultChunkSize is the default multi-part upload size used by the
-// upload pipeline when no --yun139-part-size option is supplied.
-const DefaultChunkSize int64 = 100 * 1024 * 1024
+// upload pipeline when no --yun139-part-size option is supplied. Matches
+// the official PC client's 5 MiB part size.
+const DefaultChunkSize int64 = 5 * 1024 * 1024
 
 // CommonUpload groups the fields shared by /file/create across the file
 // types (regular, folder, etc.). The hash lives in PersonalCreateReq's
@@ -504,11 +507,10 @@ type CommonUpload struct {
 	Type     string `json:"type,omitempty"`
 }
 
-// PersonalCreateReq is the request for POST /file/create (regular file).
-// Field names mirror what alist/139Strm post: contentHash (not "sha256"),
-// parallelHashCtx per part, and an explicit type:"file". The server
-// decides 秒传 automatically from contentHash - we do NOT set a
-// rapidUpload flag.
+// PersonalCreateReq is the request for POST /hcy/file/create (regular file).
+// Field names mirror what the official PC client posts (captured
+// 2026-09-03, client 8.8.6.20260829): contentHash + parallelUpload:true +
+// partInfos with parallelHashCtx, and localCreatedAt/localUpdatedAt.
 type PersonalCreateReq struct {
 	CommonUpload
 	FileRenameMode       string     `json:"fileRenameMode"`
@@ -517,6 +519,8 @@ type PersonalCreateReq struct {
 	ContentType          string     `json:"contentType"`
 	ParallelUpload       bool       `json:"parallelUpload"`
 	PartInfos            []PartInfo `json:"partInfos"`
+	LocalCreatedAt       string     `json:"localCreatedAt"`
+	LocalUpdatedAt       string     `json:"localUpdatedAt"`
 }
 
 // PartUploadInfo is one part URL returned by /file/create.
@@ -538,12 +542,14 @@ type PersonalCreateResp struct {
 	} `json:"data"`
 }
 
-// PersonalCompleteReq is the request for POST /file/complete.
+// PersonalCompleteReq is the request for POST /hcy/file/complete.
+// Mirrors the official client (captured 2026-09-03):
+// {contentHash, contentHashAlgorithm, fileId, uploadId} - no size.
 type PersonalCompleteReq struct {
-	FileID  string `json:"fileId"`
-	SHA256  string `json:"sha256"`
-	Size    int64  `json:"size"`
-	ResType int    `json:"resType"`
+	FileID               string `json:"fileId"`
+	UploadID             string `json:"uploadId"`
+	ContentHash          string `json:"contentHash"`
+	ContentHashAlgorithm string `json:"contentHashAlgorithm"`
 }
 
 // PersonalCompleteResp is the response of POST /file/complete.

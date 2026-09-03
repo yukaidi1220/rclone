@@ -7,10 +7,10 @@ import (
 	"github.com/rclone/rclone/backend/yun139/api"
 )
 
-// TestPersonalCall_HeaderShape drives the header constructors directly
-// (the same path the request pipeline takes) and asserts every header
-// 139's PersonalNew API requires. PC-client masquerade is critical for
-// /file/create to honour SHA-256 秒传, so we pin those headers too.
+// TestPersonalCall_HeaderShape pins the PC-client header set to the
+// request captured from the official client (2026-09-03, v8.8.6.20260829):
+// the native upload module sends a lean set on /hcy/file/create with
+// NO mcloud-* headers and NO mcloud-sign.
 func TestPersonalCall_HeaderShape(t *testing.T) {
 	ts := "1700000000000"
 	randStr := "abcd1234abcd1234abcd1234abcd1234"
@@ -22,41 +22,91 @@ func TestPersonalCall_HeaderShape(t *testing.T) {
 	mustHeaderContains := []string{
 		"Accept",
 		"Authorization",
-		"Mcloud-Sign",
-		"x-SvcType",
-		"x-yun-device-id",
-		"x-yun-app-channel",
-		"x-m4c-caller",
-		"User-Agent",
 		"Content-Type",
+		"x-yun-api-version",
+		"x-yun-app-channel",
+		"x-yun-client-info",
+		"x-yun-device-id",
+		"x-yun-market-source",
+		"x-yun-module-type",
+		"x-yun-op-type",
+		"x-yun-svc-type",
+		"User-Agent",
 	}
 	for _, k := range mustHeaderContains {
 		if h[k] == "" {
 			t.Errorf("pcHeaders missing %q", k)
 		}
 	}
-	if !strings.Contains(h["Mcloud-Sign"], ts) {
-		t.Errorf("Mcloud-Sign %q does not contain ts %q", h["Mcloud-Sign"], ts)
+	// Lean set: the upload module does NOT send these.
+	mustNotContain := []string{
+		"Mcloud-Sign",
+		"mcloud-sign",
+		"x-SvcType",
+		"x-m4c-caller",
+		"x-DeviceInfo",
+		"x-huawei-channelSrc",
+		"Inner-Hcy-Router-Https",
+		"Caller",
+		"CMS-DEVICE",
 	}
-	if !strings.Contains(h["Mcloud-Sign"], sign) {
-		t.Errorf("Mcloud-Sign %q does not contain sign %q", h["Mcloud-Sign"], sign)
+	for _, k := range mustNotContain {
+		if h[k] != "" {
+			t.Errorf("pcHeaders must NOT contain %q (official client omits it)", k)
+		}
 	}
-	if h["x-SvcType"] != "1" {
-		t.Errorf("x-SvcType = %q, want 1", h["x-SvcType"])
+	if h["x-yun-app-channel"] != "10200153" {
+		t.Errorf("x-yun-app-channel = %q, want 10200153", h["x-yun-app-channel"])
+	}
+	if h["x-yun-market-source"] != "001" {
+		t.Errorf("x-yun-market-source = %q, want 001 (captured value)", h["x-yun-market-source"])
+	}
+	if h["x-yun-svc-type"] != "1" {
+		t.Errorf("x-yun-svc-type = %q, want 1", h["x-yun-svc-type"])
 	}
 	if !strings.HasPrefix(h["Authorization"], "Basic ") {
 		t.Errorf("Authorization = %q, want Basic prefix", h["Authorization"])
 	}
-	if !strings.HasPrefix(h["x-yun-device-id"], "OPENLIST") {
-		t.Errorf("x-yun-device-id = %q, want OPENLIST prefix", h["x-yun-device-id"])
+	if !strings.Contains(h["x-yun-client-info"], pcAppVersion) {
+		t.Errorf("x-yun-client-info = %q, want version %s inside", h["x-yun-client-info"], pcAppVersion)
 	}
-	// PC masquerade: the official PC client uses x-yun-app-channel=10200153
-	// and Caller=PC.
+	// Device id is md5(account)+"-ENDIN", matching the captured
+	// "<32HEX>-ENDIN" shape.
+	if !strings.HasSuffix(h["x-yun-device-id"], "-ENDIN") {
+		t.Errorf("x-yun-device-id = %q, want *-ENDIN suffix", h["x-yun-device-id"])
+	}
+	// UA is the short native-module one on the upload path.
+	if h["User-Agent"] != pcUserAgentShort {
+		t.Errorf("User-Agent = %q, want %q", h["User-Agent"], pcUserAgentShort)
+	}
+}
+
+// TestPCHeadersFull_Shape pins the Electron-main-process header set for
+// general API calls (folder create, trash, list, family) - the one with
+// APP_AUTH/APP_CP/CP_VERSION and the long UA.
+func TestPCHeadersFull_Shape(t *testing.T) {
+	auth := "Basic " + encodeB64("pc:13800138000:TestToken|fake")
+	h := pcHeadersFull(auth, "13800138000", md5hex("13800138000")+"-ENDIN")
+
+	for _, k := range []string{
+		"APP_AUTH", "APP_CP", "CP_VERSION", "Accept", "Authorization",
+		"Content-Type", "Sec-Fetch-Dest", "Sec-Fetch-Mode", "Sec-Fetch-Site",
+		"User-Agent", "x-DeviceInfo", "x-ExpRoute-Code", "x-yun-api-version",
+		"x-yun-app-channel", "x-yun-client-info", "x-yun-device-id",
+		"x-yun-market-source", "x-yun-module-type", "x-yun-op-type", "x-yun-svc-type",
+	} {
+		if h[k] == "" {
+			t.Errorf("pcHeadersFull missing %q", k)
+		}
+	}
+	if h["APP_CP"] != "pc" {
+		t.Errorf("APP_CP = %q, want pc", h["APP_CP"])
+	}
+	if h["User-Agent"] != pcUserAgentFull {
+		t.Errorf("User-Agent = %q, want the Electron UA", h["User-Agent"])
+	}
 	if h["x-yun-app-channel"] != pcAppChannel {
 		t.Errorf("x-yun-app-channel = %q, want %q", h["x-yun-app-channel"], pcAppChannel)
-	}
-	if h["x-m4c-caller"] != "PC" {
-		t.Errorf("x-m4c-caller = %q, want PC", h["x-m4c-caller"])
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rclone/rclone/backend/yun139/api"
 	"github.com/rclone/rclone/fs"
@@ -98,25 +99,28 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 // uploadFile is the single upload pipeline used by both Put and Update.
 //
-// The whole file is buffered in memory (or a TempFile for files larger than
-// 64 MiB) so the SHA-256 and the multipart stream come from the same bytes.
+// The input is streamed once through a temp file while SHA-256 is
+// computed, then /hcy/file/create + parallel part PUTs are driven from
+// random-access SectionReader handles. This caps memory use to one
+// part (chunkSize) regardless of the file size, and the single pass
+// doubles as the midstate scan for parallelUpload.
 func (f *Fs) uploadFile(ctx context.Context, in io.Reader, dirID, leaf string, size int64) (*uploadResult, error) {
 	if size <= 0 {
 		return nil, errors.New("yun139: size must be > 0")
 	}
-	if size <= int64(64*1024*1024) {
-		// In-memory path: one Read+Hash, then uploadFromBuffer.
+	// Small files: keep the reader in memory, hash it once.
+	if size <= int64(5*1024*1024) {
 		data := make([]byte, size)
 		h := sha256.New()
 		if _, err := io.ReadFull(io.TeeReader(in, h), data); err != nil {
 			return nil, fmt.Errorf("yun139: read: %w", err)
 		}
-		return f.uploadFromBuffer(ctx, data, dirID, leaf, size, hex.EncodeToString(h.Sum(nil)))
+		return f.uploadFromRandom(ctx, bytes.NewReader(data), dirID, leaf, size, hex.EncodeToString(h.Sum(nil)))
 	}
 	// Streaming path for large files: stream the data through a temp file
-	// while hashing it, then drive /file/create + parallel part PUTs from
-	// random-access SectionReader handles. This caps memory use to one
-	// part (chunkSize) regardless of the file size.
+	// while hashing it, then drive /hcy/file/create + parallel part PUTs
+	// from random-access SectionReader handles. This caps memory use to
+	// one part (chunkSize) regardless of the file size.
 	tmp, err := os.CreateTemp("", "yun139-upload-")
 	if err != nil {
 		return nil, fmt.Errorf("yun139: temp file: %w", err)
@@ -152,18 +156,36 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		chunkSize = api.DefaultChunkSize
 	}
 	parts := planParts(size, chunkSize)
-	// First, ask the server to create (or rapid-upload) the file.
-	// The payload mirrors alist/139Strm: contentHash + type:file, no
-	// rapidUpload flag (the server decides instant-upload by hash).
+	// The official PC client (captured 2026-09-03) sends
+	// parallelUpload:true with a parallelHashCtx per part: the SHA-256
+	// midstate (8 H registers) after all bytes before that part. The
+	// server signs each part's context into its upload URL
+	// (X-Amz-Iteration-Hash-Ctx) and accepts out-of-order concurrent
+	// part PUTs. Part 1 carries no context (it starts from the IV).
 	partInfos := make([]api.PartInfo, 0, len(parts))
-	for _, p := range parts {
-		partInfos = append(partInfos, api.PartInfo{
+	for i, p := range parts {
+		pi := api.PartInfo{
 			PartNumber: p.index,
 			PartSize:   p.partSize,
-			ParallelHashCtx: &api.ParallelHashCtx{
-				PartOffset: p.offset,
-			},
-		})
+		}
+		// The official client always sets partOffset (we verified on
+		// 2026-09-03 with mCloudDownload.zip) even on the first part;
+		// only the h field is omitted for part 1.
+		pi.ParallelHashCtx = &api.ParallelHashCtx{PartOffset: p.offset}
+		if i > 0 {
+			regs, _, err := api.Sha256Midstate(sha256MidstateHash(freader, p.offset))
+			if err != nil {
+				return nil, fmt.Errorf("yun139: midstate part %d: %w", p.index, err)
+			}
+			pi.ParallelHashCtx.H = regs
+		}
+		partInfos = append(partInfos, pi)
+	}
+	// Limit the create payload to the first maxPartsPerRequest parts; the
+	// rest are covered by /hcy/file/getUploadUrl later (alist does the
+	// same 100-part batches).
+	if len(partInfos) > maxPartsPerRequest {
+		partInfos = partInfos[:maxPartsPerRequest]
 	}
 	body := api.PersonalCreateReq{
 		CommonUpload: api.CommonUpload{
@@ -177,13 +199,19 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	body.ContentHash = hashHex
 	body.ContentHashAlgorithm = "SHA256"
 	body.ContentType = "application/octet-stream"
-	body.ParallelUpload = false
+	body.ParallelUpload = true
 	body.PartInfos = partInfos
+	// The official client stamps local timestamps in RFC3339 UTC with
+	// milliseconds, e.g. "2026-09-03T08:06:36.784Z". The server rejects
+	// other formats with '04000002: 本地更新时间格式不符合标准'.
+	now := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+	body.LocalCreatedAt = now
+	body.LocalUpdatedAt = now
 	if len(body.PartInfos) > maxPartsPerRequest {
 		body.PartInfos = body.PartInfos[:maxPartsPerRequest]
 	}
 	var resp api.PersonalCreateResp
-	if err := f.personalCall(ctx, "/file/create", body, &resp); err != nil {
+	if err := f.personalCall(ctx, "/hcy/file/create", body, &resp); err != nil {
 		return nil, fmt.Errorf("create: %w", err)
 	}
 	fs.Debugf(f, "yun139: create returned %d part URLs, rapid=%v exists=%v", len(resp.Data.PartInfos), resp.Data.RapidUpload, resp.Data.Exists)
@@ -214,334 +242,22 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	if err := eg.Wait(); err != nil {
 		return nil, fmt.Errorf("put part: %w", err)
 	}
-	// Finally, mark the file complete.
+	// Finally, mark the file complete. Mirrors the official client:
+	// contentHash + contentHashAlgorithm + fileId + uploadId.
 	cmpl := api.PersonalCompleteReq{
-		FileID:  resp.Data.FileID,
-		SHA256:  hashHex,
-		Size:    size,
-		ResType: 1,
+		FileID:               resp.Data.FileID,
+		UploadID:             resp.Data.UploadID,
+		ContentHash:          hashHex,
+		ContentHashAlgorithm: "SHA256",
 	}
 	var cmplResp api.PersonalCompleteResp
-	if err := f.personalCall(ctx, "/file/complete", cmpl, &cmplResp); err != nil {
+	if err := f.personalCall(ctx, "/hcy/file/complete", cmpl, &cmplResp); err != nil {
 		return nil, fmt.Errorf("complete: %w", err)
 	}
 	if !cmplResp.Success {
 		return nil, &apiError{Code: cmplResp.Code, Message: cmplResp.Message}
 	}
 	return &uploadResult{fileID: resp.Data.FileID, fileName: leaf}, nil
-}
-
-// uploadFromBuffer uploads a file that is already in memory.
-func (f *Fs) uploadFromBuffer(ctx context.Context, data []byte, dirID, leaf string, size int64, hashHex string) (*uploadResult, error) {
-	plans := planParts(size, int64(f.opt.PartSize))
-	// Step 1: create the upload session and fetch the first 100 part URLs.
-	first := plans
-	if len(first) > maxPartsPerRequest {
-		first = first[:maxPartsPerRequest]
-	}
-	createBody, err := f.makeCreateReq(dirID, leaf, size, hashHex, first)
-	if err != nil {
-		return nil, err
-	}
-	var createResp api.PersonalUploadResp
-	if err := f.pacer.Call(func() (bool, error) {
-		err := f.uploadCreate(ctx, createBody, &createResp)
-		return shouldRetry(ctx, err)
-	}); err != nil {
-		return nil, err
-	}
-	if createResp.Data.Exist {
-		return &uploadResult{fileID: createResp.Data.FileId, fileName: leaf, hashHex: hashHex}, nil
-	}
-	if len(createResp.Data.PartInfos) == 0 {
-		// Rapid upload: server already has the content, no parts to send.
-		return f.completeUpload(ctx, createResp.Data.FileId, createResp.Data.UploadId, hashHex)
-	}
-	// Step 2: upload the first 100 parts.
-	if err := f.uploadParts(ctx, data, plans[:len(createResp.Data.PartInfos)], createResp.Data.PartInfos); err != nil {
-		return nil, err
-	}
-	// Step 3: get more part URLs in batches of 100 and upload the rest.
-	allParts := createResp.Data.PartInfos
-	for i := maxPartsPerRequest; i < len(plans); i += maxPartsPerRequest {
-		end := i + maxPartsPerRequest
-		if end > len(plans) {
-			end = len(plans)
-		}
-		batch := plans[i:end]
-		urls, err := f.fetchMoreURLs(ctx, createResp.Data.FileId, createResp.Data.UploadId, batch)
-		if err != nil {
-			return nil, err
-		}
-		if err := f.uploadParts(ctx, data, batch, urls); err != nil {
-			return nil, err
-		}
-		allParts = append(allParts, urls...)
-	}
-	// Step 4: complete.
-	return f.completeUpload(ctx, createResp.Data.FileId, createResp.Data.UploadId, hashHex)
-}
-
-// uploadStreamed uploads from a TempFile (no buffer copy). It is the path for
-// files that did not fit in memory.
-func (f *Fs) uploadStreamed(ctx context.Context, in io.ReaderAt, dirID, leaf string, size int64, sum []byte) (*uploadResult, error) {
-	plans := planParts(size, int64(f.opt.PartSize))
-	first := plans
-	if len(first) > maxPartsPerRequest {
-		first = first[:maxPartsPerRequest]
-	}
-	hashHex := hex.EncodeToString(sum)
-	createBody, err := f.makeCreateReq(dirID, leaf, size, hashHex, first)
-	if err != nil {
-		return nil, err
-	}
-	var createResp api.PersonalUploadResp
-	if err := f.pacer.Call(func() (bool, error) {
-		err := f.uploadCreate(ctx, createBody, &createResp)
-		return shouldRetry(ctx, err)
-	}); err != nil {
-		return nil, err
-	}
-	if createResp.Data.Exist {
-		return &uploadResult{fileID: createResp.Data.FileId, fileName: leaf, hashHex: hashHex}, nil
-	}
-	if len(createResp.Data.PartInfos) == 0 {
-		return f.completeUpload(ctx, createResp.Data.FileId, createResp.Data.UploadId, hashHex)
-	}
-	if err := f.uploadPartsRandom(ctx, in, plans[:len(createResp.Data.PartInfos)], createResp.Data.PartInfos, size); err != nil {
-		return nil, err
-	}
-	allParts := createResp.Data.PartInfos
-	for i := maxPartsPerRequest; i < len(plans); i += maxPartsPerRequest {
-		end := i + maxPartsPerRequest
-		if end > len(plans) {
-			end = len(plans)
-		}
-		batch := plans[i:end]
-		urls, err := f.fetchMoreURLs(ctx, createResp.Data.FileId, createResp.Data.UploadId, batch)
-		if err != nil {
-			return nil, err
-		}
-		if err := f.uploadPartsRandom(ctx, in, batch, urls, size); err != nil {
-			return nil, err
-		}
-		allParts = append(allParts, urls...)
-	}
-	return f.completeUpload(ctx, createResp.Data.FileId, createResp.Data.UploadId, hashHex)
-}
-
-// makeCreateReq builds the create request for the active space.
-//
-// The server expects a parallelHashCtx with partOffset for every part. The
-// SHA-256 midstate (H) is only needed for true parallel upload; the official
-// client falls back to sequential upload when the midstate is missing, so
-// leaving the H field empty is safe.
-func (f *Fs) makeCreateReq(dirID, leaf string, size int64, hashHex string, plans []partPlan) (any, error) {
-	parts := make([]api.PartInfo, 0, len(plans))
-	for _, p := range plans {
-		parts = append(parts, api.PartInfo{
-			PartNumber: p.index,
-			PartSize:   p.partSize,
-			ParallelHashCtx: &api.ParallelHashCtx{
-				PartOffset: p.offset,
-			},
-		})
-	}
-	if f.space == spaceFamily {
-		body := api.FamilyUploadCreateReq{}
-		body.FamilyCommon.CloudID = f.opt.FamilyID
-		body.FamilyCommon.CommonAccountInfo.Account = f.account
-		body.FamilyCommon.CommonAccountInfo.AccountType = 1
-		body.ContentHash = hashHex
-		body.ContentHashAlgorithm = "SHA256"
-		body.ContentType = "application/octet-stream"
-		body.ParallelUpload = false
-		body.PartInfos = parts
-		body.Size = size
-		body.ParentFileID = dirID
-		body.Name = leaf
-		body.Type = "file"
-		body.FileRenameMode = "auto_rename"
-		body.GroupID = f.opt.FamilyID
-		body.GroupType = 1 // family
-		body.SeqNo = random.String(32)
-		return body, nil
-	}
-	return map[string]any{
-		"contentHash":          hashHex,
-		"contentHashAlgorithm": "SHA256",
-		"contentType":          "application/octet-stream",
-		"parallelUpload":       false,
-		"partInfos":            parts,
-		"size":                 size,
-		"parentFileId":         dirID,
-		"name":                 leaf,
-		"type":                 "file",
-		"fileRenameMode":       "auto_rename",
-	}, nil
-}
-
-// uploadCreate issues the /file/create call (personal or family).
-func (f *Fs) uploadCreate(ctx context.Context, body any, out *api.PersonalUploadResp) error {
-	if f.space == spaceFamily {
-		req, ok := body.(api.FamilyUploadCreateReq)
-		if !ok {
-			return fmt.Errorf("yun139: family upload body has wrong type %T", body)
-		}
-		var resp api.FamilyUploadCreateResp
-		if err := f.familyCall(ctx, "/dynamic/file/create", req, &resp); err != nil {
-			return err
-		}
-		out.BaseResp = resp.BaseResp
-		out.Data = resp.Data
-		return nil
-	}
-	return f.personalCall(ctx, "/file/create", body, out)
-}
-
-// fetchMoreURLs calls /file/getUploadUrl (personal) or
-// /dynamic/file/getUploadUrl (family) for a batch of partInfos.
-func (f *Fs) fetchMoreURLs(ctx context.Context, fileID, uploadID string, plans []partPlan) ([]api.PersonalPartInfo, error) {
-	parts := make([]api.PartInfo, 0, len(plans))
-	for _, p := range plans {
-		parts = append(parts, api.PartInfo{
-			PartNumber:      p.index,
-			PartSize:        p.partSize,
-			ParallelHashCtx: &api.ParallelHashCtx{PartOffset: p.offset},
-		})
-	}
-	if f.space == spaceFamily {
-		body := api.FamilyUploadURLReq{}
-		body.FamilyCommon.CloudID = f.opt.FamilyID
-		body.FamilyCommon.CommonAccountInfo.Account = f.account
-		body.FamilyCommon.CommonAccountInfo.AccountType = 1
-		body.FileId = fileID
-		body.UploadId = uploadID
-		body.PartInfos = parts
-		var resp api.FamilyUploadCreateResp
-		if err := f.familyCall(ctx, "/dynamic/file/getUploadUrl", body, &resp); err != nil {
-			return nil, err
-		}
-		return resp.Data.PartInfos, nil
-	}
-	body := map[string]any{
-		"fileId":    fileID,
-		"uploadId":  uploadID,
-		"partInfos": parts,
-		"commonAccountInfo": map[string]any{
-			"account":     f.account,
-			"accountType": 1,
-		},
-	}
-	var resp api.PersonalUploadURLResp
-	if err := f.personalCall(ctx, "/file/getUploadUrl", body, &resp); err != nil {
-		return nil, err
-	}
-	return resp.Data.PartInfos, nil
-}
-
-// completeUpload calls /file/complete and returns the uploadResult.
-func (f *Fs) completeUpload(ctx context.Context, fileID, uploadID, hashHex string) (*uploadResult, error) {
-	if f.space == spaceFamily {
-		body := api.FamilyUploadCompleteReq{}
-		body.FamilyCommon.CloudID = f.opt.FamilyID
-		body.FamilyCommon.CommonAccountInfo.Account = f.account
-		body.FamilyCommon.CommonAccountInfo.AccountType = 1
-		body.ContentHash = hashHex
-		body.ContentHashAlgorithm = "SHA256"
-		body.FileId = fileID
-		body.UploadId = uploadID
-		if err := f.familyCall(ctx, "/dynamic/file/complete", body, nil); err != nil {
-			return nil, err
-		}
-		return &uploadResult{fileID: fileID, fileName: "", hashHex: hashHex}, nil
-	}
-	body := map[string]any{
-		"contentHash":          hashHex,
-		"contentHashAlgorithm": "SHA256",
-		"fileId":               fileID,
-		"uploadId":             uploadID,
-	}
-	if err := f.personalCall(ctx, "/file/complete", body, nil); err != nil {
-		return nil, err
-	}
-	return &uploadResult{fileID: fileID, fileName: "", hashHex: hashHex}, nil
-}
-
-// uploadParts reads each part from data and PUTs it to its upload URL.
-// parts and urls must be aligned by index. Concurrent, --upload-concurrency
-// workers at most.
-func (f *Fs) uploadParts(ctx context.Context, data []byte, parts []partPlan, urls []api.PersonalPartInfo) error {
-	if len(parts) != len(urls) {
-		return fmt.Errorf("yun139: parts/urls length mismatch: %d vs %d", len(parts), len(urls))
-	}
-	concurrency := f.opt.UploadConcurrency
-	if concurrency < 1 {
-		concurrency = 1
-	}
-	if concurrency > len(parts) {
-		concurrency = len(parts)
-	}
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(concurrency)
-	var mu sync.Mutex
-	var firstErr error
-	for i := range parts {
-		p := parts[i]
-		u := urls[i]
-		g.Go(func() error {
-			err := f.putPart(gctx, bytes.NewReader(data[p.offset:p.offset+p.partSize]), u.UploadURL, p.partSize)
-			if err != nil {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				mu.Unlock()
-				return err
-			}
-			return nil
-		})
-	}
-	_ = g.Wait()
-	return firstErr
-}
-
-// uploadPartsRandom is like uploadParts but reads each part from a random-
-// access source (TempFile) at the part offset.
-func (f *Fs) uploadPartsRandom(ctx context.Context, in io.ReaderAt, parts []partPlan, urls []api.PersonalPartInfo, total int64) error {
-	if len(parts) != len(urls) {
-		return fmt.Errorf("yun139: parts/urls length mismatch: %d vs %d", len(parts), len(urls))
-	}
-	concurrency := f.opt.UploadConcurrency
-	if concurrency < 1 {
-		concurrency = 1
-	}
-	if concurrency > len(parts) {
-		concurrency = len(parts)
-	}
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(concurrency)
-	var mu sync.Mutex
-	var firstErr error
-	for i := range parts {
-		p := parts[i]
-		u := urls[i]
-		g.Go(func() error {
-			section := io.NewSectionReader(in, p.offset, p.partSize)
-			err := f.putPart(gctx, section, u.UploadURL, p.partSize)
-			if err != nil {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				mu.Unlock()
-				return err
-			}
-			return nil
-		})
-	}
-	_ = g.Wait()
-	return firstErr
 }
 
 // putPart PUTs a single part to its pre-signed URL.
@@ -669,12 +385,12 @@ func (f *Fs) deleteObject(ctx context.Context, id, srvPath string, family bool) 
 	}
 	if f.opt.HardDelete {
 		return f.pacer.Call(func() (bool, error) {
-			err := f.personalCall(ctx, "/file/batchDelete", api.PersonalTrashReq{FileIds: []string{id}}, nil)
+			err := f.personalCall(ctx, "/hcy/file/batchDelete", api.PersonalTrashReq{FileIds: []string{id}}, nil)
 			return shouldRetry(ctx, err)
 		})
 	}
 	return f.pacer.Call(func() (bool, error) {
-		err := f.personalCall(ctx, "/recyclebin/batchTrash", api.PersonalTrashReq{FileIds: []string{id}}, nil)
+		err := f.personalCall(ctx, "/hcy/recyclebin/batchTrash", api.PersonalTrashReq{FileIds: []string{id}}, nil)
 		return shouldRetry(ctx, err)
 	})
 }
@@ -697,7 +413,7 @@ func (f *Fs) renameObject(ctx context.Context, id, newName, dirID string, family
 		})
 	}
 	return f.pacer.Call(func() (bool, error) {
-		err := f.personalCall(ctx, "/file/update", api.PersonalUpdateReq{
+		err := f.personalCall(ctx, "/hcy/file/update", api.PersonalUpdateReq{
 			FileId:      id,
 			Name:        newName,
 			Description: "",
@@ -745,7 +461,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, dst fs.Fs, dstDir string) 
 		})
 	}
 	return f.pacer.Call(func() (bool, error) {
-		err := f.personalCall(ctx, "/file/batchMove", api.PersonalBatchMoveReq{
+		err := f.personalCall(ctx, "/hcy/file/batchMove", api.PersonalBatchMoveReq{
 			FileIds:        []string{srcObj.id},
 			ToParentFileID: dstDirID,
 		}, nil)
@@ -784,7 +500,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		})
 	}
 	return f.pacer.Call(func() (bool, error) {
-		err := f.personalCall(ctx, "/file/batchMove", api.PersonalBatchMoveReq{
+		err := f.personalCall(ctx, "/hcy/file/batchMove", api.PersonalBatchMoveReq{
 			FileIds:        []string{srcID},
 			ToParentFileID: dstID,
 		}, nil)
@@ -823,7 +539,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, dst fs.Fs, dstDir string) 
 		})
 	}
 	return f.pacer.Call(func() (bool, error) {
-		err := f.personalCall(ctx, "/file/batchCopy", api.PersonalBatchCopyReq{
+		err := f.personalCall(ctx, "/hcy/file/batchCopy", api.PersonalBatchCopyReq{
 			FileIds:        []string{srcObj.id},
 			ToParentFileID: dstDirID,
 		}, nil)
@@ -852,4 +568,33 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 // "I have already confirmed the target will be overwritten" path.
 func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	return f.Put(ctx, in, src, options...)
+}
+// sha256MidstateHash hashes the first n bytes of src through a fresh
+// SHA-256 and returns the digest. Caller exports the midstate via
+// api.Sha256Midstate. The hash is never re-used: each part of the file
+// needs its own digest up to its starting offset.
+func sha256MidstateHash(src io.ReaderAt, n int64) interface {
+	Write(p []byte) (int, error)
+	Sum(b []byte) []byte
+} {
+	h := sha256.New()
+	// Copy in 1 MiB chunks. With 5 MiB parts and typical 64 KiB Go
+	// buffer defaults this stays comfortably off the GC.
+	buf := make([]byte, 1<<20)
+	off := int64(0)
+	for off < n {
+		want := n - off
+		if want > int64(len(buf)) {
+			want = int64(len(buf))
+		}
+		nr, err := src.ReadAt(buf[:want], off)
+		if nr > 0 {
+			h.Write(buf[:nr])
+		}
+		if err != nil {
+			break
+		}
+		off += int64(nr)
+	}
+	return h
 }

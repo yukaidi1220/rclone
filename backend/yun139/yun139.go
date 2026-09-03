@@ -60,7 +60,9 @@ const (
 	defaultFamilyRoot = "0"
 
 	// personalPartSize is the default part size for personal uploads.
-	personalPartSize = int64(100 * 1024 * 1024)
+	// The official PC client (8.8.6, captured 2026-09-03) uploads in
+	// 5242880-byte (5 MiB) parts with parallelUpload:true.
+	personalPartSize = int64(5 * 1024 * 1024)
 
 	// maxPartsPerRequest caps the partInfos sent in /file/create and
 	// /file/getUploadUrl (the server accepts up to 100).
@@ -415,35 +417,91 @@ func newHeaders(auth, ts, randStr, sign, svcType string) map[string]string {
 	return h
 }
 
-// pcHeaders returns the header set for the PersonalNew API masquerading as the
-// official PC client. The /file/create endpoint rejects SHA-256 rapid upload
-// ("秒传") unless the request looks like the PC client, so the upload path
-// must use these headers.
+// pcHeaders returns the header set that the official 139 PC client
+// sends. Captured live (2026-09-03, client 8.8.6.20260829):
+//
+//	Accept: */*
+//	Authorization: Basic ***
+//	Content-Type: application/json
+//	x-yun-api-version: v1
+//	x-yun-app-channel: 10200153
+//	x-yun-client-info: ||11|8.8.6.20260829|PC|REVTS1RPUC1CUklONDBD|<DEV>|| Windows 11 (10.0.26200.8246)|1024X720|Q2hpbmVzZSAoU2ltcGxpZmllZCk=|||
+//	x-yun-device-id: <DEV>
+//	x-yun-market-source: 001
+//	x-yun-module-type: 100
+//	x-yun-op-type: 1
+//	x-yun-svc-type: 1
+//	Accept-Language: zh-CN,en,*
+//	User-Agent: Mozilla/5.0
+//
+// Notably there are NO mcloud-* headers and no mcloud-sign: the PC
+// client does not sign its requests the way the web client does.
 func pcHeaders(auth, account, ts, randStr, sign, svcType string) map[string]string {
-	deviceID := "OPENLIST" + md5hex(account)[:16] + "-PC"
-	pcDeviceInfo := "||11|" + pcAppVersion + "|PC|QkYtMjAyMDAzMTAxNjQ3|" + deviceID +
-		"|| Windows 10 (10.0)|1920X1040|Q2hpbmVzZSAoU2ltcGxpZmllZCk=|||"
-	h := newHeaders(auth, ts, randStr, sign, svcType)
-	h["x-DeviceInfo"] = pcDeviceInfo
-	h["x-huawei-channelSrc"] = pcAppChannel
-	h["x-MM-Source"] = "000"
-	h["x-yun-api-version"] = "v1"
-	h["x-yun-app-channel"] = pcAppChannel
-	h["x-yun-client-info"] = pcDeviceInfo
-	h["x-yun-device-id"] = deviceID
-	h["x-yun-device-info"] = pcDeviceInfo
-	h["x-yun-market-source"] = "000"
-	h["x-yun-module-type"] = "100"
-	h["x-yun-op-type"] = "1"
-	h["x-yun-svc-type"] = "1"
-	h["x-ExpRoute-Code"] = "routeCode=" + account + ",type=2"
-	return h
+	deviceID := md5hex(account) + "-ENDIN"
+	pcDeviceInfo := "||11|" + pcAppVersion + "|PC|REVTS1RPUC1CUklONDBD|" + deviceID +
+		"|| Windows 11 (10.0.26200.8246)|1024X720|Q2hpbmVzZSAoU2ltcGxpZmllZCk=|||"
+	return map[string]string{
+		"Accept":             "*/*",
+		"Authorization":      "Basic " + auth,
+		"Content-Type":       "application/json",
+		"x-yun-api-version":  "v1",
+		"x-yun-app-channel":  pcAppChannel,
+		"x-yun-client-info":  pcDeviceInfo,
+		"x-yun-device-id":    deviceID,
+		"x-yun-market-source": "001",
+		"x-yun-module-type":  "100",
+		"x-yun-op-type":      "1",
+		"x-yun-svc-type":     "1",
+		"Accept-Language":    "zh-CN,en,*",
+		"User-Agent":         "Mozilla/5.0",
+	}
 }
 
 const (
-	pcAppVersion = "8.7.2.20260519"
+	pcAppVersion = "8.8.6.20260829"
 	pcAppChannel = "10200153"
+	// pcUserAgentFull is the Electron renderer UA, used by the PC
+	// client's main API paths (create-folder, trash, list, family).
+	pcUserAgentFull = "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) mCloud/" + pcAppVersion + " Chrome/108.0.5359.215 Electron/22.3.0 Safari/537.36"
+	// pcUserAgentShort is the native upload module's UA, used only on
+	// /hcy/file/create with part upload bodies.
+	pcUserAgentShort = "Mozilla/5.0"
 )
+
+// pcHeadersFull returns the header set the PC client's Electron main
+// process sends for general API calls (folder create, trash, list,
+// family). Captured live 2026-09-03, client 8.8.6.20260829.
+func pcHeadersFull(auth, account, deviceID string) map[string]string {
+	pcDeviceInfo := "||11|" + pcAppVersion + "|PC|REVTS1RPUC1CUklONDBD|" + deviceID +
+		"|| Windows 11 (10.0.26200.8246)|1024X720|Q2hpbmVzZSAoU2ltcGxpZmllZCk=|||"
+	return map[string]string{
+		"APP_AUTH":            "Basic " + auth,
+		"APP_CP":              "pc",
+		"Accept":              "*/*",
+		"Accept-Encoding":     "gzip, deflate, br",
+		"Accept-Language":     "zh-CN",
+		"Authorization":       "Basic " + auth,
+		"CP_VERSION":          pcAppVersion,
+		"Content-Type":        "application/json;charset=UTF-8",
+		"Sec-Fetch-Dest":      "empty",
+		"Sec-Fetch-Mode":      "cors",
+		"Sec-Fetch-Site":      "cross-site",
+		"User-Agent":          pcUserAgentFull,
+		"sec-ch-ua":           `"Not?A_Brand";v="8", "Chromium";v="108"`,
+		"sec-ch-ua-mobile":    "?0",
+		"sec-ch-ua-platform":  `"Windows"`,
+		"x-DeviceInfo":        pcDeviceInfo,
+		"x-ExpRoute-Code":     "routeCode=" + account + ",type=2",
+		"x-yun-api-version":   "v1",
+		"x-yun-app-channel":   pcAppChannel,
+		"x-yun-client-info":   pcDeviceInfo,
+		"x-yun-device-id":     deviceID,
+		"x-yun-market-source": "001",
+		"x-yun-module-type":   "100",
+		"x-yun-op-type":       "1",
+		"x-yun-svc-type":      "1",
+	}
+}
 
 // md5hex returns the lower-case hex MD5 of s. Used to derive a stable
 // x-yun-device-id from the account name.
@@ -520,9 +578,16 @@ func (f *Fs) call(ctx context.Context, url string, body any, out any) error {
 	if strings.HasPrefix(url, yunBaseURL+"/orchestration") {
 		headers = legacyHeaders(auth, ts, randStr, sign, f.svcType)
 	} else if f.space == spacePersonal {
-		// Personal space: always pretend to be the PC client so /file/create
-		// honours the SHA-256 rapid-upload ("秒传") fast path.
-		headers = pcHeaders(auth, f.account, ts, randStr, sign, f.svcType)
+		// Personal space always speaks as the official PC client
+		// (captured 2026-09-03, client 8.8.6.20260829). The native
+		// upload module sends a lean header set on /hcy/file/create;
+		// every other call comes from the Electron main process with
+		// the full browser-like set.
+		if strings.HasSuffix(strings.SplitN(url, "?", 2)[0], "/hcy/file/create") && strings.Contains(string(payload), `"partInfos"`) {
+			headers = pcHeaders(auth, f.account, ts, randStr, sign, f.svcType)
+		} else {
+			headers = pcHeadersFull(auth, f.account, md5hex(f.account)+"-ENDIN")
+		}
 	} else {
 		headers = newHeaders(auth, ts, randStr, sign, f.svcType)
 	}
@@ -607,7 +672,11 @@ func (f *Fs) personalCloudHost(ctx context.Context) (string, error) {
 	}
 	for _, p := range resp.Data.RoutePolicyList {
 		if p.ModName == "personal" && p.HttpsURL != "" {
-			f.personalHost = strings.TrimRight(p.HttpsURL, "/")
+			// The route policy host already ends with "/hcy"
+			// (https://personal-kd-njs.yun.139.com/hcy); our
+			// personalCall paths carry the /hcy prefix themselves,
+			// so strip it here to avoid /hcy/hcy/*.
+			f.personalHost = strings.TrimRight(strings.TrimSuffix(p.HttpsURL, "/hcy"), "/")
 			return f.personalHost, nil
 		}
 	}
@@ -615,11 +684,20 @@ func (f *Fs) personalCloudHost(ctx context.Context) (string, error) {
 }
 
 // familyRoot discovers the server-side root catalog ID of the family cloud.
+//
+// The family_id option is required: 139's family API does not expose a
+// "list my families" endpoint, so the only way for the backend to learn
+// the cloud id is from the config. An empty or wrong family_id makes the
+// first family endpoint call return '1010220314: 家庭云不存在' which we
+// surface verbatim to the user.
 func (f *Fs) familyRoot(ctx context.Context) (string, error) {
 	f.familyRootMu.Lock()
 	defer f.familyRootMu.Unlock()
 	if f.familyRootID != "" {
 		return f.familyRootID, nil
+	}
+	if f.opt.FamilyID == "" {
+		return "", errors.New("yun139: family_id is required when space=family; find it in the 139 client's family settings")
 	}
 	req := api.QueryContentListReq{}
 	req.FamilyCommon.CloudID = f.opt.FamilyID
@@ -840,7 +918,7 @@ func (f *Fs) listPersonal(ctx context.Context, dirID string, fn func(listEntry) 
 		}
 		var resp api.PersonalListResp
 		err := f.pacer.Call(func() (bool, error) {
-			err := f.personalCall(ctx, "/file/list", body, &resp)
+			err := f.personalCall(ctx, "/hcy/file/list", body, &resp)
 			return shouldRetry(ctx, err)
 		})
 		if err != nil {
@@ -1050,12 +1128,13 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 		// createCloudDoc returns no ID; find it by listing the parent.
 		return f.findDirID(ctx, pathID, leaf)
 	}
+	// The official client posts exactly {"name","type":"folder",
+	// "parentFileId"} - no description, no fileRenameMode (captured
+	// 2026-09-03).
 	body := api.PersonalCreateFolderReq{
-		ParentFileID:   pathID,
-		Name:           leaf,
-		Description:    "",
-		Type:           "folder",
-		FileRenameMode: "force_rename",
+		ParentFileID: pathID,
+		Name:         leaf,
+		Type:         "folder",
 	}
 	var resp struct {
 		BaseResp api.BaseResp
@@ -1063,7 +1142,7 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 			FileId string `json:"fileId"`
 		} `json:"data"`
 	}
-	if err := f.personalCall(ctx, "/file/create", body, &resp); err != nil {
+	if err := f.personalCall(ctx, "/hcy/file/create", body, &resp); err != nil {
 		return "", err
 	}
 	if resp.Data.FileId == "" {

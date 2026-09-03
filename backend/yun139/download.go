@@ -62,7 +62,7 @@ func (f *Fs) fetchDownloadURL(ctx context.Context, o *Object) (string, error) {
 	body := map[string]any{"fileId": o.id}
 	var resp api.PersonalDownloadResp
 	err := f.pacer.Call(func() (bool, error) {
-		err := f.personalCall(ctx, "/file/getDownloadUrl", body, &resp)
+		err := f.personalCall(ctx, "/hcy/file/getDownloadUrl", body, &resp)
 		return shouldRetry(ctx, err)
 	})
 	if err != nil {
