@@ -886,8 +886,13 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 	}
 	// (family_id is auto-discovered in NewFs via queryFamilyCloud when
 	// not set; personal space needs no extra config.)
-	if opt.PartSize < 1024*1024 {
-		return nil, fmt.Errorf("yun139: part_size must be at least 1Mi, got %s", opt.PartSize)
+	// Live-tested part sizes (audit 2026-09-04): the server accepts
+	// 5 MiB and 10 MiB parts; 1/2/4 MiB all fail with
+	// '04000002: 请求参数不合法(00010002)'. Reject anything smaller
+	// than 5 MiB outright so misconfiguration fails fast instead of
+	// at the first create call.
+	if opt.PartSize < 5*1024*1024 {
+		return nil, fmt.Errorf("yun139: part_size must be at least 5Mi (the server rejects smaller parts), got %s", opt.PartSize)
 	}
 	if opt.PartSize%64 != 0 {
 		return nil, fmt.Errorf("yun139: part_size must be a multiple of 64 bytes, got %d", opt.PartSize)
