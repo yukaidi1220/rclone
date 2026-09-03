@@ -2526,13 +2526,20 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if err != nil {
 		return nil, err
 	}
-	_ = dstLeaf // copy lands under srcLeaf; the engine handles leaf changes
 	if f.space == spaceFamily {
 		if err := f.familyCopy(ctx, srcObj, dstDirID); err != nil {
 			return nil, err
 		}
 		// The family copy task has no direct id echo; re-resolve.
-		return f.NewObject(ctx, remote)
+		o, err := f.NewObject(ctx, remote)
+		if err == nil {
+			return o, nil
+		}
+		// Fall through to the same findNewCopy+rename path as personal.
+		if o, err2 := f.resolveCopyLeaf(ctx, srcObj, dstDirID, dstLeaf); err2 == nil {
+			return o, nil
+		}
+		return nil, err
 	}
 	taskID, err := f.copyTaskID(ctx, srcObj.id, dstDirID)
 	if err != nil {
@@ -2541,17 +2548,34 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if err := f.taskGet(ctx, taskID, "copy"); err != nil {
 		return nil, err
 	}
-	// The copy task has no direct id echo; re-resolve. A same-directory
-	// copy gets auto-renamed by the server (name(1).ext), so also scan
-	// the parent for a fresh entry that is not the source.
 	o, err := f.NewObject(ctx, remote)
 	if err == nil {
 		return o, nil
 	}
-	if o, err2 := f.findNewCopy(ctx, srcObj, dstDirID); err2 == nil {
+	return f.resolveCopyLeaf(ctx, srcObj, dstDirID, dstLeaf)
+}
+
+// resolveCopyLeaf finds the server-created copy and, when the server
+// auto-renamed it (batchCopy lands under <src>_<timestamp>.<ext> or
+// <src>(1).<ext> instead of the requested leaf), renames it to the
+// requested leaf and returns the object at remote. If nothing was
+// found, returns ErrorObjectNotFound.
+func (f *Fs) resolveCopyLeaf(ctx context.Context, srcObj *Object, dstDirID, dstLeaf string) (fs.Object, error) {
+	o, err := f.findNewCopy(ctx, srcObj, dstDirID)
+	if err != nil {
+		return nil, err
+	}
+	newObj := o.(*Object)
+	if newObj.leaf() == dstLeaf {
 		return o, nil
 	}
-	return nil, err
+	// The server put the copy under a different name (auto_rename).
+	// Rename it to the requested leaf; both spaces support this.
+	if err := f.renameObject(ctx, newObj.id, f.opt.Enc.FromStandardName(dstLeaf), dstDirID, f.space == spaceFamily); err != nil {
+		return nil, fmt.Errorf("yun139: rename copy to %q: %w", dstLeaf, err)
+	}
+	newObj.remote = path.Join(f.root, dstLeaf)
+	return newObj, nil
 }
 
 // findNewCopy lists dstDirID and returns the first file entry that is
