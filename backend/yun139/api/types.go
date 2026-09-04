@@ -118,14 +118,14 @@ const AuthTokenRefreshURL = "https://note-njs.yun.139.com/yun-note/user/authToke
 
 // PersonalFileItem is one entry in the PersonalNew listing.
 type PersonalFileItem struct {
-	FileId       string              `json:"fileId"`
-	Name         string              `json:"name"`
-	Size         int64               `json:"size"`
-	Type         string              `json:"type"` // "folder" or "file"
-	CreatedAt    string              `json:"createdAt"`
-	UpdatedAt    string              `json:"updatedAt"`
-	ContentHash  string              `json:"contentHash"` // sha256 (lowercase) of files; empty for folders
-	Thumbnails   []PersonalThumbnail `json:"thumbnailUrls"`
+	FileId      string              `json:"fileId"`
+	Name        string              `json:"name"`
+	Size        int64               `json:"size"`
+	Type        string              `json:"type"` // "folder" or "file"
+	CreatedAt   string              `json:"createdAt"`
+	UpdatedAt   string              `json:"updatedAt"`
+	ContentHash string              `json:"contentHash"` // sha256 (lowercase) of files; empty for folders
+	Thumbnails  []PersonalThumbnail `json:"thumbnailUrls"`
 }
 
 // PersonalThumbnail is one thumbnail URL variant.
@@ -212,15 +212,15 @@ type FamilyCloud struct {
 	CommonAccountInfo struct {
 		Account       string      `json:"account"`
 		AccountUserID string      `json:"accountUserId"`
-		AccountType   json.Number  `json:"accountType"` // server sends "1" or 1
+		AccountType   json.Number `json:"accountType"` // server sends "1" or 1
 	} `json:"commonAccountInfo"`
-	Nickname      string `json:"nickname"`
-	CloudNickName string `json:"cloudNickName"`
-	CloudID       string `json:"cloudID"`
-	CloudName     string `json:"cloudName"`
-	CloudDesc     string `json:"cloudDesc"`
-	CloudType     int    `json:"cloudType"`
-	CreateTime    string `json:"createTime"`
+	Nickname       string `json:"nickname"`
+	CloudNickName  string `json:"cloudNickName"`
+	CloudID        string `json:"cloudID"`
+	CloudName      string `json:"cloudName"`
+	CloudDesc      string `json:"cloudDesc"`
+	CloudType      int    `json:"cloudType"`
+	CreateTime     string `json:"createTime"`
 	LastUpdateTime string `json:"lastUpdateTime"`
 }
 
@@ -312,12 +312,12 @@ type FamilyCreateFolderResp struct {
 // FamilyRenameReq is the request for renaming a family file or folder.
 type FamilyRenameReq struct {
 	FamilyCommon
-	CatalogType   int    `json:"catalogType"`
-	DocLibName    string `json:"docLibName"`
-	DocLibraryID  string `json:"docLibraryID"`
-	Path          string `json:"path"`
-	ContentID     string `json:"contentID"`
-	ContentName   string `json:"contentName"`
+	CatalogType  int    `json:"catalogType"`
+	DocLibName   string `json:"docLibName"`
+	DocLibraryID string `json:"docLibraryID"`
+	Path         string `json:"path"`
+	ContentID    string `json:"contentID"`
+	ContentName  string `json:"contentName"`
 }
 
 // FamilyRenameResp is the response of the family rename endpoint.
@@ -386,9 +386,9 @@ type FamilyUploadCreateResp struct {
 // (/dynamic/file/getUploadUrl).
 type FamilyUploadURLReq struct {
 	FamilyCommon
-	FileId    string             `json:"fileId"`
-	UploadId  string             `json:"uploadId"`
-	PartInfos []PartInfo         `json:"partInfos"`
+	FileId    string     `json:"fileId"`
+	UploadId  string     `json:"uploadId"`
+	PartInfos []PartInfo `json:"partInfos"`
 }
 
 // FamilyUploadCompleteReq is the request for /dynamic/file/complete.
@@ -469,10 +469,10 @@ type FamilyModifyContentReq struct {
 // (modifyCloudDocV2).
 type FamilyModifyDocV2Req struct {
 	FamilyCommon
-	CatalogType   int    `json:"catalogType"`
-	DocLibName    string `json:"docLibName"`
-	DocLibraryID  string `json:"docLibraryID"`
-	Path          string `json:"path"`
+	CatalogType  int    `json:"catalogType"`
+	DocLibName   string `json:"docLibName"`
+	DocLibraryID string `json:"docLibraryID"`
+	Path         string `json:"path"`
 }
 
 // FamilyDeleteReq is the request for the family batch-delete endpoint.
@@ -489,9 +489,9 @@ type FamilyDeleteReq struct {
 // IsboBatchOprTaskReq is the request for the isbo openApi batch-operation
 // endpoint used by family move.
 type IsboBatchOprTaskReq struct {
-	CatalogList   []string `json:"catalogList"`
-	ContentList   []string `json:"contentList"`
-	AccountInfo   struct {
+	CatalogList []string `json:"catalogList"`
+	ContentList []string `json:"contentList"`
+	AccountInfo struct {
 		AccountName string `json:"accountName"`
 		AccountType string `json:"accountType"`
 	} `json:"accountInfo"`
