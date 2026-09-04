@@ -15,14 +15,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"os"
-	"path"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
 	"github.com/rclone/rclone/backend/yun139/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -36,19 +28,27 @@ import (
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/random"
 	"golang.org/x/sync/errgroup"
+	"io"
+	"net/http"
+	"os"
+	"path"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 )
 
 // ------------------------------------------------------------ constants ----
 
 const (
-	yunBaseURL       = "https://yun.139.com"
-	userNJSBaseURL   = "https://user-njs.yun.139.com"
-	minSleep         = 10 * time.Millisecond
-	maxSleep         = 2 * time.Second
-	decayConstant    = 2
-	listPageSize     = 100
-	maxListPages     = 1000
-	defaultRootID    = "/"
+	yunBaseURL        = "https://yun.139.com"
+	userNJSBaseURL    = "https://user-njs.yun.139.com"
+	minSleep          = 10 * time.Millisecond
+	maxSleep          = 2 * time.Second
+	decayConstant     = 2
+	listPageSize      = 100
+	maxListPages      = 1000
+	defaultRootID     = "/"
 	defaultFamilyRoot = "0"
 
 	// personalPartSize is the default part size for personal uploads.
@@ -89,15 +89,15 @@ const (
 
 // Options defines the configuration for this backend
 type Options struct {
-	Authorization string `config:"authorization"` // base64("pc:account:token")
-	Space         string `config:"space"`
-	FamilyID      string `config:"family_id"`
-	RootFolderID  string `config:"root_folder_id"`
-	UserDomainID  string `config:"user_domain_id"` // <user-domain-id>-style id, optional
-	HardDelete    bool   `config:"hard_delete"`
-	PartSize      fs.SizeSuffix `config:"part_size"`
-	UploadConcurrency int       `config:"upload_concurrency"`
-	Enc           encoder.MultiEncoder `config:"encoding"`
+	Authorization     string               `config:"authorization"` // base64("pc:account:token")
+	Space             string               `config:"space"`
+	FamilyID          string               `config:"family_id"`
+	RootFolderID      string               `config:"root_folder_id"`
+	UserDomainID      string               `config:"user_domain_id"` // <user-domain-id>-style id, optional
+	HardDelete        bool                 `config:"hard_delete"`
+	PartSize          fs.SizeSuffix        `config:"part_size"`
+	UploadConcurrency int                  `config:"upload_concurrency"`
+	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
 func init() {
@@ -152,8 +152,8 @@ func init() {
 			Default:  fs.SizeSuffix(personalPartSize),
 			Advanced: true,
 		}, {
-			Name: "upload_concurrency",
-			Help: "Concurrency for part uploads within a single file.",
+			Name:     "upload_concurrency",
+			Help:     "Concurrency for part uploads within a single file.",
 			Default:  4,
 			Advanced: true,
 		}, {
@@ -212,7 +212,7 @@ type Fs struct {
 	root       string             // the path we are working on
 	opt        Options            // parsed options
 	m          configmap.Mapper   // config mapper, used to write tokens back
-	features   *fs.Features      // optional features
+	features   *fs.Features       // optional features
 	httpClient *http.Client       // the connection to the server
 	pacer      *fs.Pacer          // pacer for API calls
 	dirCache   *dircache.DirCache // Map of directory path to directory id
@@ -221,8 +221,8 @@ type Fs struct {
 	// lock-copy-free.
 	srvPathOf *srvPathCache
 
-	space      string // spacePersonal or spaceFamily
-	svcType    string // svcTypePersonal or svcTypeFamily
+	space   string // spacePersonal or spaceFamily
+	svcType string // svcTypePersonal or svcTypeFamily
 
 	tokMu   *sync.Mutex // guards authorization + account (pointer so NewFs's tempF copy stays lock-safe)
 	auth    string      // the raw base64 authorization token
@@ -239,14 +239,14 @@ type Fs struct {
 
 // Object describes a yun139 object
 type Object struct {
-	fs         *Fs     // what this object is part of
-	remote     string  // the remote path
-	id         string  // ID of the object
-	size       int64   // size of the object
+	fs         *Fs       // what this object is part of
+	remote     string    // the remote path
+	id         string    // ID of the object
+	size       int64     // size of the object
 	modTime    time.Time // modification time
-	isDir      bool    // whether this is a directory
-	serverPath string  // family/group: server-side path (root:/...)
-	sha256     string  // personal space: contentHash from listing/upload
+	isDir      bool      // whether this is a directory
+	serverPath string    // family/group: server-side path (root:/...)
+	sha256     string    // personal space: contentHash from listing/upload
 
 	urlMu     *sync.Mutex // protects url / urlExpiry (pointer so Object copy stays lock-safe)
 	url       string      // cached download URL
@@ -384,17 +384,17 @@ func (f *Fs) refreshToken(ctx context.Context) error {
 // commonHeaders returns the base header set shared by both API families.
 func commonHeaders() map[string]string {
 	return map[string]string{
-		"Accept":         "application/json, text/plain, */*",
-		"mcloud-channel": "1000101",
-		"mcloud-client":  "10701",
-		"mcloud-version": "7.14.0",
-		"Origin":         yunBaseURL,
-		"Referer":        yunBaseURL + "/w/",
-		"x-DeviceInfo":   deviceInfo,
-		"x-huawei-channelSrc": "10000034",
-		"x-inner-ntwk":   "2",
-		"x-m4c-caller":   "PC",
-		"x-m4c-src":      "10002",
+		"Accept":                 "application/json, text/plain, */*",
+		"mcloud-channel":         "1000101",
+		"mcloud-client":          "10701",
+		"mcloud-version":         "7.14.0",
+		"Origin":                 yunBaseURL,
+		"Referer":                yunBaseURL + "/w/",
+		"x-DeviceInfo":           deviceInfo,
+		"x-huawei-channelSrc":    "10000034",
+		"x-inner-ntwk":           "2",
+		"x-m4c-caller":           "PC",
+		"x-m4c-src":              "10002",
 		"Inner-Hcy-Router-Https": "1",
 	}
 }
@@ -402,29 +402,29 @@ func commonHeaders() map[string]string {
 // newHeaders returns the header set for the PersonalNew API (web client).
 func newHeaders(auth, ts, randStr, sign, svcType string) map[string]string {
 	h := map[string]string{
-		"Accept":               "application/json, text/plain, */*",
-		"Caller":               "web",
-		"CMS-DEVICE":           "default",
-		"Mcloud-Channel":       "1000101",
-		"Mcloud-Client":        "10701",
-		"Mcloud-Route":         "001",
-		"Mcloud-Sign":          fmt.Sprintf("%s,%s,%s", ts, randStr, sign),
-		"Mcloud-Version":       "7.14.0",
-		"x-DeviceInfo":         deviceInfo,
-		"x-huawei-channelSrc":  "10000034",
-		"x-inner-ntwk":         "2",
-		"x-m4c-caller":         "PC",
-		"x-m4c-src":            "10002",
-		"x-SvcType":            svcType,
-		"X-Yun-Api-Version":    "v1",
-		"X-Yun-App-Channel":    "10000034",
-		"X-Yun-Channel-Source": "10000034",
-		"X-Yun-Client-Info":    deviceInfo + "dW5kZWZpbmVk||",
-		"X-Yun-Module-Type":    "100",
-		"X-Yun-Svc-Type":       svcType,
-		"User-Agent":           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		"Accept":                 "application/json, text/plain, */*",
+		"Caller":                 "web",
+		"CMS-DEVICE":             "default",
+		"Mcloud-Channel":         "1000101",
+		"Mcloud-Client":          "10701",
+		"Mcloud-Route":           "001",
+		"Mcloud-Sign":            fmt.Sprintf("%s,%s,%s", ts, randStr, sign),
+		"Mcloud-Version":         "7.14.0",
+		"x-DeviceInfo":           deviceInfo,
+		"x-huawei-channelSrc":    "10000034",
+		"x-inner-ntwk":           "2",
+		"x-m4c-caller":           "PC",
+		"x-m4c-src":              "10002",
+		"x-SvcType":              svcType,
+		"X-Yun-Api-Version":      "v1",
+		"X-Yun-App-Channel":      "10000034",
+		"X-Yun-Channel-Source":   "10000034",
+		"X-Yun-Client-Info":      deviceInfo + "dW5kZWZpbmVk||",
+		"X-Yun-Module-Type":      "100",
+		"X-Yun-Svc-Type":         svcType,
+		"User-Agent":             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 		"Inner-Hcy-Router-Https": "1",
-		"Content-Type":         "application/json",
+		"Content-Type":           "application/json",
 	}
 	h["Authorization"] = "Basic " + auth
 	return h
@@ -454,19 +454,19 @@ func pcHeaders(auth, account, ts, randStr, sign, svcType string) map[string]stri
 	pcDeviceInfo := "||11|" + pcAppVersion + "|PC|REVTS1RPUC1CUklONDBD|" + deviceID +
 		"|| Windows 11 (10.0.26200.8246)|1024X720|Q2hpbmVzZSAoU2ltcGxpZmllZCk=|||"
 	return map[string]string{
-		"Accept":             "*/*",
-		"Authorization":      "Basic " + auth,
-		"Content-Type":       "application/json",
-		"x-yun-api-version":  "v1",
-		"x-yun-app-channel":  pcAppChannel,
-		"x-yun-client-info":  pcDeviceInfo,
-		"x-yun-device-id":    deviceID,
+		"Accept":              "*/*",
+		"Authorization":       "Basic " + auth,
+		"Content-Type":        "application/json",
+		"x-yun-api-version":   "v1",
+		"x-yun-app-channel":   pcAppChannel,
+		"x-yun-client-info":   pcDeviceInfo,
+		"x-yun-device-id":     deviceID,
 		"x-yun-market-source": "001",
-		"x-yun-module-type":  "100",
-		"x-yun-op-type":      "1",
-		"x-yun-svc-type":     "1",
-		"Accept-Language":    "zh-CN,en,*",
-		"User-Agent":         "Mozilla/5.0",
+		"x-yun-module-type":   "100",
+		"x-yun-op-type":       "1",
+		"x-yun-svc-type":      "1",
+		"Accept-Language":     "zh-CN,en,*",
+		"User-Agent":          "Mozilla/5.0",
 	}
 }
 
@@ -693,7 +693,9 @@ func (f *Fs) familyCall(ctx context.Context, pathname string, body any, out any)
 
 // deviceInfoHeader returns the x-DeviceInfo value the official client
 // posts on every /hcy/group/dynamic/* call. The string has the shape
-//   "||<clientInfo>|<osInfo>|<screen>|<localeBase64>|||<osLocale>|"
+//
+//	"||<clientInfo>|<osInfo>|<screen>|<localeBase64>|||<osLocale>|"
+//
 // with the fields delimited by "||".
 //
 // The fifth clientInfo field is a 16-byte hex device id. The official
@@ -838,8 +840,8 @@ func (f *Fs) familyRoot(ctx context.Context) (string, error) {
 		"pageInfo": map[string]int{"pageNum": 1, "pageSize": 1},
 	}
 	var resp struct {
-		Path               string `json:"path"`
-		CloudCatalogList   []struct {
+		Path             string `json:"path"`
+		CloudCatalogList []struct {
 			CatalogID string `json:"catalogID"`
 		} `json:"cloudCatalogList"`
 	}
@@ -917,13 +919,13 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 	}
 
 	f := &Fs{
-		name: name,
-		root: parsePath(root),
-		opt:  *opt,
-		m:    m,
+		name:       name,
+		root:       parsePath(root),
+		opt:        *opt,
+		m:          m,
 		httpClient: fshttp.NewClient(ctx),
-		space: opt.Space,
-		svcType: svcTypePersonal,
+		space:      opt.Space,
+		svcType:    svcTypePersonal,
 	}
 	if opt.Space == spaceFamily {
 		f.svcType = svcTypeFamily
@@ -1070,13 +1072,13 @@ func (f *Fs) DirCacheFlush() { f.dirCache.ResetRoot() }
 
 // listEntry is one entry of a directory listing, normalised across spaces.
 type listEntry struct {
-	id       string
-	name     string
-	size     int64
-	isDir    bool
-	modTime  time.Time
-	srvPath  string // family/group server path of the parent dir
-	sha256   string // personal space: contentHash from the listing (empty if absent)
+	id      string
+	name    string
+	size    int64
+	isDir   bool
+	modTime time.Time
+	srvPath string // family/group server path of the parent dir
+	sha256  string // personal space: contentHash from the listing (empty if absent)
 }
 
 // listPersonal lists the entries of a personal-cloud directory.
@@ -1318,11 +1320,11 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 		// {catalogType, cloudID, docLibName, manualRename, path,
 		//  commonAccountInfo} and returns {catalogInfo.catalogID}.
 		body := map[string]any{
-			"catalogType": 3,
-			"cloudID":     f.opt.FamilyID,
-			"docLibName":  leaf,
+			"catalogType":  3,
+			"cloudID":      f.opt.FamilyID,
+			"docLibName":   leaf,
 			"manualRename": 0,
-			"path":        srvPath,
+			"path":         srvPath,
 			"commonAccountInfo": map[string]any{
 				"userDomainId": f.userDomainID,
 				"accountType":  1,
@@ -1683,7 +1685,6 @@ func (f *Fs) purgeFamilyDir(ctx context.Context, id string) error {
 	return f.deleteObject(ctx, id, "", true)
 }
 
-
 // About returns quota information for the personal cloud.
 //
 // POST user-njs.yun.139.com/user/disk/quota/detail with
@@ -1739,9 +1740,9 @@ func quotaToUsage(diskMiB, freeMiB int64) *fs.Usage {
 
 // uploadResult is the outcome of one Put/Update upload.
 type uploadResult struct {
-	fileID  string
+	fileID   string
 	fileName string // server-side name after auto_rename
-	hashHex string
+	hashHex  string
 }
 
 // partPlan describes the byte range of one part of an upload.
@@ -2297,7 +2298,7 @@ func (f *Fs) deleteObject(ctx context.Context, id, srvPath string, family bool) 
 	if family {
 		taskID, err := f.familyBatchOprTask(ctx, familyBatchReq{
 			ContentList:       []string{id},
-			DestCloudID:       "",    // delete - no dest
+			DestCloudID:       "", // delete - no dest
 			DestCatalogType:   1002,
 			DestType:          "1",
 			DestPath:          "",
@@ -2891,6 +2892,7 @@ func (w *yun139ChunkWriter) Abort(ctx context.Context) error {
 func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	return f.Put(ctx, in, src, options...)
 }
+
 // sha256MidstateHash hashes the first n bytes of src through a fresh
 // SHA-256 and returns the digest. Caller exports the midstate via
 // api.Sha256Midstate. The hash is never re-used: each part of the file
@@ -3211,7 +3213,7 @@ func (f *Fs) familyTaskPoll(ctx context.Context, taskID string) error {
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		body := map[string]any{
-			"taskID":    taskID,
+			"taskID": taskID,
 			"accountInfo": map[string]any{
 				"userDomainId": f.userDomainID,
 				"accountType":  1,
@@ -3228,7 +3230,7 @@ func (f *Fs) familyTaskPoll(ctx context.Context, taskID string) error {
 				ResultDesc string `json:"resultDesc"`
 			} `json:"result"`
 			BatchOprTask struct {
-				TaskStatus   int `json:"taskStatus"`
+				TaskStatus     int  `json:"taskStatus"`
 				TaskResultCode *int `json:"taskResultCode"`
 			} `json:"batchOprTask"`
 			ContentList []struct {

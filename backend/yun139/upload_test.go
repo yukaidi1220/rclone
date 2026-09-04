@@ -142,6 +142,7 @@ func TestCreateReqPayload_Mirrors139Strm(t *testing.T) {
 		t.Errorf("partOffset = %v, want 0", ctx["partOffset"])
 	}
 }
+
 // TestBuildCreateBody_CapsAt100Parts pins the create payload cap at
 // maxPartsPerRequest (100) parts - the official client's create sends
 // at most 100 partInfos and fetches the rest via getUploadUrl
@@ -178,11 +179,11 @@ func TestPlanParts_EdgeCases(t *testing.T) {
 		wantParts   int
 		wantLast    int64
 	}{
-		{0, 5242880, 1, 0},            // empty file: one zero-size part
-		{5242880, 5242880, 1, 5242880}, // exactly one part
+		{0, 5242880, 1, 0},                     // empty file: one zero-size part
+		{5242880, 5242880, 1, 5242880},         // exactly one part
 		{5242880 * 100, 5242880, 100, 5242880}, // exactly 100 parts
 		{5242880*100 + 1, 5242880, 101, 1},     // 101st part triggers getUploadUrl
-		{5, 5242880, 1, 5},            // tiny file
+		{5, 5242880, 1, 5},                     // tiny file
 	}
 	for _, c := range cases {
 		parts := planParts(c.size, c.chunk)
@@ -216,7 +217,7 @@ func TestChunkWriter_OutOfOrderWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(tmp.Name())
+	defer func() { _ = os.Remove(tmp.Name()) }()
 
 	w := &yun139ChunkWriter{
 		tmp:       tmp,
