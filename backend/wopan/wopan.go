@@ -435,6 +435,12 @@ func spaceParams(spaceType, familyID string) map[string]any {
 // corruption) or containing a non-BMP character (which the server rejects
 // with HTTP 500). The NoRetryError wrapper stops --retries from re-running a
 // whole sync round, which is pointless for a name that can never succeed.
+//
+// TODO(2026-09-17): 实测发现文件名含 © 型 BMP 特殊符号(如 "英特尔® XTU" 中的
+// ®, U+00AE)也会被 wopan 服务器拒收, 导致迁移目标端缺失该对象, rclone check
+// 报 "file not in wopan root"。当前 validateName 只拦截 >100 runes 与非-BMP,
+// 未覆盖此类字符。待排查: 服务器返回的具体错误码(上传时)与完整拒收字符集
+// (是否 >=0x80 全拒, 或仅部分符号), 确认后在此扩展校验规则并同步迁移 FAQ。
 func validateName(leaf string) error {
 	n := utf8.RuneCountInString(leaf)
 	if n > 100 {
@@ -922,19 +928,30 @@ func (f *Fs) call(ctx context.Context, channel, method string, param any, extra 
 
 // queryUserID validates the access token and returns the account's userId,
 // which is the invariant used to key the shared token registry.
+//
+// Wrapped in f.pacer.Call so that transient control-plane failures (504 Gateway
+// Timeout, 502, 503, 429) are retried with the standard low-level retry budget
+// instead of killing the entire Preflight / rclone lsd wopan: on the first
+// connect attempt. was directly calling f.call before (TODO at line 888-894).
 func (f *Fs) queryUserID(ctx context.Context) (string, error) {
 	param := api.QueryUserRequest{AccessToken: f.tok.accessTokenNow()}
-	data, err := f.call(ctx, chanAPIUser, "AppQueryUser", param,
-		map[string]any{"clientId": clientID, "secret": true})
+	var u api.QueryUserResponse
+	err := f.pacer.Call(func() (bool, error) {
+		data, err := f.call(ctx, chanAPIUser, "AppQueryUser", param,
+			map[string]any{"clientId": clientID, "secret": true})
+		if err != nil {
+			return shouldRetryCall(ctx, err)
+		}
+		if err := json.Unmarshal(data, &u); err != nil {
+			return false, fmt.Errorf("wopan: decode user info: %w", err)
+		}
+		if u.UserID == "" {
+			return false, errors.New("wopan: AppQueryUser returned an empty userId")
+		}
+		return false, nil
+	})
 	if err != nil {
 		return "", fmt.Errorf("wopan: couldn't validate the token: %w", err)
-	}
-	var u api.QueryUserResponse
-	if err := json.Unmarshal(data, &u); err != nil {
-		return "", fmt.Errorf("wopan: decode user info: %w", err)
-	}
-	if u.UserID == "" {
-		return "", errors.New("wopan: AppQueryUser returned an empty userId")
 	}
 	return u.UserID, nil
 }
