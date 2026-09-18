@@ -436,11 +436,24 @@ func spaceParams(spaceType, familyID string) map[string]any {
 // with HTTP 500). The NoRetryError wrapper stops --retries from re-running a
 // whole sync round, which is pointless for a name that can never succeed.
 //
-// TODO(2026-09-17): 实测发现文件名含 © 型 BMP 特殊符号(如 "英特尔® XTU" 中的
-// ®, U+00AE)也会被 wopan 服务器拒收, 导致迁移目标端缺失该对象, rclone check
-// 报 "file not in wopan root"。当前 validateName 只拦截 >100 runes 与非-BMP,
-// 未覆盖此类字符。待排查: 服务器返回的具体错误码(上传时)与完整拒收字符集
-// (是否 >=0x80 全拒, 或仅部分符号), 确认后在此扩展校验规则并同步迁移 FAQ。
+// TODO(2026-09-17): validateName 当前只拦截两类:
+//   1. > 100 runes (服务器静默截断, NoRetryError 避免反复重试)
+//   2. 非 BMP 字符 (r > 0xFFFF, 如 emoji 😀, 服务器直接 HTTP 500)
+//
+//   实测发现还有第三类漏网: BMP 范围内的特殊符号, 例如 "英特尔® XTU" 中的
+//   ® (U+00AE), 服务器返回 RSP_CODE=1009 "名称中含有非法字符" 并拒收整个路径。
+//   目录创建 CreateDirectory 触发 1009 → 该目录下所有文件都无法上传 →
+//   rclone check 报 "file not in wopan root", probe 若未抽到则静默漏掉。
+//
+//   ── 开发时需排查确认 ──
+//   [ ] wopan 完整拒收字符集: 是仅若干特定符号 (® © ™ ° ± …) 还是 >=0x80 全拒?
+//   [ ] 拒收的是目录名、文件名、还是两者?
+//   [ ] 服务器返回的具体错误码 (已见 RSP_CODE=1009, 是否还有其他码)?
+//   [ ] 拦截策略: NoRetryError 阻止重试? 还是提供 sanitize 替换模式
+//       (--wopan-sanitize-names 自动把非法字符替换为 _)?
+//   [ ] 同步迁移 FAQ / docs: 说明哪些字符会丢, 如何规避。
+//   [ ] 补充 unit test: 覆盖 BMP 特殊符号 case, 以及 RSP_CODE=1009 的
+//       NoRetryError 包裹测试。
 func validateName(leaf string) error {
 	n := utf8.RuneCountInString(leaf)
 	if n > 100 {
