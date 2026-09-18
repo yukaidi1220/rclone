@@ -4,7 +4,6 @@ package s3
 //go:generate go run gen_setfrom.go -o setfrom.go
 
 import (
-	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/tls"
@@ -3298,6 +3297,16 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, err
 	}
 
+	// With NoHeadObject no metadata was read for the new object, so carry
+	// the size and MD5 over from the source as a server-side copy produces
+	// an object with identical content.
+	if f.opt.NoHeadObject {
+		if dstObject, ok := dstObj.(*Object); ok {
+			dstObject.bytes = srcObj.bytes
+			dstObject.md5 = srcObj.md5
+		}
+	}
+
 	// Set Object Lock via separate API calls if requested
 	if f.opt.ObjectLockSetAfterUpload {
 		if dstObject, ok := dstObj.(*Object); ok {
@@ -3317,6 +3326,10 @@ func (f *Fs) Hashes() hash.Set {
 
 // PublicLink generates a public link to the remote path (usually readable by anyone)
 func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (link string, err error) {
+	return f.publicLink(ctx, remote, expire, &s3.GetObjectInput{})
+}
+
+func (f *Fs) publicLink(ctx context.Context, remote string, expire fs.Duration, req *s3.GetObjectInput) (link string, err error) {
 	if strings.HasSuffix(remote, "/") {
 		return "", fs.ErrorCantShareDirectories
 	}
@@ -3330,11 +3343,10 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 		expire = maxExpireDuration
 	}
 	bucket, bucketPath := f.split(remote)
-	httpReq, err := s3.NewPresignClient(f.c).PresignGetObject(ctx, &s3.GetObjectInput{
-		Bucket:    &bucket,
-		Key:       &bucketPath,
-		VersionId: o.versionID,
-	}, s3.WithPresignExpires(time.Duration(expire)))
+	req.Bucket = &bucket
+	req.Key = &bucketPath
+	req.VersionId = o.versionID
+	httpReq, err := s3.NewPresignClient(f.c).PresignGetObject(ctx, req, s3.WithPresignExpires(time.Duration(expire)))
 	if err != nil {
 		return "", err
 	}
@@ -3342,6 +3354,40 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 }
 
 var commandHelp = []fs.CommandHelp{{
+	Name:  "link",
+	Short: "Generate a signed link with response header overrides.",
+	Long: `This command generates a signed download link for one file, with optional
+overrides for the HTTP response headers. Pass the file path as a separate
+argument, relative to the remote path.
+
+Usage examples:
+
+` + "```console" + `
+rclone backend link s3:bucket path/to/file -o expire=1h
+rclone backend link s3:bucket path/to/file -o response-expires="Thu, 01 Jan 1970 00:00:00 GMT"
+rclone backend link s3:bucket path/to/file -o response-content-disposition='attachment; filename="download.txt"'
+` + "```" + `
+
+The link expires after 7 days by default. Use ` + "`-o expire=1h`" + ` to change
+its lifetime. Durations must be at least 1 second; values above 7 days are
+limited to 7 days, as with ` + "`rclone link`" + `.
+
+The ` + "`response-expires`" + ` option sets the HTTP Expires response header,
+not the lifetime of the signed link. It must be an HTTP date, such as
+` + "`Thu, 01 Jan 1970 00:00:00 GMT`" + `.
+
+The overrides are included in the signature and must not be changed in the
+returned URL. They do not modify the object's stored metadata.`,
+	Opts: map[string]string{
+		"expire":                       "How long the link will be valid (default 7d, maximum 7d).",
+		"response-cache-control":       "Set the Cache-Control response header.",
+		"response-content-disposition": "Set the Content-Disposition response header.",
+		"response-content-encoding":    "Set the Content-Encoding response header.",
+		"response-content-language":    "Set the Content-Language response header.",
+		"response-content-type":        "Set the Content-Type response header.",
+		"response-expires":             "Set the Expires response header to an HTTP date.",
+	},
+}, {
 	Name:  "restore",
 	Short: "Restore objects from GLACIER or INTELLIGENT-TIERING archive tier.",
 	Long: `This command can be used to restore one or more objects from GLACIER to normal
@@ -3569,6 +3615,44 @@ It doesn't return anything.`,
 // otherwise it will be JSON encoded and shown to the user like that
 func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out any, err error) {
 	switch name {
+	case "link":
+		if len(arg) != 1 || arg[0] == "" {
+			return nil, errors.New("link requires exactly one file path argument")
+		}
+		req := s3.GetObjectInput{}
+		expire := maxExpireDuration
+		for key, value := range opt {
+			switch key {
+			case "expire":
+				duration, err := fs.ParseDuration(value)
+				if err != nil {
+					return nil, fmt.Errorf("invalid expire: %w", err)
+				}
+				if duration < time.Second {
+					return nil, errors.New("expire must be at least 1 second")
+				}
+				expire = fs.Duration(duration)
+			case "response-cache-control":
+				req.ResponseCacheControl = aws.String(value)
+			case "response-content-disposition":
+				req.ResponseContentDisposition = aws.String(value)
+			case "response-content-encoding":
+				req.ResponseContentEncoding = aws.String(value)
+			case "response-content-language":
+				req.ResponseContentLanguage = aws.String(value)
+			case "response-content-type":
+				req.ResponseContentType = aws.String(value)
+			case "response-expires":
+				date, err := http.ParseTime(value)
+				if err != nil {
+					return nil, fmt.Errorf("invalid response-expires: %w", err)
+				}
+				req.ResponseExpires = &date
+			default:
+				return nil, fmt.Errorf("unknown link option %q", key)
+			}
+		}
+		return f.publicLink(ctx, arg[0], expire, &req)
 	case "restore":
 		req := s3.RestoreObjectInput{
 			//Bucket:         &f.rootBucket,
@@ -4987,6 +5071,16 @@ func (w *s3ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 			// retry all chunks once have done the first few
 			return true, err
 		}
+		if uout == nil || uout.ETag == nil {
+			// A successful UploadPart without an ETag header is unusable: the
+			// part ETag is required by CompleteMultipartUpload. Proxies and
+			// load balancers have been observed emitting empty 200 responses
+			// under load - see #9822. Treat it as a retryable error so the
+			// pacer retries this chunk, instead of dereferencing a nil ETag
+			// in the debug log below or completing the upload with a broken
+			// part list.
+			return true, fmt.Errorf("UploadPart response for chunk %d has no ETag", chunkNumber+1)
+		}
 		return false, nil
 	})
 	if err != nil {
@@ -5076,27 +5170,36 @@ func (o *Object) uploadMultipart(ctx context.Context, src fs.ObjectInfo, in io.R
 }
 
 // bufferForObjectLockMD5 buffers the body and computes Content-MD5 when
-// Object Lock parameters are set on the request. AWS S3 requires Content-MD5
-// for PutObject with Object Lock params and cannot compute it automatically
+// Object Lock parameters are set on the request and Content-MD5 isn't
+// already known from the source. AWS S3 requires Content-MD5 for
+// PutObject with Object Lock params and cannot compute it automatically
 // from a non-seekable io.Reader.
 // See: https://github.com/aws/aws-sdk-go-v2/discussions/2960
-func bufferForObjectLockMD5(req *s3.PutObjectInput, in io.Reader) (io.Reader, error) {
-	if req.ObjectLockMode == "" && req.ObjectLockRetainUntilDate == nil && req.ObjectLockLegalHoldStatus == "" {
-		return in, nil
+//
+// The returned body must not be closed by the transport and cleanup must
+// be called once the upload has finished with it.
+func bufferForObjectLockMD5(req *s3.PutObjectInput, in io.Reader) (body io.Reader, cleanup func(), err error) {
+	cleanup = func() {}
+	if req.ContentMD5 != nil || (req.ObjectLockMode == "" && req.ObjectLockRetainUntilDate == nil && req.ObjectLockLegalHoldStatus == "") {
+		return in, cleanup, nil
 	}
-	buf, err := io.ReadAll(in)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read body for Content-MD5: %w", err)
+	rw := multipart.NewRW()
+	cleanup = func() {
+		_ = rw.Close()
 	}
-	md5sum := md5.Sum(buf)
-	md5base64 := base64.StdEncoding.EncodeToString(md5sum[:])
+	hasher := md5.New()
+	if _, err = io.Copy(rw, io.TeeReader(in, hasher)); err != nil {
+		return nil, cleanup, fmt.Errorf("failed to read body for Content-MD5: %w", err)
+	}
+	md5base64 := base64.StdEncoding.EncodeToString(hasher.Sum(nil))
 	req.ContentMD5 = &md5base64
-	return bytes.NewReader(buf), nil
+	return rw, cleanup, nil
 }
 
 // Upload a single part using PutObject
 func (o *Object) uploadSinglepartPutObject(ctx context.Context, req *s3.PutObjectInput, size int64, in io.Reader) (etag string, lastModified time.Time, versionID *string, err error) {
-	in, err = bufferForObjectLockMD5(req, in)
+	in, cleanup, err := bufferForObjectLockMD5(req, in)
+	defer cleanup()
 	if err != nil {
 		return etag, lastModified, nil, err
 	}
@@ -5131,7 +5234,8 @@ func (o *Object) uploadSinglepartPutObject(ctx context.Context, req *s3.PutObjec
 // Upload a single part using a presigned request
 func (o *Object) uploadSinglepartPresignedRequest(ctx context.Context, req *s3.PutObjectInput, size int64, in io.Reader) (etag string, lastModified time.Time, versionID *string, err error) {
 	// Content-MD5 must be set before signing so it's included in the presigned URL.
-	in, err = bufferForObjectLockMD5(req, in)
+	in, cleanup, err := bufferForObjectLockMD5(req, in)
+	defer cleanup()
 	if err != nil {
 		return etag, lastModified, nil, err
 	}
@@ -5146,8 +5250,9 @@ func (o *Object) uploadSinglepartPresignedRequest(ctx context.Context, req *s3.P
 		in = nil
 	}
 
-	// create the vanilla http request
-	httpReq, err := http.NewRequestWithContext(ctx, "PUT", putReq.URL, in)
+	// create the vanilla http request, making sure the transport can't
+	// close a pooled body
+	httpReq, err := http.NewRequestWithContext(ctx, "PUT", putReq.URL, readers.NoCloser(in))
 	if err != nil {
 		return etag, lastModified, nil, fmt.Errorf("s3 upload: new request: %w", err)
 	}
@@ -5155,6 +5260,13 @@ func (o *Object) uploadSinglepartPresignedRequest(ctx context.Context, req *s3.P
 	// set the headers we signed and the length
 	httpReq.Header = putReq.SignedHeader
 	httpReq.ContentLength = size
+	// let the client resend a seekable body when following a redirect
+	if seeker, ok := in.(io.Seeker); ok {
+		httpReq.GetBody = func() (io.ReadCloser, error) {
+			_, err := seeker.Seek(0, io.SeekStart)
+			return io.NopCloser(readers.NoCloser(in)), err
+		}
+	}
 
 	var resp *http.Response
 	err = o.fs.pacer.CallNoRetry(func() (bool, error) {
