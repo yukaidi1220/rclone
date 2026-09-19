@@ -9,6 +9,7 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +17,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
+	neturl "net/url"
 	"os"
 	"path"
 	"strconv"
@@ -96,6 +99,8 @@ type Options struct {
 	NoRefresh         bool                 `config:"no_refresh"` // never refresh the token
 	PartSize          fs.SizeSuffix        `config:"part_size"`
 	UploadConcurrency int                  `config:"upload_concurrency"`
+	RegionCode        string               `config:"region_code"` // "province:city" 上传调度节点码,如 531:543(江苏无锡);留空不发送
+	DisableHTTP2      bool                 `config:"disable_http2"`
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -162,6 +167,19 @@ func init() {
 			Name:     "upload_concurrency",
 			Help:     "Concurrency for part uploads within a single file.",
 			Default:  4,
+			Advanced: true,
+		}, {
+			Name:     "region_code",
+			Help:     "userRegion 上传调度节点码,格式 province:city,如 531:543(江苏无锡)。官方 PC 客户端会随 create 发送;设置后 personal 上传也带 userRegion 以就近调度。留空则不发送。",
+			Advanced: true,
+		}, {
+			Name: "disable_http2",
+			Help: "Disable HTTP/2 for all yun139 traffic.\n\n" +
+				"HTTP/2 multiplexes every concurrent part upload onto a single TCP " +
+				"connection, which caps aggregate upload throughput at one connection's " +
+				"worth of bandwidth. Set this to use HTTP/1.1 keep-alive instead, so the " +
+				"concurrent part uploads spread across multiple parallel TCP connections.",
+			Default:  false,
 			Advanced: true,
 		}, {
 			Name:     config.ConfigEncoding,
@@ -1105,7 +1123,11 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		root:       parsePath(root),
 		opt:        *opt,
 		m:          m,
-		httpClient: fshttp.NewClient(ctx),
+		httpClient: fshttp.NewClientCustom(ctx, func(t *http.Transport) {
+			if opt.DisableHTTP2 {
+				t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+			}
+		}),
 		space:      opt.Space,
 		svcType:    svcTypePersonal,
 	}
@@ -2042,7 +2064,7 @@ func (f *Fs) uploadFile(ctx context.Context, in io.Reader, dirID, leaf string, s
 // contentHash + contentHashAlgorithm:SHA256 + contentType + parallelUpload:true
 // + partInfos[:100] + fileRenameMode:auto_rename + localCreatedAt/localUpdatedAt
 // in RFC3339 millisecond UTC.
-func buildCreateBody(dirID, leaf string, size int64, hashHex string, partInfos []api.PartInfo) api.PersonalCreateReq {
+func buildCreateBody(dirID, leaf string, size int64, hashHex string, partInfos []api.PartInfo, regionCode string) api.PersonalCreateReq {
 	body := api.PersonalCreateReq{
 		CommonUpload: api.CommonUpload{
 			ParentID: dirID,
@@ -2057,6 +2079,13 @@ func buildCreateBody(dirID, leaf string, size int64, hashHex string, partInfos [
 	body.ContentType = "application/octet-stream"
 	body.ParallelUpload = true
 	body.PartInfos = partInfos
+	// userRegion:官方 PC 客户端随 create 发送(如 531:543),供服务端就近调度上传 CDN。
+	// personal 默认不发送(历史行为);设置 region_code 后补上,可显著影响上传节点选择与吞吐。
+	if regionCode != "" {
+		if pc, ci, ok := strings.Cut(regionCode, ":"); ok && pc != "" && ci != "" {
+			body.UserRegion = &api.Region{CityCode: ci, ProvinceCode: pc}
+		}
+	}
 	// The official client sends localCreatedAt/localUpdatedAt as
 	// RFC3339 UTC with milliseconds (captured 2026-09-03,
 	// v8.8.6.20260829 - e.g. "2026-09-03T08:06:36.784Z"). The server
@@ -2128,7 +2157,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	if len(partInfos) > maxPartsPerRequest {
 		partInfos = partInfos[:maxPartsPerRequest]
 	}
-	body := buildCreateBody(dirID, leaf, size, hashHex, partInfos)
+	body := buildCreateBody(dirID, leaf, size, hashHex, partInfos, f.opt.RegionCode)
 	// Family space uses a different create endpoint
 	// (/hcy/group/dynamic/file/create, captured 2026-09-03) on the
 	// group.yun.139.com host, with extra fields {groupId, groupType,
@@ -2282,7 +2311,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 				return fmt.Errorf("yun139: no upload URL for part %d", p.index)
 			}
 			rdr := io.NewSectionReader(freader, p.offset, p.partSize)
-			return f.putPart(gctx, rdr, url, p.partSize)
+			return f.putPart(gctx, int(p.index), len(parts), rdr, url, p.partSize)
 		})
 	}
 	if err := g.Wait(); err != nil {
@@ -2323,7 +2352,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 }
 
 // putPart PUTs a single part to its pre-signed URL.
-func (f *Fs) putPart(ctx context.Context, r io.Reader, url string, size int64) error {
+func (f *Fs) putPart(ctx context.Context, partIdx, total int, r io.Reader, url string, size int64) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, r)
 	if err != nil {
 		return err
@@ -2339,6 +2368,25 @@ func (f *Fs) putPart(ctx context.Context, r io.Reader, url string, size int64) e
 		req.ContentLength = size
 		req.Header.Set("Content-Length", strconv.FormatInt(size, 10))
 	}
+	// Capture which endpoint + peer IP actually served this part: the
+	// pre-signed URL's host is one thing, the connection may land on a
+	// different CDN edge, so per-part attribution is the only way to
+	// correlate speed with the node the request hit (mirrors wopan).
+	host := ""
+	if u, perr := neturl.Parse(url); perr == nil {
+		host = u.Host
+	}
+	var peerAddr string
+	var reusedConn bool
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			if info.Conn != nil {
+				peerAddr = info.Conn.RemoteAddr().String()
+			}
+			reusedConn = info.Reused
+		},
+	}))
+	t0 := time.Now()
 	res, err := f.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -2348,13 +2396,17 @@ func (f *Fs) putPart(ctx context.Context, r io.Reader, url string, size int64) e
 		body, _ := io.ReadAll(res.Body)
 		// 5xx and 4xx are both treated as business errors; the part URL
 		// is single-use so a retry on a transient 5xx would just hit the
-		// same dead URL.
-		err := fmt.Errorf("yun139: upload part: %s: %s", res.Status, truncate(string(body), 500))
+		err := fmt.Errorf("yun139: upload part %d/%d via %s -> %s: %s: %s",
+			partIdx, total, host, peerAddr, res.Status, truncate(string(body), 500))
 		if res.StatusCode >= 400 && res.StatusCode < 500 {
 			return fserrors.NoRetryError(err)
 		}
 		return err
 	}
+	elapsed := time.Since(t0)
+	fs.Debugf(f, "yun139: uploaded part %d/%d (%v) via %s -> %s (reused=%v) in %v (%s)",
+		partIdx, total, fs.SizeSuffix(size), host, peerAddr, reusedConn,
+		elapsed.Round(time.Millisecond), fs.SizeSuffix(float64(size)/elapsed.Seconds()).ByteRateUnit())
 	return nil
 }
 

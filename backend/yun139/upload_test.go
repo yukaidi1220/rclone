@@ -30,7 +30,7 @@ func TestPutPart_SetsContentLength(t *testing.T) {
 	defer srv.Close()
 
 	f := &Fs{httpClient: srv.Client(), opt: Options{}}
-	err := f.putPart(context.Background(), newZeroReader(100*1024*1024), srv.URL, 100*1024*1024)
+	err := f.putPart(context.Background(), 1, 1, newZeroReader(100*1024*1024), srv.URL, 100*1024*1024)
 	if err != nil {
 		t.Fatalf("putPart: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestBuildCreateBody_CapsAt100Parts(t *testing.T) {
 	for i := 1; i <= 116; i++ {
 		partInfos = append(partInfos, api.PartInfo{PartNumber: int64(i), PartSize: 5242880})
 	}
-	body := buildCreateBody("parent", "big.bin", 116*5242880, strings.Repeat("ab", 32), partInfos)
+	body := buildCreateBody("parent", "big.bin", 116*5242880, strings.Repeat("ab", 32), partInfos, "")
 	if len(body.PartInfos) != maxPartsPerRequest {
 		t.Fatalf("len(PartInfos) = %d, want %d", len(body.PartInfos), maxPartsPerRequest)
 	}
