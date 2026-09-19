@@ -34,7 +34,6 @@ import (
 var (
 	flagToken   = flag.String("token", "", "Basic <base64> authorization")
 	flagAction  = flag.String("action", "probe-size", "probe-size|create-large|pc-test|web-test")
-	flagSpace   = flag.String("space", "personal", "personal|family")
 	flagSize    = flag.Int64("size", 6*1024*1024*1024, "file size in bytes for create-large")
 	flagName    = flag.String("name", "rclone-probe.bin", "filename for create-large")
 	flagParent  = flag.String("parent", "", "parent dir id (default: cloud root)")
@@ -208,8 +207,8 @@ func ensurePersonalHost(ctx context.Context, account, auth string) (string, erro
 	var raw struct {
 		Data struct {
 			RoutePolicyList []struct {
-				HttpURL  string `json:"httpUrl"`
-				HttpsURL string `json:"httpsUrl"`
+				HTTPURL  string `json:"httpUrl"`
+				HTTPSURL string `json:"httpsUrl"`
 			} `json:"routePolicyList"`
 		} `json:"data"`
 	}
@@ -217,11 +216,11 @@ func ensurePersonalHost(ctx context.Context, account, auth string) (string, erro
 		return "", err
 	}
 	for _, p := range raw.Data.RoutePolicyList {
-		if p.HttpsURL != "" {
-			return p.HttpsURL, nil
+		if p.HTTPSURL != "" {
+			return p.HTTPSURL, nil
 		}
-		if p.HttpURL != "" {
-			return p.HttpURL, nil
+		if p.HTTPURL != "" {
+			return p.HTTPURL, nil
 		}
 	}
 	b, _ := json.Marshal(raw)
@@ -254,7 +253,7 @@ func doRequest(ctx context.Context, method, fullURL string, body []byte, hdr map
 	if err != nil {
 		return err
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	resBody, _ := io.ReadAll(res.Body)
 	if *flagHeaders {
 		fmt.Fprintf(os.Stderr, "<<< %s %d\n", method, res.StatusCode)
@@ -277,29 +276,29 @@ const (
 
 func webHeaders(auth, ts, randStr, sign, svcType string) map[string]string {
 	h := map[string]string{
-		"Accept":               "application/json, text/plain, */*",
-		"Caller":               "web",
-		"CMS-DEVICE":           "default",
-		"Mcloud-Channel":       "1000101",
-		"Mcloud-Client":        "10701",
-		"Mcloud-Route":         "001",
-		"Mcloud-Sign":          ts + "," + randStr + "," + sign,
-		"Mcloud-Version":       "7.14.0",
-		"x-DeviceInfo":         deviceInfoWeb,
-		"x-huawei-channelSrc":  "10000034",
-		"x-inner-ntwk":         "2",
-		"x-m4c-caller":         "PC",
-		"x-m4c-src":            "10002",
-		"x-SvcType":            svcType,
-		"X-Yun-Api-Version":    "v1",
-		"X-Yun-App-Channel":    "10000034",
-		"X-Yun-Channel-Source": "10000034",
-		"X-Yun-Client-Info":    deviceInfoWeb + "dW5kZWZpbmVk||",
-		"X-Yun-Module-Type":    "100",
-		"X-Yun-Svc-Type":       svcType,
-		"User-Agent":           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		"Accept":                 "application/json, text/plain, */*",
+		"Caller":                 "web",
+		"CMS-DEVICE":             "default",
+		"Mcloud-Channel":         "1000101",
+		"Mcloud-Client":          "10701",
+		"Mcloud-Route":           "001",
+		"Mcloud-Sign":            ts + "," + randStr + "," + sign,
+		"Mcloud-Version":         "7.14.0",
+		"x-DeviceInfo":           deviceInfoWeb,
+		"x-huawei-channelSrc":    "10000034",
+		"x-inner-ntwk":           "2",
+		"x-m4c-caller":           "PC",
+		"x-m4c-src":              "10002",
+		"x-SvcType":              svcType,
+		"X-Yun-Api-Version":      "v1",
+		"X-Yun-App-Channel":      "10000034",
+		"X-Yun-Channel-Source":   "10000034",
+		"X-Yun-Client-Info":      deviceInfoWeb + "dW5kZWZpbmVk||",
+		"X-Yun-Module-Type":      "100",
+		"X-Yun-Svc-Type":         svcType,
+		"User-Agent":             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 		"Inner-Hcy-Router-Https": "1",
-		"Content-Type":         "application/json",
+		"Content-Type":           "application/json",
 	}
 	h["Authorization"] = "Basic " + auth
 	return h
