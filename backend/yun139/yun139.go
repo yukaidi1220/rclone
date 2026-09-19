@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rclone/rclone/backend/yun139/api"
@@ -361,6 +362,7 @@ type Object struct {
 	serverPath string    // family/group: server-side path (root:/...)
 	sha256     string    // personal space: contentHash from listing/upload
 
+	hashMu    *sync.Mutex // protects sha256 (concurrent Hash on one object)
 	urlMu     *sync.Mutex // protects url / urlExpiry (pointer so Object copy stays lock-safe)
 	url       string      // cached download URL
 	urlExpiry time.Time   // when the cached URL stops being valid
@@ -968,28 +970,8 @@ func (f *Fs) familyRoot(ctx context.Context) (string, error) {
 	if f.familyRootID != "" {
 		return f.familyRootID, nil
 	}
-	if f.opt.FamilyID == "" {
-		clouds, _, err := f.queryFamilyCloud(ctx)
-		if err != nil {
-			return "", err
-		}
-		switch len(clouds) {
-		case 0:
-			return "", errors.New("yun139: account has no family cloud; create one in the 139 client first")
-		case 1:
-			// Single family cloud: pick it for the user.
-			f.opt.FamilyID = clouds[0].CloudID
-		default:
-			// Multiple family clouds: refuse to guess. List every
-			// available cloudID and cloudName so the user can set
-			// --yun139-family-id (or family_id in the conf) to the
-			// one they want.
-			ids := make([]string, 0, len(clouds))
-			for _, c := range clouds {
-				ids = append(ids, fmt.Sprintf("%s (%s)", c.CloudID, c.CloudName))
-			}
-			return "", fmt.Errorf("yun139: account belongs to %d family clouds: %s; set --yun139-family-id to the one you want", len(clouds), strings.Join(ids, ", "))
-		}
+	if err := f.resolveFamilyID(ctx); err != nil {
+		return "", err
 	}
 	body := map[string]any{
 		"catalogSortType": 0,
@@ -1028,6 +1010,40 @@ func (f *Fs) familyRoot(ctx context.Context) (string, error) {
 	}
 	f.familyRootID = p
 	return f.familyRootID, nil
+}
+
+// resolveFamilyID ensures f.opt.FamilyID is set, auto-discovering it from
+// queryFamilyCloud when the user did not configure family_id.
+//
+// It is called once at NewFs time (freezing FamilyID before any operation
+// can race on it) and again inside familyRoot, which keeps the lock held
+// so the write can never race with a reader.
+func (f *Fs) resolveFamilyID(ctx context.Context) error {
+	if f.opt.FamilyID != "" {
+		return nil
+	}
+	clouds, _, err := f.queryFamilyCloud(ctx)
+	if err != nil {
+		return err
+	}
+	switch len(clouds) {
+	case 0:
+		return errors.New("yun139: account has no family cloud; create one in the 139 client first")
+	case 1:
+		// Single family cloud: pick it for the user.
+		f.opt.FamilyID = clouds[0].CloudID
+	default:
+		// Multiple family clouds: refuse to guess. List every
+		// available cloudID and cloudName so the user can set
+		// --yun139-family-id (or family_id in the conf) to the
+		// one they want.
+		ids := make([]string, 0, len(clouds))
+		for _, c := range clouds {
+			ids = append(ids, fmt.Sprintf("%s (%s)", c.CloudID, c.CloudName))
+		}
+		return fmt.Errorf("yun139: account belongs to %d family clouds: %s; set --yun139-family-id to the one you want", len(clouds), strings.Join(ids, ", "))
+	}
+	return nil
 }
 
 // ------------------------------------------------------------ NewFs -------
@@ -1153,6 +1169,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	rootID := f.opt.RootFolderID
+	if f.space == spaceFamily {
+		// Freeze family_id once, before any operation can race on it.
+		// familyRoot also resolves it, but only when root_folder_id is
+		// empty; resolving here covers the root_folder_id-set case too.
+		if err := f.resolveFamilyID(ctx); err != nil {
+			return nil, err
+		}
+	}
 	if rootID == "" {
 		if f.space == spaceFamily {
 			rootID, err = f.familyRoot(ctx)
@@ -1634,6 +1658,7 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, e listEntry) 
 		modTime:    e.modTime,
 		serverPath: e.srvPath,
 		sha256:     e.sha256,
+		hashMu:     &sync.Mutex{},
 		urlMu:      &sync.Mutex{},
 	}
 	return o, nil
@@ -1720,8 +1745,11 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	if t != hash.SHA256 {
 		return "", hash.ErrUnsupported
 	}
-	if o.sha256 != "" {
-		return o.sha256, nil
+	o.hashMu.Lock()
+	cached := o.sha256
+	o.hashMu.Unlock()
+	if cached != "" {
+		return cached, nil
 	}
 	// Not cached (e.g. the object was built from a listing that predates
 	// the field). Refetch the entry once.
@@ -1737,7 +1765,9 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 				return false
 			})
 			if err == nil && found != "" {
+				o.hashMu.Lock()
 				o.sha256 = found
+				o.hashMu.Unlock()
 				return found, nil
 			}
 		}
@@ -1952,6 +1982,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		size:    size,
 		modTime: src.ModTime(ctx),
 		sha256:  res.hashHex,
+		hashMu:  &sync.Mutex{},
 		urlMu:   &sync.Mutex{},
 	}
 	return o, nil
@@ -2060,7 +2091,15 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	// (X-Amz-Iteration-Hash-Ctx) and accepts out-of-order concurrent
 	// part PUTs. Part 1 carries no context (it starts from the IV).
 	partInfos := make([]api.PartInfo, 0, len(parts))
-	for i, p := range parts {
+	// Compute every part's SHA-256 midstate in a single forward pass.
+	// Re-hashing 0..offset for each part is O(n^2) on large files (a
+	// 500MiB/100-part upload re-hashes ~25GiB before the first PUT), so
+	// feed one running hash once and capture the state at each part
+	// boundary.
+	h := sha256.New()
+	buf := make([]byte, 1<<20)
+	fed := int64(0)
+	for _, p := range parts {
 		pi := api.PartInfo{
 			PartNumber: p.index,
 			PartSize:   p.partSize,
@@ -2069,8 +2108,12 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		// 2026-09-03 with mCloudDownload.zip) even on the first part;
 		// only the h field is omitted for part 1.
 		pi.ParallelHashCtx = &api.ParallelHashCtx{PartOffset: p.offset}
-		if i > 0 {
-			regs, _, err := api.Sha256Midstate(sha256MidstateHash(freader, p.offset))
+		if p.offset > 0 {
+			if err := sha256Feed(h, freader, fed, p.offset, buf); err != nil {
+				return nil, fmt.Errorf("yun139: midstate part %d: %w", p.index, err)
+			}
+			fed = p.offset
+			regs, _, err := api.Sha256Midstate(h)
 			if err != nil {
 				return nil, fmt.Errorf("yun139: midstate part %d: %w", p.index, err)
 			}
@@ -2229,20 +2272,20 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 			urlOfPart[pi.PartNumber] = pi.UploadURL
 		}
 	}
-	var eg errgroup.Group
-	eg.SetLimit(f.opt.UploadConcurrency)
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(f.opt.UploadConcurrency)
 	for _, p := range parts {
 		p := p
-		eg.Go(func() error {
+		g.Go(func() error {
 			url, ok := urlOfPart[int(p.index)]
 			if !ok {
 				return fmt.Errorf("yun139: no upload URL for part %d", p.index)
 			}
 			rdr := io.NewSectionReader(freader, p.offset, p.partSize)
-			return f.putPart(ctx, rdr, url, p.partSize)
+			return f.putPart(gctx, rdr, url, p.partSize)
 		})
 	}
-	if err := eg.Wait(); err != nil {
+	if err := g.Wait(); err != nil {
 		return nil, fmt.Errorf("put part: %w", err)
 	}
 	// Finally, mark the file complete. Mirrors the official client:
@@ -2955,6 +2998,11 @@ type yun139ChunkWriter struct {
 	chunkSize int64
 	total     int64
 	closed    bool
+	// written is the running total of bytes written by WriteChunk. It is
+	// incremented atomically because the copy engine calls WriteChunk
+	// concurrently; Close verifies it equals size to catch a silently
+	// truncated chunk.
+	written atomic.Int64
 }
 
 // WriteChunk writes chunkNumber at chunkNumber*chunkSize in the temp
@@ -2981,9 +3029,17 @@ func (w *yun139ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, rea
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return 0, err
 	}
+	// The copy engine promises exactly size bytes across all chunks, so a
+	// non-empty chunk must fill its full span. A short read here would
+	// otherwise be written as a silent gap (zero-fill) and corrupt the
+	// uploaded file.
+	if int64(m) != limit {
+		return 0, fmt.Errorf("yun139: chunk %d short read: got %d of %d bytes", chunkNumber, m, limit)
+	}
 	if _, err := w.tmp.WriteAt(buf[:m], offset); err != nil {
 		return 0, err
 	}
+	w.written.Add(int64(m))
 	return int64(m), nil
 }
 
@@ -2997,6 +3053,11 @@ func (w *yun139ChunkWriter) Close(ctx context.Context) error {
 		_ = w.tmp.Close()
 		_ = os.Remove(w.path)
 	}()
+	// Every chunk must have been written in full; otherwise a chunk was
+	// silently dropped and the staged file is shorter than declared.
+	if got := w.written.Load(); got != w.size {
+		return fmt.Errorf("yun139: chunk writer staged %d of %d bytes", got, w.size)
+	}
 	if err := w.tmp.Sync(); err != nil {
 		return err
 	}
@@ -3036,34 +3097,33 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	return f.Put(ctx, in, src, options...)
 }
 
-// sha256MidstateHash hashes the first n bytes of src through a fresh
-// SHA-256 and returns the digest. Caller exports the midstate via
-// api.Sha256Midstate. The hash is never re-used: each part of the file
-// needs its own digest up to its starting offset.
-func sha256MidstateHash(src io.ReaderAt, n int64) interface {
+// sha256Feed hashes src[off:end] into the running h in 1 MiB chunks,
+// continuing any prior state. off and end are absolute file offsets; the
+// caller advances fed past each part boundary so a whole file is hashed
+// exactly once (single forward pass for all part midstates).
+func sha256Feed(h interface {
 	Write(p []byte) (int, error)
-	Sum(b []byte) []byte
-} {
-	h := sha256.New()
-	// Copy in 1 MiB chunks. With 5 MiB parts and typical 64 KiB Go
-	// buffer defaults this stays comfortably off the GC.
-	buf := make([]byte, 1<<20)
-	off := int64(0)
-	for off < n {
-		want := n - off
+}, src io.ReaderAt, off, end int64, buf []byte) error {
+	for off < end {
+		want := end - off
 		if want > int64(len(buf)) {
 			want = int64(len(buf))
 		}
 		nr, err := src.ReadAt(buf[:want], off)
 		if nr > 0 {
 			h.Write(buf[:nr])
+			off += int64(nr)
 		}
 		if err != nil {
-			break
+			// ReadAt returns io.EOF when it reads fewer bytes than
+			// requested at end of data; that is fine if we reached end.
+			if err == io.EOF && off >= end {
+				return nil
+			}
+			return err
 		}
-		off += int64(nr)
 	}
-	return h
+	return nil
 }
 
 // ============================================================================
