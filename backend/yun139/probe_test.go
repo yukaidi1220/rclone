@@ -110,36 +110,6 @@ func TestPCHeadersFull_Shape(t *testing.T) {
 	}
 }
 
-// TestNewHeaders_Family covers the family-side header set. The orchestration
-// API still expects svcType=2.
-func TestNewHeaders_Family(t *testing.T) {
-	ts := "1700000000000"
-	randStr := "abcd1234abcd1234abcd1234abcd1234"
-	sign := api.Sign(`{}`, ts, randStr)
-	h := newHeaders("Basic xyz", ts, randStr, sign, "2")
-	if h["x-SvcType"] != "2" {
-		t.Errorf("x-SvcType = %q, want 2", h["x-SvcType"])
-	}
-	if h["X-Yun-Svc-Type"] != "2" {
-		t.Errorf("X-Yun-Svc-Type = %q, want 2", h["X-Yun-Svc-Type"])
-	}
-}
-
-// TestLegacyHeaders verifies the orchestration endpoint variant is separate
-// from the personal new API and carries the x-SvcType contract.
-func TestLegacyHeaders(t *testing.T) {
-	ts := "1700000000000"
-	randStr := "abcd1234abcd1234abcd1234abcd1234"
-	sign := api.Sign(`{}`, ts, randStr)
-	h := legacyHeaders("Basic xyz", ts, randStr, sign, "2")
-	if h["x-SvcType"] != "2" {
-		t.Errorf("legacy x-SvcType = %q, want 2", h["x-SvcType"])
-	}
-	if h["mcloud-sign"] == "" {
-		t.Errorf("legacy mcloud-sign empty")
-	}
-}
-
 // encodeB64 is a tiny helper to avoid pulling encoding/base64 into the
 // probe test file's import list.
 func encodeB64(s string) string {

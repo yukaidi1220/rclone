@@ -42,7 +42,6 @@ import (
 
 const (
 	yunBaseURL        = "https://yun.139.com"
-	userNJSBaseURL    = "https://user-njs.yun.139.com"
 	minSleep          = 10 * time.Millisecond
 	maxSleep          = 2 * time.Second
 	decayConstant     = 2
@@ -381,55 +380,6 @@ func (f *Fs) refreshToken(ctx context.Context) error {
 
 // ------------------------------------------------------------ headers -----
 
-// commonHeaders returns the base header set shared by both API families.
-func commonHeaders() map[string]string {
-	return map[string]string{
-		"Accept":                 "application/json, text/plain, */*",
-		"mcloud-channel":         "1000101",
-		"mcloud-client":          "10701",
-		"mcloud-version":         "7.14.0",
-		"Origin":                 yunBaseURL,
-		"Referer":                yunBaseURL + "/w/",
-		"x-DeviceInfo":           deviceInfo,
-		"x-huawei-channelSrc":    "10000034",
-		"x-inner-ntwk":           "2",
-		"x-m4c-caller":           "PC",
-		"x-m4c-src":              "10002",
-		"Inner-Hcy-Router-Https": "1",
-	}
-}
-
-// newHeaders returns the header set for the PersonalNew API (web client).
-func newHeaders(auth, ts, randStr, sign, svcType string) map[string]string {
-	h := map[string]string{
-		"Accept":                 "application/json, text/plain, */*",
-		"Caller":                 "web",
-		"CMS-DEVICE":             "default",
-		"Mcloud-Channel":         "1000101",
-		"Mcloud-Client":          "10701",
-		"Mcloud-Route":           "001",
-		"Mcloud-Sign":            fmt.Sprintf("%s,%s,%s", ts, randStr, sign),
-		"Mcloud-Version":         "7.14.0",
-		"x-DeviceInfo":           deviceInfo,
-		"x-huawei-channelSrc":    "10000034",
-		"x-inner-ntwk":           "2",
-		"x-m4c-caller":           "PC",
-		"x-m4c-src":              "10002",
-		"x-SvcType":              svcType,
-		"X-Yun-Api-Version":      "v1",
-		"X-Yun-App-Channel":      "10000034",
-		"X-Yun-Channel-Source":   "10000034",
-		"X-Yun-Client-Info":      deviceInfo + "dW5kZWZpbmVk||",
-		"X-Yun-Module-Type":      "100",
-		"X-Yun-Svc-Type":         svcType,
-		"User-Agent":             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-		"Inner-Hcy-Router-Https": "1",
-		"Content-Type":           "application/json",
-	}
-	h["Authorization"] = "Basic " + auth
-	return h
-}
-
 // pcHeaders returns the header set that the official 139 PC client
 // sends. Captured live (2026-09-03, client 8.8.6.20260829):
 //
@@ -546,17 +496,6 @@ func (c *srvPathCache) get(k string) (string, bool) {
 	return v, ok
 }
 
-// legacyHeaders returns the header set for the orchestration API.
-func legacyHeaders(auth, ts, randStr, sign, svcType string) map[string]string {
-	h := commonHeaders()
-	h["CMS-DEVICE"] = "default"
-	h["Authorization"] = "Basic " + auth
-	h["mcloud-sign"] = fmt.Sprintf("%s,%s,%s", ts, randStr, sign)
-	h["x-SvcType"] = svcType
-	h["Content-Type"] = "application/json"
-	return h
-}
-
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -589,17 +528,14 @@ func (f *Fs) call(ctx context.Context, url string, body any, out any) error {
 
 	var headers map[string]string
 	host := strings.SplitN(url, "/", 4)[2]
-	p := strings.SplitN(url, "?", 2)[0]
-	if strings.HasPrefix(url, yunBaseURL+"/orchestration") {
-		headers = legacyHeaders(auth, ts, randStr, sign, f.svcType)
-	} else if host == "group.yun.139.com" || strings.HasSuffix(p, "/hcy/group/dynamic/file/create") {
+	if host == "group.yun.139.com" {
 		// Family space: lean header set, short UA, x-yun-url-type:3 on
 		// every call (captured 2026-09-03, family cloud).
 		headers = pcHeaders(auth, f.account, ts, randStr, sign, f.svcType)
 		headers["x-yun-url-type"] = "3"
 		headers["Accept"] = "*/*"
 		headers["x-DeviceInfo"] = f.deviceInfoHeader()
-	} else if f.space == spacePersonal {
+	} else {
 		// Personal space always speaks as the official PC client
 		// (captured 2026-09-03, client 8.8.6.20260829). The native
 		// upload module sends a lean header set on /hcy/file/create
@@ -615,8 +551,6 @@ func (f *Fs) call(ctx context.Context, url string, body any, out any) error {
 		} else {
 			headers = pcHeadersFull(auth, f.account, md5hex(f.account)+"-ENDIN")
 		}
-	} else {
-		headers = newHeaders(auth, ts, randStr, sign, f.svcType)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
