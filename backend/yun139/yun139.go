@@ -2301,6 +2301,13 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 			urlOfPart[pi.PartNumber] = pi.UploadURL
 		}
 	}
+	// Log the upload endpoint host (the CDN edge the part URLs point at),
+	// mirroring wopan's per-run upload-zone attribution for diagnosis.
+	if firstURL, ok := urlOfPart[1]; ok {
+		if u, perr := neturl.Parse(firstURL); perr == nil {
+			fs.Debugf(f, "yun139: upload endpoint %s", u.Host)
+		}
+	}
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(f.opt.UploadConcurrency)
 	for _, p := range parts {
@@ -3265,13 +3272,20 @@ func (f *Fs) fetchDownloadURL(ctx context.Context, o *Object) (string, error) {
 		return "", err
 	}
 	// Prefer cdnUrl when the server says the CDN switch is on, otherwise url.
+	var dl string
 	if resp.Data.CDNURL != "" && resp.Data.CDNSwitch {
-		return resp.Data.CDNURL, nil
-	}
-	if resp.Data.URL == "" {
+		dl = resp.Data.CDNURL
+	} else if resp.Data.URL != "" {
+		dl = resp.Data.URL
+	} else {
 		return "", fmt.Errorf("yun139: no download URL returned for %q", o.remote)
 	}
-	return resp.Data.URL, nil
+	if u, perr := neturl.Parse(dl); perr == nil {
+		fs.Debugf(o, "yun139: download url-type=3 via %s", u.Host)
+	} else {
+		fs.Debugf(o, "yun139: download url-type=3 (unparsed host): %.120s", dl)
+	}
+	return dl, nil
 }
 
 // Open opens the file for read. Call Close() on the returned io.ReadCloser.
