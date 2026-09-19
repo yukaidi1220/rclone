@@ -97,8 +97,8 @@ type QueryRoutePolicyResp struct {
 			SiteID      string `json:"siteID"`
 			SiteCode    string `json:"siteCode"`
 			ModName     string `json:"modName"`
-			HttpURL     string `json:"httpUrl"`
-			HttpsURL    string `json:"httpsUrl"`
+			HTTPURL     string `json:"httpUrl"`
+			HTTPSURL    string `json:"httpsUrl"`
 			EnvID       string `json:"envID"`
 			ExtInfo     string `json:"extInfo"`
 			HashName    string `json:"hashName"`
@@ -118,7 +118,7 @@ const AuthTokenRefreshURL = "https://note-njs.yun.139.com/yun-note/user/authToke
 
 // PersonalFileItem is one entry in the PersonalNew listing.
 type PersonalFileItem struct {
-	FileId      string              `json:"fileId"`
+	FileID      string              `json:"fileId"`
 	Name        string              `json:"name"`
 	Size        int64               `json:"size"`
 	Type        string              `json:"type"` // "folder" or "file"
@@ -172,12 +172,12 @@ type ParallelHashCtx struct {
 type PersonalUploadResp struct {
 	BaseResp
 	Data struct {
-		FileId      string             `json:"fileId"`
+		FileID      string             `json:"fileId"`
 		FileName    string             `json:"fileName"`
 		PartInfos   []PersonalPartInfo `json:"partInfos"`
 		Exist       bool               `json:"exist"`
 		RapidUpload bool               `json:"rapidUpload"`
-		UploadId    string             `json:"uploadId"`
+		UploadID    string             `json:"uploadId"`
 	} `json:"data"`
 }
 
@@ -191,8 +191,8 @@ type PersonalPartInfo struct {
 type PersonalUploadURLResp struct {
 	BaseResp
 	Data struct {
-		FileId    string             `json:"fileId"`
-		UploadId  string             `json:"uploadId"`
+		FileID    string             `json:"fileId"`
+		UploadID  string             `json:"uploadId"`
 		PartInfos []PersonalPartInfo `json:"partInfos"`
 	} `json:"data"`
 }
@@ -373,12 +373,12 @@ type FamilyUploadCreateReq struct {
 type FamilyUploadCreateResp struct {
 	BaseResp
 	Data struct {
-		FileId      string             `json:"fileId"`
+		FileID      string             `json:"fileId"`
 		FileName    string             `json:"fileName"`
 		PartInfos   []PersonalPartInfo `json:"partInfos"`
 		Exist       bool               `json:"exist"`
 		RapidUpload bool               `json:"rapidUpload"`
-		UploadId    string             `json:"uploadId"`
+		UploadID    string             `json:"uploadId"`
 	} `json:"data"`
 }
 
@@ -386,8 +386,8 @@ type FamilyUploadCreateResp struct {
 // (/dynamic/file/getUploadUrl).
 type FamilyUploadURLReq struct {
 	FamilyCommon
-	FileId    string     `json:"fileId"`
-	UploadId  string     `json:"uploadId"`
+	FileID    string     `json:"fileId"`
+	UploadID  string     `json:"uploadId"`
 	PartInfos []PartInfo `json:"partInfos"`
 }
 
@@ -396,8 +396,8 @@ type FamilyUploadCompleteReq struct {
 	FamilyCommon
 	ContentHash          string `json:"contentHash"`
 	ContentHashAlgorithm string `json:"contentHashAlgorithm"`
-	FileId               string `json:"fileId"`
-	UploadId             string `json:"uploadId"`
+	FileID               string `json:"fileId"`
+	UploadID             string `json:"uploadId"`
 }
 
 // ------------------------------------------------------------ quota ------
@@ -425,7 +425,7 @@ type PersonalCreateFolderReq struct {
 // Mirrors the official client (captured 2026-09-03):
 // {fileIds, toParentFileId, userId, eventType:"move", businessType:0}.
 type PersonalBatchMoveReq struct {
-	FileIds        []string `json:"fileIds"`
+	FileIDs        []string `json:"fileIds"`
 	ToParentFileID string   `json:"toParentFileId"`
 	UserID         string   `json:"userId"`
 	EventType      string   `json:"eventType"`
@@ -436,7 +436,7 @@ type PersonalBatchMoveReq struct {
 // Mirrors the official client (captured 2026-09-03):
 // {userId, userDomainId, fileIds, toParentFileId}.
 type PersonalBatchCopyReq struct {
-	FileIds        []string `json:"fileIds"`
+	FileIDs        []string `json:"fileIds"`
 	ToParentFileID string   `json:"toParentFileId"`
 	UserID         string   `json:"userId"`
 	UserDomainID   string   `json:"userDomainId"`
@@ -445,14 +445,14 @@ type PersonalBatchCopyReq struct {
 // PersonalUpdateReq is the request for POST /hcy/file/update (rename).
 // The official client sends exactly {fileId, name} (captured 2026-09-03).
 type PersonalUpdateReq struct {
-	FileId string `json:"fileId"`
+	FileID string `json:"fileId"`
 	Name   string `json:"name"`
 }
 
 // PersonalTrashReq is the request for POST /hcy/recyclebin/batchTrash.
 // businessType:0 is what the official client sends.
 type PersonalTrashReq struct {
-	FileIds      []string `json:"fileIds"`
+	FileIDs      []string `json:"fileIds"`
 	BusinessType int      `json:"businessType"`
 }
 
@@ -509,7 +509,7 @@ type IsboBatchOprTaskReq struct {
 type AndAlbumCopyReq struct {
 	CommonAccountInfo struct {
 		AccountType   string `json:"accountType"`
-		AccountUserId string `json:"accountUserId"`
+		AccountUserID string `json:"accountUserId"`
 	} `json:"commonAccountInfo"`
 	DestCatalogID    string   `json:"destCatalogID"`
 	DestCloudID      string   `json:"destCloudID"`
