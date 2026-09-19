@@ -1,8 +1,12 @@
 package yun139
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"reflect"
 	"testing"
 
+	"github.com/rclone/rclone/backend/yun139/api"
 	"github.com/rclone/rclone/fs/fserrors"
 )
 
@@ -191,5 +195,69 @@ func TestValidateName(t *testing.T) {
 	}
 	if err := f.validateName("a:dir/name.txt"); err != nil {
 		t.Errorf("(f).validateName rejected reserved char in parent dir: %v", err)
+	}
+}
+
+// TestSha256MidstateSinglePass proves the single-forward-pass midstate
+// computation (one running SHA-256, captured at each part boundary) produces
+// byte-identical H registers to the old per-part re-hash from offset 0. This
+// is the safety net for the O(n^2)->O(n) refactor of the parallel upload
+// midstate path; the server signs each part's context, so a drift here would
+// silently break every multi-part upload.
+func TestSha256MidstateSinglePass(t *testing.T) {
+	data := make([]byte, 12*1024*1024)
+	for i := range data {
+		data[i] = byte(i * 31)
+	}
+	r := bytes.NewReader(data)
+	buf := make([]byte, 1<<20)
+
+	partSizes := []int64{5 * 1024 * 1024, 1 * 1024 * 1024, 7 * 1024 * 1024, 12 * 1024 * 1024}
+	for _, partSize := range partSizes {
+		parts := planParts(int64(len(data)), partSize)
+		if len(parts) < 2 {
+			continue
+		}
+		// Single forward pass, mirroring uploadFromRandom.
+		h := sha256.New()
+		fed := int64(0)
+		single := make([][]uint32, len(parts)+1)
+		for _, p := range parts {
+			if p.offset > 0 {
+				if err := sha256Feed(h, r, fed, p.offset, buf); err != nil {
+					t.Fatalf("partSize %d: sha256Feed(%d,%d): %v", partSize, fed, p.offset, err)
+				}
+				fed = p.offset
+				regs, _, err := api.Sha256Midstate(h)
+				if err != nil {
+					t.Fatalf("partSize %d: midstate: %v", partSize, err)
+				}
+				single[p.index] = regs
+			}
+		}
+		// Reference: fresh hash from offset 0 to each part boundary.
+		for _, p := range parts {
+			if p.offset == 0 {
+				continue
+			}
+			h2 := sha256.New()
+			off := int64(0)
+			for off < p.offset {
+				want := p.offset - off
+				if want > int64(len(buf)) {
+					want = int64(len(buf))
+				}
+				nr, _ := r.ReadAt(buf[:want], off)
+				h2.Write(buf[:nr])
+				off += int64(nr)
+			}
+			ref, _, err := api.Sha256Midstate(h2)
+			if err != nil {
+				t.Fatalf("partSize %d part %d: ref midstate: %v", partSize, p.index, err)
+			}
+			if !reflect.DeepEqual(single[p.index], ref) {
+				t.Errorf("partSize %d part %d: single-pass midstate != per-part midstate", partSize, p.index)
+			}
+		}
 	}
 }
