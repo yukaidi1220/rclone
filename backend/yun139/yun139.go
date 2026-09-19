@@ -3113,7 +3113,11 @@ func sha256Feed(h interface {
 		}
 		nr, err := src.ReadAt(buf[:want], off)
 		if nr > 0 {
-			h.Write(buf[:nr])
+			if nw, werr := h.Write(buf[:nr]); werr != nil {
+				return werr
+			} else if nw != nr {
+				return io.ErrShortWrite
+			}
 			off += int64(nr)
 		}
 		if err != nil {
