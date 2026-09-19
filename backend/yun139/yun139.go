@@ -372,9 +372,6 @@ func tokenExpiryOf(auth string) (time.Time, bool) {
 	return time.UnixMilli(ms), true
 }
 
-// tokenExpiry returns the expiry time encoded in the current token.
-func (f *Fs) tokenExpiry() (time.Time, bool) { return tokenExpiryOf(f.auth) }
-
 // accessToken returns the current authorization (raw base64).
 //
 // When the account-wide tokenState has been registered (NewFs sets it), read
@@ -457,11 +454,11 @@ func (f *Fs) refreshToken(ctx context.Context) error {
 	userID := f.userDomainID
 	manual := f.opt.UserDomainID != "" // conf provided a value (possibly wrong)
 	if userID == "" {
-		if uid, derr := f.discoverUserDomainID(ctx); derr != nil {
+		uid, derr := f.discoverUserDomainID(ctx)
+		if derr != nil {
 			return fserrors.NoRetryError(fmt.Errorf("yun139: refresh token: could not resolve userDomainId: %w", derr))
-		} else {
-			userID = uid
 		}
+		userID = uid
 	}
 
 	// doRefresh sends the SSO heartbeat with the given authToken + userId and
