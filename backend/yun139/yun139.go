@@ -94,6 +94,7 @@ type Options struct {
 	RootFolderID      string               `config:"root_folder_id"`
 	UserDomainID      string               `config:"user_domain_id"` // <user-domain-id>-style id, optional
 	HardDelete        bool                 `config:"hard_delete"`
+	NoRefresh         bool                 `config:"no_refresh"` // never refresh the token
 	PartSize          fs.SizeSuffix        `config:"part_size"`
 	UploadConcurrency int                  `config:"upload_concurrency"`
 	Enc               encoder.MultiEncoder `config:"encoding"`
@@ -141,6 +142,14 @@ func init() {
 			Name: "hard_delete",
 			Help: "Delete permanently instead of moving files to the recycle bin.\n\n" +
 				"Only applies to the personal space.",
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name: "no_refresh",
+			Help: "Never refresh the token.\n\n" +
+				"Use when the same account is shared with another program that manages " +
+				"the token itself (e.g. an OpenList/alist instance), to avoid competing " +
+				"refreshes rotating the token out from under each other.",
 			Default:  false,
 			Advanced: true,
 		}, {
@@ -205,6 +214,78 @@ func (e *apiError) Error() string {
 
 // ------------------------------------------------------------ Fs ----------
 
+// tokenState holds the authorization token shared by every yun139 remote
+// that belongs to the same account. Refreshing rotates the token, so two
+// remotes of one account that kept independent state could refresh the same
+// (now-stale) token and rotate it out from under each other. Sharing one state
+// per account and serialising the refresh on a single lock avoids that.
+type tokenState struct {
+	mu       sync.Mutex
+	auth     string
+	mappers  map[string]configmap.Mapper // section name -> mapper for write back
+}
+
+// tokenRegistry indexes the shared token states by account.
+//
+// The account (phone number) is an invariant of the authorization token, so
+// it is a stable registry key across token rotations.
+var tokenRegistry = struct {
+	sync.Mutex
+	byAccount map[string]*tokenState
+}{byAccount: map[string]*tokenState{}}
+
+// addMapper registers a remote so that refreshed tokens are written back to it.
+func (ts *tokenState) addMapper(name string, m configmap.Mapper) {
+	if m == nil {
+		return
+	}
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if ts.mappers == nil {
+		ts.mappers = map[string]configmap.Mapper{}
+	}
+	ts.mappers[name] = m
+}
+
+// writeBackLocked saves the current token into every registered section.
+//
+// ts.mu must be held. The in-memory value is updated by the caller before this
+// runs, so a concurrent request that already picked up the new token keeps
+// working while the sections are being written.
+func (ts *tokenState) writeBackLocked() {
+	for _, m := range ts.mappers {
+		if m == nil {
+			continue
+		}
+		m.Set("authorization", ts.auth)
+	}
+}
+
+// accountKey returns the stable registry key for this Fs's account. If the
+// account cannot be parsed the authorization itself is used as a fallback so
+// distinct remotes never collide.
+func (f *Fs) accountKey() string {
+	if f.account != "" {
+		return "acct:" + f.account
+	}
+	return "auth:" + f.auth
+}
+
+// tokenState returns the shared token state for this Fs's account, registering
+// this remote's mapper so a refresh writes back to its config section.
+func (f *Fs) tokenState() *tokenState {
+	tokenRegistry.Lock()
+	defer tokenRegistry.Unlock()
+	key := f.accountKey()
+	ts, ok := tokenRegistry.byAccount[key]
+	if !ok {
+		ts = &tokenState{auth: f.auth, mappers: map[string]configmap.Mapper{}}
+		tokenRegistry.byAccount[key] = ts
+	}
+	ts.addMapper(f.name, f.m)
+	return ts
+}
+
 // Fs represents a remote yun139
 type Fs struct {
 	name       string             // name of this remote
@@ -226,6 +307,7 @@ type Fs struct {
 	tokMu   *sync.Mutex // guards authorization + account (pointer so NewFs's tempF copy stays lock-safe)
 	auth    string      // the raw base64 authorization token
 	account string      // the phone number
+	ts      *tokenState // account-wide shared token state (nil until NewFs sets it)
 
 	hostMu       *sync.Mutex // guards personalHost
 	personalHost string      // per-account personal cloud host, discovered once
@@ -267,9 +349,11 @@ func (f *Fs) parseAuth() (account string, err error) {
 	return parts[1], nil
 }
 
-// tokenExpiry returns the expiry time encoded in the token, if present.
-func (f *Fs) tokenExpiry() (time.Time, bool) {
-	decoded, err := base64.StdEncoding.DecodeString(f.auth)
+// tokenExpiryOf returns the expiry time encoded in an authorization token, if
+// present. Token-expiry is a pure function of the auth string, so callers pass
+// the exact token they are inspecting (the shared tokenState value in refresh).
+func tokenExpiryOf(auth string) (time.Time, bool) {
+	decoded, err := base64.StdEncoding.DecodeString(auth)
 	if err != nil {
 		return time.Time{}, false
 	}
@@ -288,92 +372,213 @@ func (f *Fs) tokenExpiry() (time.Time, bool) {
 	return time.UnixMilli(ms), true
 }
 
+// tokenExpiry returns the expiry time encoded in the current token.
+func (f *Fs) tokenExpiry() (time.Time, bool) { return tokenExpiryOf(f.auth) }
+
 // accessToken returns the current authorization (raw base64).
+//
+// When the account-wide tokenState has been registered (NewFs sets it), read
+// from the shared state so a remote of the same account always sees the freshest
+// token even if another remote refreshed it. Falls back to f.auth pre-NewFs.
 func (f *Fs) accessToken() string {
+	if f.ts != nil {
+		f.ts.mu.Lock()
+		defer f.ts.mu.Unlock()
+		return f.ts.auth
+	}
 	f.tokMu.Lock()
 	defer f.tokMu.Unlock()
 	return f.auth
 }
 
+// discoverUserDomainID resolves the <user-domain-id>-style id from
+// queryFamilyCloud, persists it to the config, and returns it. The official
+// client caches this from login; we learn it in one extra request. The phone
+// number is never accepted by the refresh endpoint, so this is the only
+// reliable source for the userId a refresh must send.
+func (f *Fs) discoverUserDomainID(ctx context.Context) (string, error) {
+	_, uid, err := f.queryFamilyCloud(ctx)
+	if err != nil {
+		return "", err
+	}
+	if uid == "" {
+		return "", errors.New("yun139: queryFamilyCloud returned no accountUserId")
+	}
+	f.userDomainID = uid
+	f.opt.UserDomainID = uid
+	f.m.Set("user_domain_id", uid)
+	return uid, nil
+}
+
 // refreshToken refreshes the token via the SSO endpoint when it has less than
 // minTokenLifetime left. The new token is written back to the config.
+//
+// Concurrency: shares one tokenState per account across every remote of that
+// account (mirroring wopan's tokenRegistry), so several backends of one account
+// refresh under a single account-wide lock and never rotate a stale token out
+// from under each other:
+//
+//   - the refresh is serialised per-account by ts.mu (the shared tokenState's
+//     lock, not per-Fs), so two remotes of one account cannot refresh together;
+//   - before refreshing, the token is re-read from the shared state: if a
+//     concurrent remote already refreshed it, we adopt the fresher token and
+//     skip our own refresh instead of using the now-stale old one;
+//   - the new token returned in the response APP_AUTH header is written back
+//     to every registered mapper via writeBackLocked, only when it differs;
+//   - --yun139-no-refresh (NoRefresh) disables refresh entirely for accounts
+//     whose token another program manages.
 func (f *Fs) refreshToken(ctx context.Context) error {
-	f.tokMu.Lock()
-	auth := f.auth
-	account := f.account
-	f.tokMu.Unlock()
-
-	expiry, ok := f.tokenExpiry()
-	if !ok {
-		// No expiry in the token: assume it is valid.
+	if f.opt.NoRefresh {
 		return nil
 	}
-	if time.Until(expiry) > minTokenLifetime {
+	ts := f.tokenState()
+	f.ts = ts
+
+	// Fast path: if the token still has plenty of life left there is nothing to
+	// refresh, so return before doing any network or userDomainId discovery.
+	// The read is done under the shared lock (cheap) so a concurrent refresh's
+	// commit of ts.auth is never read unsynchronised.
+	ts.mu.Lock()
+	auth := ts.auth
+	if auth == "" {
+		auth = f.auth
+	}
+	expiry, ok := tokenExpiryOf(auth)
+	if ok && time.Until(expiry) > minTokenLifetime {
+		ts.mu.Unlock()
 		return nil
 	}
-	// Within minTokenLifetime of expiry, or already past it: refresh.
-	// 139 rejects API calls with a fully-expired token, so refreshing
-	// after the deadline is the only path to a working session.
+	ts.mu.Unlock()
 
-	decoded, err := base64.StdEncoding.DecodeString(auth)
-	if err != nil {
-		return err
-	}
-	parts := strings.SplitN(string(decoded), ":", 3)
-	if len(parts) < 3 {
-		return errors.New("yun139: invalid authorization format")
-	}
-	token := parts[2]
-
-	// The PC client refreshes with a JSON heartbeat
-	// {"authToken":..., "userId":...} to note-njs.yun.139.com
-	// (captured 2026-09-03). The response is a user profile; it does
-	// NOT contain a new token, so a 200 means the token is still valid
-	// (its window was extended server-side).
+	// Resolve the userDomainId up front, OUTSIDE the shared lock. Discovery
+	// calls queryFamilyCloud -> familyCall -> call -> accessToken(), which
+	// locks ts.mu; doing it while holding ts.mu would deadlock on the same
+	// mutex. The same applies to the self-heal rediscovery on a retry.
 	userID := f.userDomainID
+	manual := f.opt.UserDomainID != "" // conf provided a value (possibly wrong)
 	if userID == "" {
-		userID = account
+		if uid, derr := f.discoverUserDomainID(ctx); derr != nil {
+			return fserrors.NoRetryError(fmt.Errorf("yun139: refresh token: could not resolve userDomainId: %w", derr))
+		} else {
+			userID = uid
+		}
 	}
-	reqBody, err := json.Marshal(map[string]string{"authToken": token, "userId": userID})
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, api.AuthTokenRefreshURL, bytes.NewReader(reqBody))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", pcUserAgentShort)
-	req.Header.Set("APP_CP", "pc")
-	req.Header.Set("CP_VERSION", pcAppVersion)
 
-	res, err := f.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("yun139: refresh token: %w", err)
+	// doRefresh sends the SSO heartbeat with the given authToken + userId and
+	// returns the fresh, pc:-normalised authorization. It does not touch ts.mu.
+	// Success or failure is carried in the response header ERRORCODE (0 = ok);
+	// the new token comes back in the response header APP_AUTH as
+	// "Basic " + base64("<account>:<token>...") WITHOUT the "pc:" scheme prefix
+	// that parseAuth / tokenExpiry expect, so we re-add it before persisting.
+	doRefresh := func(authToken, userID string) (string, error) {
+		reqBody, err := json.Marshal(map[string]string{"authToken": authToken, "userId": userID})
+		if err != nil {
+			return "", err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, api.AuthTokenRefreshURL, bytes.NewReader(reqBody))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+		req.Header.Set("User-Agent", pcUserAgentShort)
+		req.Header.Set("APP_CP", "pc")
+		req.Header.Set("CP_VERSION", pcAppVersion)
+
+		res, err := f.httpClient.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("yun139: refresh token: %w", err)
+		}
+		defer func() { _ = res.Body.Close() }()
+		if res.StatusCode >= 300 {
+			body, _ := io.ReadAll(res.Body)
+			return "", fmt.Errorf("yun139: refresh token: http %s: %s", res.Status, truncate(string(body), 200))
+		}
+		// A 200 with a non-zero ERRORCODE is still a rejection and must not be
+		// treated as a successful refresh.
+		if code := res.Header.Get("ERRORCODE"); code != "" && code != "0" {
+			return "", fserrors.NoRetryError(fmt.Errorf("yun139: refresh token: ERRORCODE %s", code))
+		}
+		newAuth := strings.TrimPrefix(res.Header.Get("APP_AUTH"), "Basic ")
+		newAuth = strings.TrimSpace(newAuth)
+		if newAuth == "" {
+			return "", errors.New("yun139: refresh token returned no APP_AUTH")
+		}
+		if decoded, err := base64.StdEncoding.DecodeString(newAuth); err == nil {
+			s := string(decoded)
+			if !strings.HasPrefix(s, "pc:") {
+				newAuth = base64.StdEncoding.EncodeToString([]byte("pc:" + s))
+			}
+		}
+		return newAuth, nil
 	}
-	defer func() { _ = res.Body.Close() }()
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		return err
-	}
-	if res.StatusCode >= 300 {
-		return fmt.Errorf("yun139: refresh token: http %s: %s", res.Status, truncate(string(body), 200))
-	}
-	// A 200 body that parses as JSON means the token is still good.
-	// The response is a user profile (userphone/username/...), not an
-	// envelope, so any 200 with JSON is success.
-	var env struct {
-		Success bool   `json:"success"`
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	}
-	if err := json.Unmarshal(body, &env); err != nil {
-		return fmt.Errorf("yun139: refresh token: decode %w", err)
-	}
-	if !env.Success && env.Message != "" {
-		// An explicit error envelope (e.g. {"success":false,...})
-		// means the token is dead.
-		return fserrors.NoRetryError(fmt.Errorf("yun139: refresh token: %s %s", env.Code, env.Message))
+
+	// Attempt the refresh, with a single self-heal retry when the configured
+	// userDomainId looks wrong. Each attempt reads the latest token under the
+	// shared lock, then releases it before any network/discovery work.
+	for attempt := 0; attempt < 2; attempt++ {
+		ts.mu.Lock()
+		auth := ts.auth
+		if auth == "" {
+			auth = f.auth
+		}
+		expiry, ok := tokenExpiryOf(auth)
+		if !ok {
+			ts.mu.Unlock()
+			return nil // no expiry: assume valid
+		}
+		if time.Until(expiry) > minTokenLifetime {
+			ts.mu.Unlock()
+			return nil
+		}
+		// A concurrent rclone may have refreshed already; adopt it and stop.
+		if v, ok := f.m.Get("authorization"); ok && v != "" && v != auth {
+			ts.auth = v
+			f.auth = v
+			if acct, err := f.parseAuth(); err == nil {
+				f.account = acct
+			}
+			fs.Debugf(f, "yun139: adopted refreshed token from config file")
+			ts.mu.Unlock()
+			return nil
+		}
+		decoded, err := base64.StdEncoding.DecodeString(auth)
+		if err != nil {
+			ts.mu.Unlock()
+			return err
+		}
+		parts := strings.SplitN(string(decoded), ":", 3)
+		if len(parts) < 3 {
+			ts.mu.Unlock()
+			return errors.New("yun139: invalid authorization format")
+		}
+		authToken := parts[2]
+		ts.mu.Unlock()
+
+		// Refresh outside the lock (doRefresh does not take ts.mu).
+		newAuth, rerr := doRefresh(authToken, userID)
+		if rerr == nil {
+			// Commit the fresh token under the lock, writing back to every mapper.
+			ts.mu.Lock()
+			if newAuth != "" && newAuth != auth {
+				ts.auth = newAuth
+				f.auth = newAuth
+				f.opt.Authorization = newAuth
+				ts.writeBackLocked()
+				fs.Debugf(f, "yun139: refreshed token in config file")
+			}
+			ts.mu.Unlock()
+			return nil
+		}
+		// Refresh failed. If a manually-configured userDomainId is in play it is
+		// probably wrong (server rejects it with 05010003): rediscover OUTSIDE
+		// the lock and retry once so a stale config self-heals.
+		if manual && attempt == 0 {
+			if uid, derr := f.discoverUserDomainID(ctx); derr == nil && uid != "" && uid != userID {
+				userID = uid
+				continue
+			}
+		}
+		return rerr
 	}
 	return nil
 }
@@ -522,9 +727,7 @@ func (f *Fs) call(ctx context.Context, url string, body any, out any) error {
 	randStr := random.String(16)
 	sign := api.Sign(string(payload), ts, randStr)
 
-	f.tokMu.Lock()
-	auth := f.auth
-	f.tokMu.Unlock()
+	auth := f.accessToken()
 
 	var headers map[string]string
 	host := strings.SplitN(url, "/", 4)[2]
@@ -912,6 +1115,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if f.userDomainID == "" {
 		if _, accountUserID, err := f.queryFamilyCloud(ctx); err == nil && accountUserID != "" {
 			f.userDomainID = accountUserID
+			f.opt.UserDomainID = accountUserID
+			f.m.Set("user_domain_id", accountUserID)
 		}
 		// A failure here is not fatal: personal-space operations
 		// that do not need the domain id keep working (the quota
