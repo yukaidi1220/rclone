@@ -1,0 +1,26 @@
+backend: yun139
+name: China Mobile Cloud Drive (中国移动云盘)
+tier: Tier 1
+maintainers: External
+features_score: 4
+integration_tests: Flaky
+data_integrity: Hash
+performance: High
+adoption: Some use
+docs: Full
+security: High
+virtual: false
+remote: 'TestYun139:'
+features:
+- About
+- CanHaveEmptyDirectories
+- CaseInsensitive
+- Copy
+- DirMove
+- Move
+- OpenChunkWriter
+- Purge
+- SlowHash
+hashes:
+- SHA256
+precision: 1000000000
