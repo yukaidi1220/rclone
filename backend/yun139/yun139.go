@@ -207,6 +207,43 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("yun139: API error %s: %s", e.Code, e.Message)
 }
 
+// ------------------------------------------------------------ names --------
+
+// yun139RejectedRunes holds the characters the 139 server refuses to store in
+// a file or directory name, returning RSP_CODE 04000002 "文件名称不符合标准".
+// Live probe (2026-09-19, personal space, directory create) shows the server
+// enforces Windows filename rules: it rejects the control chars (0x00-0x1F,
+// 0x7F) and the eight ASCII "reserved" characters `" * : < > ? \ |`, while
+// accepting CJK, accented Latin (é), BMP symbols (© ® ° ± ✓) and non-BMP
+// emoji. The backend's default encoder already encodes the control chars,
+// leading/trailing space·dot·CR·LF·HT·VT, leading tilde/period and invalid
+// UTF-8, so only the eight reserved ASCII characters below reach the server
+// raw and trip the rejection.
+var yun139RejectedRunes = `"*:<>?\|`
+
+// validateName checks a leaf file name against yun139's storage rules.
+//
+// It returns an error wrapped with NoRetryError for names containing one of
+// yun139RejectedRunes, which the server rejects deterministically with
+// RSP_CODE 04000002. The NoRetryError wrapper stops --retries from re-running
+// a whole sync round, which is pointless for a name that can never succeed.
+//
+// sanitize (replacing illegal characters) is intentionally NOT offered: sync
+// is bidirectional, and a name transformed on the way up cannot be
+// untransformed on the way down.
+func validateName(leaf string) error {
+	if strings.ContainsAny(leaf, yun139RejectedRunes) {
+		return fserrors.NoRetryError(fmt.Errorf(
+			"yun139: file or directory name contains a character which yun139 cannot store: %q", leaf))
+	}
+	return nil
+}
+
+// validateName checks the leaf name of remote against yun139's storage rules.
+func (f *Fs) validateName(remote string) error {
+	return validateName(path.Base(remote))
+}
+
 // ------------------------------------------------------------ Fs ----------
 
 // tokenState holds the authorization token shared by every yun139 remote
@@ -1433,6 +1470,9 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 
 // CreateDir makes a directory with pathID as parent and name leaf
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
+	if err := validateName(leaf); err != nil {
+		return "", err
+	}
 	leaf = f.opt.Enc.FromStandardName(leaf)
 	if f.space == spaceFamily {
 		srvPath := ""
@@ -1897,6 +1937,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	if err != nil {
 		return nil, err
 	}
+	if err := f.validateName(src.Remote()); err != nil {
+		return nil, err
+	}
 	leaf = f.opt.Enc.FromStandardName(leaf)
 	res, err := f.uploadFile(ctx, in, dirID, leaf, size)
 	if err != nil {
@@ -2289,6 +2332,9 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if err != nil {
 		return err
 	}
+	if err := o.fs.validateName(o.remote); err != nil {
+		return err
+	}
 	leaf = o.fs.opt.Enc.FromStandardName(leaf)
 
 	// Lossless Update: rename the old file away FIRST, upload the new
@@ -2502,6 +2548,9 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if err != nil {
 		return nil, err
 	}
+	if err := f.validateName(remote); err != nil {
+		return nil, err
+	}
 	srcLeaf := srcObj.leaf()
 	if f.space == spaceFamily {
 		// No native family move (new PC client has no move button).
@@ -2613,6 +2662,9 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 	dstLeaf, dstDirID, err := f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
+		return nil, err
+	}
+	if err := f.validateName(remote); err != nil {
 		return nil, err
 	}
 	if f.space == spaceFamily {
@@ -2849,6 +2901,9 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	}
 	leaf, dirID, err := f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
+		return info, nil, err
+	}
+	if err := f.validateName(remote); err != nil {
 		return info, nil, err
 	}
 	leaf = f.opt.Enc.FromStandardName(leaf)

@@ -2,6 +2,8 @@ package yun139
 
 import (
 	"testing"
+
+	"github.com/rclone/rclone/fs/fserrors"
 )
 
 // TestPlanParts verifies the byte ranges produced by planParts for a few
@@ -140,5 +142,54 @@ func TestParsePath_CleansDotDot(t *testing.T) {
 		if got := parsePath(in); got != want {
 			t.Errorf("parsePath(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestValidateName pins the client-side name rejection: the 139 server
+// returns RSP_CODE 04000002 for the eight reserved ASCII characters
+// `" * : < > ? \ |` (probe 2026-09-19), so validateName must refuse them
+// with NoRetryError instead of pushing the name to the backend. Everything
+// the encoder can handle (control chars, leading/trailing space·dot,
+// leading tilde) and everything the server accepts (CJK, é, symbols,
+// emoji) must pass.
+func TestValidateName(t *testing.T) {
+	rejected := []string{
+		`a"b`, `a*b`, `a:b`, `a<b>`, `a?b`, `a\b`, `a|b`,
+		`qu"ote`, `"lead`, `trail"`, `star*`,
+	}
+	for _, n := range rejected {
+		if err := validateName(n); err == nil {
+			t.Errorf("validateName(%q) accepted, want NoRetryError", n)
+		} else if !fserrors.IsNoRetryError(err) {
+			t.Errorf("validateName(%q) = %v, want NoRetryError-wrapped", n, err)
+		}
+	}
+
+	accepted := []string{
+		"plain.txt",
+		"世界.txt", "Ünïcødé.txt", "中文 文件",
+		"emoji😀.txt", "©®™✓", "°±²³", "→↔★☀",
+		" leading space", "trailing space ",
+		".hidden", "trailing dot.",
+		"a\tb.txt", "a\nb.txt", "~tilde", // encoder handles these
+	}
+	for _, n := range accepted {
+		if err := validateName(n); err != nil {
+			t.Errorf("validateName(%q) rejected: %v", n, err)
+		}
+	}
+
+	// Empty and pure-path variants.
+	if err := validateName(""); err != nil {
+		t.Errorf("validateName(\"\") rejected: %v", err)
+	}
+	f := &Fs{}
+	// (f *Fs).validateName checks only the base leaf, so a reserved char in
+	// an intermediate directory must NOT trigger the file-name rejection.
+	if err := f.validateName("dir/a*name.txt"); err == nil {
+		t.Errorf("(f).validateName rejected path with reserved char in leaf: want error")
+	}
+	if err := f.validateName("a:dir/name.txt"); err != nil {
+		t.Errorf("(f).validateName rejected reserved char in parent dir: %v", err)
 	}
 }
