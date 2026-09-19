@@ -1,7 +1,6 @@
 // Package yun139 provides an interface to China Mobile cloud drive (中国移动云盘).
 // (Single-file layout per AGENTS.md: main implementation in yun139.go,
 // API types in api/types.go.)
-
 package yun139
 
 import (
@@ -15,6 +14,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/rclone/rclone/backend/yun139/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -28,14 +36,6 @@ import (
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/random"
 	"golang.org/x/sync/errgroup"
-	"io"
-	"net/http"
-	"os"
-	"path"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
 )
 
 // ------------------------------------------------------------ constants ----
@@ -68,8 +68,6 @@ const (
 	minTokenLifetime = 15 * 24 * time.Hour
 
 	defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-	deviceInfo = "||9|7.14.0|chrome|120.0.0.0|||windows 10||zh-CN|||"
 )
 
 // Space names for the "space" option.
@@ -183,9 +181,6 @@ func init() {
 
 // ------------------------------------------------------------ errors ------
 
-// errTokenExpired is returned when the authorization token is expired.
-var errTokenExpired = fserrors.NoRetryError(errors.New("yun139: authorization token has expired"))
-
 // shouldRetry reports whether a request error is retryable.
 func shouldRetry(ctx context.Context, err error) (bool, error) {
 	if err == nil {
@@ -220,9 +215,9 @@ func (e *apiError) Error() string {
 // (now-stale) token and rotate it out from under each other. Sharing one state
 // per account and serialising the refresh on a single lock avoids that.
 type tokenState struct {
-	mu       sync.Mutex
-	auth     string
-	mappers  map[string]configmap.Mapper // section name -> mapper for write back
+	mu      sync.Mutex
+	auth    string
+	mappers map[string]configmap.Mapper // section name -> mapper for write back
 }
 
 // tokenRegistry indexes the shared token states by account.
@@ -877,12 +872,12 @@ func (f *Fs) personalCloudHost(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("yun139: query route policy: %w", err)
 	}
 	for _, p := range resp.Data.RoutePolicyList {
-		if p.ModName == "personal" && p.HttpsURL != "" {
+		if p.ModName == "personal" && p.HTTPSURL != "" {
 			// The route policy host already ends with "/hcy"
 			// (https://personal-kd-njs.yun.139.com/hcy); our
 			// personalCall paths carry the /hcy prefix themselves,
 			// so strip it here to avoid /hcy/hcy/*.
-			f.personalHost = strings.TrimRight(strings.TrimSuffix(p.HttpsURL, "/hcy"), "/")
+			f.personalHost = strings.TrimRight(strings.TrimSuffix(p.HTTPSURL, "/hcy"), "/")
 			return f.personalHost, nil
 		}
 	}
@@ -1245,7 +1240,7 @@ func (f *Fs) listPersonal(ctx context.Context, dirID string, fn func(listEntry) 
 		n := 0
 		for i := range resp.Data.Items {
 			item := &resp.Data.Items[i]
-			if item.FileId == "" {
+			if item.FileID == "" {
 				continue
 			}
 			n++
@@ -1254,7 +1249,7 @@ func (f *Fs) listPersonal(ctx context.Context, dirID string, fn func(listEntry) 
 				modTime, _ = api.ParseRFC3339(item.CreatedAt)
 			}
 			entry := listEntry{
-				id:      item.FileId,
+				id:      item.FileID,
 				name:    f.opt.Enc.ToStandardName(item.Name),
 				size:    item.Size,
 				isDir:   item.Type == "folder",
@@ -1498,17 +1493,17 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	var resp struct {
 		BaseResp api.BaseResp
 		Data     struct {
-			FileId string `json:"fileId"`
+			FileID string `json:"fileId"`
 		} `json:"data"`
 	}
 	if err := f.personalCall(ctx, "/hcy/file/create", body, &resp); err != nil {
 		return "", err
 	}
-	if resp.Data.FileId == "" {
+	if resp.Data.FileID == "" {
 		// force_rename may have renamed; find by listing.
 		return f.findDirID(ctx, pathID, leaf)
 	}
-	return resp.Data.FileId, nil
+	return resp.Data.FileID, nil
 }
 
 // findDirID returns the id of the directory named leaf inside pathID.
@@ -1708,36 +1703,6 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 		}
 	}
 	return "", nil
-}
-
-// readMetaData reads the object metadata from its parent directory listing.
-func (o *Object) readMetaData(ctx context.Context) error {
-	leaf, dirID, err := o.fs.dirCache.FindPath(ctx, o.remote, false)
-	if err != nil {
-		if err == fs.ErrorDirNotFound {
-			return fs.ErrorObjectNotFound
-		}
-		return err
-	}
-	var found *listEntry
-	err = o.fs.listAll(ctx, dirID, func(e listEntry) bool {
-		if strings.EqualFold(e.name, leaf) {
-			found = &e
-			return true
-		}
-		return false
-	})
-	if err != nil {
-		return err
-	}
-	if found == nil || found.isDir {
-		return fs.ErrorObjectNotFound
-	}
-	o.id = found.id
-	o.size = found.size
-	o.modTime = found.modTime
-	o.serverPath = found.srvPath
-	return nil
 }
 
 // ------------------------------------------------------------ helpers ----
@@ -2413,19 +2378,6 @@ func (f *Fs) cleanupOldBackups(ctx context.Context, dirID, leaf string) {
 	}
 }
 
-// findByNameInDir lists dirID and returns the first file id matching name.
-func (f *Fs) findByNameInDir(ctx context.Context, dirID, name string) (string, error) {
-	var id string
-	err := f.listAll(ctx, dirID, func(e listEntry) bool {
-		if !e.isDir && strings.EqualFold(e.name, name) {
-			id = e.id
-			return true
-		}
-		return false
-	})
-	return id, err
-}
-
 // deleteObject removes a single object by id.
 //
 // family=true uses the family batch-delete endpoint; false uses the personal
@@ -2465,7 +2417,7 @@ func (f *Fs) deleteTask(ctx context.Context, endpoint, id string) error {
 		} `json:"data"`
 	}
 	err := f.pacer.Call(func() (bool, error) {
-		err := f.personalCall(ctx, endpoint, api.PersonalTrashReq{FileIds: []string{id}, BusinessType: 0}, &out)
+		err := f.personalCall(ctx, endpoint, api.PersonalTrashReq{FileIDs: []string{id}, BusinessType: 0}, &out)
 		return shouldRetry(ctx, err)
 	})
 	if err != nil {
@@ -2519,7 +2471,7 @@ func (f *Fs) renameObject(ctx context.Context, id, newName, dirID string, family
 	}
 	return f.pacer.Call(func() (bool, error) {
 		err := f.personalCall(ctx, "/hcy/file/update", api.PersonalUpdateReq{
-			FileId: id,
+			FileID: id,
 			Name:   newName,
 		}, nil)
 		return shouldRetry(ctx, err)
@@ -2594,7 +2546,7 @@ func (f *Fs) moveTaskID(ctx context.Context, id, dstDirID string) (string, error
 	}
 	err := f.pacer.Call(func() (bool, error) {
 		err := f.personalCall(ctx, "/hcy/file/batchMove", api.PersonalBatchMoveReq{
-			FileIds:        []string{id},
+			FileIDs:        []string{id},
 			ToParentFileID: dstDirID,
 			UserID:         f.account,
 			EventType:      "move",
@@ -2867,7 +2819,7 @@ func (f *Fs) copyTaskID(ctx context.Context, id, dstDirID string) (string, error
 			userID = f.account
 		}
 		err := f.personalCall(ctx, "/hcy/file/batchCopy", api.PersonalBatchCopyReq{
-			FileIds:        []string{id},
+			FileIDs:        []string{id},
 			ToParentFileID: dstDirID,
 			UserID:         userID,
 			UserDomainID:   userID,
