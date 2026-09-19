@@ -19,6 +19,7 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -146,6 +147,15 @@ const (
 	// codeAuthInvalid is the only code that means "the token is no longer
 	// valid". Everything else is a business error.
 	codeAuthInvalid = "1001"
+	// codeIllegalName is returned when a file or directory name contains a
+	// character wopan refuses to store (RSP_DESC "名称中含有非法字符").
+	// The rejection is deterministic for the given name, so it must carry
+	// NoRetryError: re-running the whole sync round can never succeed.
+	codeIllegalName = "1009"
+	// codeSensitiveWord is returned when a file or directory name trips the
+	// server's sensitive-word filter (RSP_DESC "您输入的文件夹名称含有敏感词！").
+	// Like codeIllegalName, it is deterministic for the given name.
+	codeSensitiveWord = "4444"
 	// codeDirExists is returned by CreateDirectory when the name is taken;
 	// Mkdir must treat it as success.
 	codeDirExists = "130007"
@@ -399,7 +409,15 @@ func call(ctx context.Context, c client, rootURL, accessToken, channel, method s
 		return nil, fmt.Errorf("STATUS=%s MSG=%s", env.Status, env.Msg)
 	}
 	if env.Rsp.RspCode != successCode {
-		return nil, &apiError{Code: env.Rsp.RspCode, Desc: env.Rsp.RspDesc, LogID: env.LogID}
+		err := &apiError{Code: env.Rsp.RspCode, Desc: env.Rsp.RspDesc, LogID: env.LogID}
+		// 1009 and 4444 are deterministic for the given name: wopan refuses to
+		// store the character (or trips the sensitive-word filter), no retry can
+		// ever succeed, so carry NoRetryError with a message that says what
+		// happened instead of a bare RSP_CODE dump.
+		if env.Rsp.RspCode == codeIllegalName || env.Rsp.RspCode == codeSensitiveWord {
+			return nil, fserrors.NoRetryError(fmt.Errorf("wopan: file or directory name is rejected by the server: %w", err))
+		}
+		return nil, err
 	}
 	return decodeData(env.Rsp.Data, channel, accessToken)
 }
@@ -428,38 +446,141 @@ func spaceParams(spaceType, familyID string) map[string]any {
 	return p
 }
 
+// wopanBMPEmoji lists the BMP codepoints with the Unicode Emoji=Yes property
+// (emoji pictographs), excluding the keycap bases (# * 0-9), the keycap joiner
+// U+20E3, the ZWJ U+200D and the variation selector U+FE0F, which are
+// Emoji=Yes only as parts of emoji sequences.
+//
+// Live probing against the wopan server (2026-09-19) showed it rejects exactly
+// this class of name character: every sampled Emoji=Yes BMP codepoint was
+// rejected with RSP_CODE 1009 "名称中含有非法字符" on CreateDirectory and a
+// bare HTTP 500 at upload time, while every sampled non-emoji symbol
+// (½ ¾ ¿ À é ✓ Ａ ° ± ² ³ ¼ …) was accepted. Generated from
+// https://www.unicode.org/Public/UCD/latest/ucd/emoji/emoji-data.txt.
+var wopanBMPEmoji = []struct{ lo, hi rune }{
+	{0x00A9, 0x00A9},
+	{0x00AE, 0x00AE},
+	{0x203C, 0x203C},
+	{0x2049, 0x2049},
+	{0x2122, 0x2122},
+	{0x2139, 0x2139},
+	{0x2194, 0x2199},
+	{0x21A9, 0x21AA},
+	{0x231A, 0x231B},
+	{0x2328, 0x2328},
+	{0x23CF, 0x23CF},
+	{0x23E9, 0x23F3},
+	{0x23F8, 0x23FA},
+	{0x24C2, 0x24C2},
+	{0x25AA, 0x25AB},
+	{0x25B6, 0x25B6},
+	{0x25C0, 0x25C0},
+	{0x25FB, 0x25FE},
+	{0x2600, 0x2604},
+	{0x260E, 0x260E},
+	{0x2611, 0x2611},
+	{0x2614, 0x2615},
+	{0x2618, 0x2618},
+	{0x261D, 0x261D},
+	{0x2620, 0x2620},
+	{0x2622, 0x2623},
+	{0x2626, 0x2626},
+	{0x262A, 0x262A},
+	{0x262E, 0x262F},
+	{0x2638, 0x263A},
+	{0x2640, 0x2640},
+	{0x2642, 0x2642},
+	{0x2648, 0x2653},
+	{0x265F, 0x2660},
+	{0x2663, 0x2663},
+	{0x2665, 0x2666},
+	{0x2668, 0x2668},
+	{0x267B, 0x267B},
+	{0x267E, 0x267F},
+	{0x2692, 0x2697},
+	{0x2699, 0x2699},
+	{0x269B, 0x269C},
+	{0x26A0, 0x26A1},
+	{0x26A7, 0x26A7},
+	{0x26AA, 0x26AB},
+	{0x26B0, 0x26B1},
+	{0x26BD, 0x26BE},
+	{0x26C4, 0x26C5},
+	{0x26C8, 0x26C8},
+	{0x26CE, 0x26CF},
+	{0x26D1, 0x26D1},
+	{0x26D3, 0x26D4},
+	{0x26E9, 0x26EA},
+	{0x26F0, 0x26F5},
+	{0x26F7, 0x26FA},
+	{0x26FD, 0x26FD},
+	{0x2702, 0x2702},
+	{0x2705, 0x2705},
+	{0x2708, 0x270D},
+	{0x270F, 0x270F},
+	{0x2712, 0x2712},
+	{0x2714, 0x2714},
+	{0x2716, 0x2716},
+	{0x271D, 0x271D},
+	{0x2721, 0x2721},
+	{0x2728, 0x2728},
+	{0x2733, 0x2734},
+	{0x2744, 0x2744},
+	{0x2747, 0x2747},
+	{0x274C, 0x274C},
+	{0x274E, 0x274E},
+	{0x2753, 0x2755},
+	{0x2757, 0x2757},
+	{0x2763, 0x2764},
+	{0x2795, 0x2797},
+	{0x27A1, 0x27A1},
+	{0x27B0, 0x27B0},
+	{0x27BF, 0x27BF},
+	{0x2934, 0x2935},
+	{0x2B05, 0x2B07},
+	{0x2B1B, 0x2B1C},
+	{0x2B50, 0x2B50},
+	{0x2B55, 0x2B55},
+	{0x3030, 0x3030},
+	{0x303D, 0x303D},
+	{0x3297, 0x3297},
+	{0x3299, 0x3299},
+}
+
+// isWopanBMPEmoji reports whether r is a BMP emoji pictograph that wopan
+// refuses to store in file or directory names. The ranges are non-overlapping
+// and ascending, so both lo and hi are monotonic: a binary search over hi
+// finds the first range that could contain r, then the lo bound is checked.
+func isWopanBMPEmoji(r rune) bool {
+	i := sort.Search(len(wopanBMPEmoji), func(i int) bool {
+		return wopanBMPEmoji[i].hi >= r
+	})
+	return i < len(wopanBMPEmoji) && r >= wopanBMPEmoji[i].lo
+}
+
 // validateName checks a leaf file name against wopan's storage rules.
 //
 // It returns an error wrapped with NoRetryError for names longer than 100
 // runes (which the server would silently truncate, risking silent data
-// corruption) or containing a non-BMP character (which the server rejects
-// with HTTP 500). The NoRetryError wrapper stops --retries from re-running a
-// whole sync round, which is pointless for a name that can never succeed.
+// corruption), containing a non-BMP character (which the server rejects
+// with HTTP 500), or containing a BMP emoji pictograph (which the server
+// rejects with RSP_CODE 1009 "名称中含有非法字符", refusing the whole path).
+// The NoRetryError wrapper stops --retries from re-running a whole sync
+// round, which is pointless for a name that can never succeed.
 //
-// TODO(2026-09-17): validateName 当前只拦截两类:
-//   1. > 100 runes (服务器静默截断, NoRetryError 避免反复重试)
-//   2. 非 BMP 字符 (r > 0xFFFF, 如 emoji 😀, 服务器直接 HTTP 500)
-//
-//   实测发现还有第三类漏网: BMP 范围内的特殊符号, 例如 "英特尔® XTU" 中的
-//   ® (U+00AE), 服务器返回 RSP_CODE=1009 "名称中含有非法字符" 并拒收整个路径。
-//   目录创建 CreateDirectory 触发 1009 → 该目录下所有文件都无法上传 →
-//   rclone check 报 "file not in wopan root", probe 若未抽到则静默漏掉。
-//
-//   ── 开发时需排查确认 ──
-//   [ ] wopan 完整拒收字符集: 是仅若干特定符号 (® © ™ ° ± …) 还是 >=0x80 全拒?
-//   [ ] 拒收的是目录名、文件名、还是两者?
-//   [ ] 服务器返回的具体错误码 (已见 RSP_CODE=1009, 是否还有其他码)?
-//   [ ] 拦截策略: NoRetryError 阻止重试? 还是提供 sanitize 替换模式
-//       (--wopan-sanitize-names 自动把非法字符替换为 _)?
-//   [ ] 同步迁移 FAQ / docs: 说明哪些字符会丢, 如何规避。
-//   [ ] 补充 unit test: 覆盖 BMP 特殊符号 case, 以及 RSP_CODE=1009 的
-//       NoRetryError 包裹测试。
+// sanitize (自动替换非法字符为 _) is intentionally NOT offered: sync is
+// bidirectional, and a name transformed on the way up cannot be untransformed
+// on the way down.
 func validateName(leaf string) error {
 	n := utf8.RuneCountInString(leaf)
 	if n > 100 {
 		return fserrors.NoRetryError(fs.ErrorFileNameTooLong)
 	}
 	for _, r := range leaf {
+		if isWopanBMPEmoji(r) {
+			return fserrors.NoRetryError(fmt.Errorf(
+				"file name contains an emoji character %q (U+%04X) which wopan cannot store: %q", r, r, leaf))
+		}
 		if r > 0xFFFF {
 			return fserrors.NoRetryError(fmt.Errorf(
 				"file name contains a non-BMP character %q (U+%04X) which wopan cannot store: %q", r, r, leaf))

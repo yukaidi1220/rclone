@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -211,6 +212,72 @@ func TestUnitValidateName(t *testing.T) {
 		assert.NotErrorIs(t, err, fs.ErrorFileNameTooLong)
 		assert.True(t, fserrors.IsNoRetryError(err), "must be wrapped in NoRetryError")
 	})
+
+	t.Run("BMP emoji rejected", func(t *testing.T) {
+		// Live probe (2026-09-19): the server answers RSP_CODE 1009 for every
+		// sampled BMP Emoji=Yes codepoint. Each must be rejected before any
+		// server call.
+		for _, tc := range []struct {
+			name string
+			r    rune
+		}{
+			{"copyright", 0x00A9}, {"registered", 0x00AE},
+			{"trademark", 0x2122}, {"info", 0x2139},
+			{"left-right arrow", 0x2194}, {"sun", 0x2600},
+			{"warning", 0x26A0}, {"plane", 0x2708},
+			{"sparkles", 0x2728}, {"wavy dash", 0x3030},
+			{"heart", 0x2764},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				err := validateName("英特尔" + string(tc.r) + "XTU.txt")
+				require.Error(t, err, "U+%04X must be rejected", tc.r)
+				assert.NotErrorIs(t, err, fs.ErrorFileNameTooLong)
+				assert.True(t, fserrors.IsNoRetryError(err), "must be wrapped in NoRetryError")
+				assert.Contains(t, err.Error(), "emoji character")
+			})
+		}
+	})
+
+	t.Run("non-emoji BMP symbols accepted", func(t *testing.T) {
+		// Live probe: these sampled non-emoji symbols round-trip fine.
+		for _, tc := range []struct {
+			name string
+			r    rune
+		}{
+			{"vulgar half", 0x00BD}, {"check mark", 0x2713},
+			{"degree", 0x00B0}, {"plus-minus", 0x00B1},
+			{"quater", 0x00BC}, {"pen nib", 0x2711},
+			{"command", 0x2318}, {"white circle", 0x25CC},
+			{"circled one", 0x2460}, {"natural", 0x266E},
+			{"CJK ideograph", 0x4E2D},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				assert.NoError(t, validateName("ok"+string(tc.r)+".txt"), "U+%04X must be accepted", tc.r)
+			})
+		}
+	})
+
+	t.Run("keycap bases not rejected", func(t *testing.T) {
+		// # * and digits are Emoji=Yes only as keycap-sequence bases and must
+		// not be blocked, or names like "photo#1.jpg" would fail.
+		for _, s := range []string{"photo#1.jpg", "a*b.txt", "2026-09.txt"} {
+			assert.NoError(t, validateName(s), "%q must be accepted", s)
+		}
+	})
+
+	t.Run("isWopanBMPEmoji boundaries", func(t *testing.T) {
+		assert.True(t, isWopanBMPEmoji(0x00A9), "first range")
+		assert.True(t, isWopanBMPEmoji(0x3299), "last range")
+		assert.True(t, isWopanBMPEmoji(0x2648), "inside a range")
+		assert.True(t, isWopanBMPEmoji(0x2648+5), "inside a range")
+		assert.False(t, isWopanBMPEmoji(0x0041), "ASCII letter")
+		assert.False(t, isWopanBMPEmoji(0x0041-1), "before table")
+		assert.False(t, isWopanBMPEmoji(0x3299+1), "after table")
+		assert.False(t, isWopanBMPEmoji(0x00A8), "gap before first range")
+		assert.False(t, isWopanBMPEmoji(0x2713), "gap inside dingbats (check mark)")
+		assert.False(t, isWopanBMPEmoji(0x0023), "keycap base")
+		assert.False(t, isWopanBMPEmoji(0x1F600), "non-BMP is handled separately")
+	})
 }
 
 func TestUnitRecycleItemParse(t *testing.T) {
@@ -308,6 +375,34 @@ func TestUnitCallEndToEnd(t *testing.T) {
 		require.True(t, asAPIError(err, &ae))
 		assert.Equal(t, "9999", ae.Code)
 		assert.False(t, isAuthInvalid(err), "9999 must not be treated as auth failure")
+	})
+
+	t.Run("illegal name 1009 carries NoRetryError", func(t *testing.T) {
+		srv := newServer("200", "1009", `""`)
+		defer srv.Close()
+		_, err := call(context.Background(), srv.Client(), srv.URL, testAccessToken, chanWoHome, "CreateDirectory", nil, nil)
+		require.Error(t, err)
+		// The rejection is deterministic for the given name, so --retries must
+		// not re-run the whole sync round; the message must say why instead of
+		// dumping a bare RSP_CODE.
+		assert.True(t, fserrors.IsNoRetryError(err), "1009 must be wrapped in NoRetryError, got: %v", err)
+		assert.Contains(t, err.Error(), "name is rejected by the server")
+		// The apiError must stay reachable through the wrapper.
+		var ae *apiError
+		require.True(t, asAPIError(err, &ae))
+		assert.Equal(t, "1009", ae.Code)
+		assert.False(t, isAuthInvalid(err), "1009 must not be treated as auth failure")
+	})
+
+	t.Run("sensitive word 4444 carries NoRetryError", func(t *testing.T) {
+		srv := newServer("200", "4444", `""`)
+		defer srv.Close()
+		_, err := call(context.Background(), srv.Client(), srv.URL, testAccessToken, chanWoHome, "CreateDirectory", nil, nil)
+		require.Error(t, err)
+		assert.True(t, fserrors.IsNoRetryError(err), "4444 must be wrapped in NoRetryError, got: %v", err)
+		var ae *apiError
+		require.True(t, asAPIError(err, &ae))
+		assert.Equal(t, "4444", ae.Code)
 	})
 
 	t.Run("auth failure 1001 is flagged", func(t *testing.T) {
@@ -527,6 +622,35 @@ func TestUnitShouldRetryCall(t *testing.T) {
 	retry, err = shouldRetryCall(deadCtx, te)
 	assert.False(t, retry)
 	assert.Same(t, te, err)
+}
+
+// TestUnitPacerNoRetryOnNameRejection locks the low-level retry contract for
+// name rejections end to end: a CreateDirectory answering RSP_CODE 1009 or
+// 4444 must reach the server exactly once. The wopan pacer callback routes
+// through shouldRetryCall, which treats every business error as terminal, so
+// --low-level-retries must never re-fire the request; and the NoRetryError
+// wrapper keeps it visible to the high-level --retries too.
+func TestUnitPacerNoRetryOnNameRejection(t *testing.T) {
+	for _, code := range []string{"1009", "4444"} {
+		t.Run(code, func(t *testing.T) {
+			var hits int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&hits, 1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"STATUS":"200","MSG":"ok","LOGID":"L","RSP":{"RSP_CODE":%q,"RSP_DESC":"d","DATA":""}}`, code)
+			}))
+			defer srv.Close()
+			ctx := context.Background()
+			p := fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(time.Millisecond)))
+			err := p.Call(func() (bool, error) {
+				_, err := call(ctx, srv.Client(), srv.URL, testAccessToken, chanWoHome, "CreateDirectory", nil, nil)
+				return shouldRetryCall(ctx, err)
+			})
+			require.Error(t, err)
+			assert.Equal(t, int32(1), atomic.LoadInt32(&hits), "a name rejection must not be low-level retried")
+			assert.True(t, fserrors.IsNoRetryError(err), "must stay NoRetryError through the pacer, got: %v", err)
+		})
+	}
 }
 
 // TestUnitUploadSingleNonSeekable1001 is the regression lock for the sixth
