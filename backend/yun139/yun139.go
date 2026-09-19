@@ -2427,7 +2427,9 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	o.id = res.fileID
 	o.size = size
 	o.modTime = src.ModTime(ctx)
+	o.hashMu.Lock()
 	o.sha256 = res.hashHex
+	o.hashMu.Unlock()
 	if backupRemote != "" {
 		if err := o.fs.deleteObject(ctx, oldID, o.serverPath, o.fs.space == spaceFamily); err != nil {
 			fs.Errorf(o, "yun139: delete backup after update: %v", err)
