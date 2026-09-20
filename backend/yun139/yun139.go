@@ -101,6 +101,7 @@ type Options struct {
 	UploadConcurrency int                  `config:"upload_concurrency"`
 	RegionCode        string               `config:"region_code"` // "province:city" 上传调度节点码,如 531:543(江苏无锡);留空不发送
 	DisableHTTP2      bool                 `config:"disable_http2"`
+	MaxFileSize       fs.SizeSuffix        `config:"max_file_size"` // 单文件上传上限覆盖;0=按会员等级自动
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -182,6 +183,15 @@ func init() {
 			Default:  false,
 			Advanced: true,
 		}, {
+			Name: "max_file_size",
+			Help: "Override the maximum single-file upload size.\n\n" +
+				"0 (default) auto-detects the member tier (vip userIdentity) and uses " +
+				"no-member 5G / silver 8G / gold 20G / diamond 500G. Larger files are " +
+				"skipped with a NoRetryError instead of wasting a full multi-part upload " +
+				"that the server rejects with 04010319 (权益不足).",
+			Default:  fs.SizeSuffix(0),
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -224,6 +234,182 @@ type apiError struct {
 
 func (e *apiError) Error() string {
 	return fmt.Sprintf("yun139: API error %s: %s", e.Code, e.Message)
+}
+
+// ------------------------------------------------------- member level ------
+
+// 单文件上传上限(字节)。无会员 5G / 白银 8G / 黄金 20G / 钻石 500G。
+const (
+	memberLimitNoMember int64 = 5 << 30
+	memberLimitSilver   int64 = 8 << 30
+	memberLimitGold     int64 = 20 << 30
+	memberLimitDiamond  int64 = 500 << 30
+)
+
+// memberQuotaErrorCode is the server rejection when a file's total size
+// exceeds the account's member single-file upload limit: /hcy/file/create
+// (and complete) validate the size after all part PUTs succeed and return
+// RSP_CODE 04010319 权益不足 (measured 2026-09-20, silver tier 8G limit).
+const memberQuotaErrorCode = "04010319"
+
+// memberLevelInfo is a detected member tier and its single-file upload limit.
+type memberLevelInfo struct {
+	maxFileSize int64  // 0 = unknown/no limit (fail-open)
+	typeCode    string // e.g. "1001"(白银) / "1000"(无会员); only for logging
+	typeName    string // e.g. "白银会员" / "无会员"; only for logging
+}
+
+// memberLevelCache caches the detected per-account member tier so remotes
+// sharing one account (accountKey) only probe once and reuse the tier name too.
+var memberLevelCache = struct {
+	sync.Mutex
+	byAccount map[string]memberLevelInfo // accountKey -> tier info
+}{byAccount: map[string]memberLevelInfo{}}
+
+// maxFileSizeForLevel maps a detected member tier to the single-file upload
+// limit. typeName is preferred (only "白银会员" is live-confirmed; gold/diamond
+// names/codes are inferred). An unrecognised tier returns 0 = no limit
+// (fail-open), so a probe we do not understand never blocks a valid upload.
+func maxFileSizeForLevel(typeCode, typeName string) int64 {
+	switch typeName {
+	case "白银会员":
+		return memberLimitSilver
+	case "黄金会员":
+		return memberLimitGold
+	case "钻石会员":
+		return memberLimitDiamond
+	}
+	// 无会员:data 为空,不进入 maxFileSizeForLevel(queryMemberLevel 返回 typeName="")。
+	switch typeCode {
+	case "1000":
+		return memberLimitNoMember
+	case "1001":
+		return memberLimitSilver
+	case "1002":
+		return memberLimitGold
+	case "1003":
+		return memberLimitDiamond
+	}
+	return 0 // unknown => no limit
+}
+
+// queryMemberLevel calls vip.yun.139.com/m4c/openapi/userIdentity to detect the
+// member tier of the current account. It uses f.httpClient directly (not f.call
+// / personalCall, whose host/signature wiring targets the personal/family
+// hosts); the VIP endpoint only needs an Authorization: Basic header. Returns
+// the first member's type/typeName, or ("","",nil) when data is empty (无会员).
+func (f *Fs) queryMemberLevel(ctx context.Context) (typeCode, typeName string, err error) {
+	body, _ := json.Marshal(map[string]any{"memberTypeList": []any{}})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, api.MemberLevelURL, bytes.NewReader(body))
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+	req.Header.Set("Authorization", "Basic "+f.accessToken())
+	res, err := f.httpClient.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("yun139: query member level: %w", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("yun139: query member level: http %s", res.Status)
+	}
+	raw, err := io.ReadAll(res.Body)
+	if err != nil {
+		return "", "", fmt.Errorf("yun139: query member level: read: %w", err)
+	}
+	var env struct {
+		Success bool   `json:"success"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
+		Data    []struct {
+			Type     string `json:"type"`
+			TypeName string `json:"typeName"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return "", "", fmt.Errorf("yun139: query member level: decode: %w", err)
+	}
+	if !env.Success || (env.Code != "" && env.Code != "0") {
+		return "", "", &apiError{Code: env.Code, Message: env.Message}
+	}
+	if len(env.Data) == 0 {
+		// 无会员:userIdentity 对无会员号返回 data 空(实测 2026-09-20)。
+		// 用 typeCode "1000" 标识无会员,让 maxFileSizeForLevel 落到 5G 上限,
+		// 避免 >5G 文件仍整包上传才被 04010319 打回浪费带宽。
+		return "1000", "无会员", nil
+	}
+	return env.Data[0].Type, env.Data[0].TypeName, nil
+}
+
+// probeAndCacheMemberLevel detects and caches the account's single-file upload
+// limit once. An explicit max_file_size wins; otherwise a cached value is used;
+// only then is a live probe issued. Any probe failure is fail-open (记为 0,只记
+// Debug 日志), never blocking the mount.
+func (f *Fs) probeAndCacheMemberLevel(ctx context.Context) {
+	if f.opt.MaxFileSize > 0 {
+		f.memberMaxFileSize = int64(f.opt.MaxFileSize)
+		return
+	}
+	key := f.accountKey()
+	memberLevelCache.Lock()
+	if info, ok := memberLevelCache.byAccount[key]; ok {
+		f.memberMaxFileSize = info.maxFileSize
+		f.memberLevelType = info.typeCode
+		f.memberLevelName = info.typeName
+		memberLevelCache.Unlock()
+		return
+	}
+	memberLevelCache.Unlock()
+	typ, name := "", ""
+	if t, n, err := f.queryMemberLevel(ctx); err == nil {
+		typ, name = t, n
+	} else {
+		fs.Debugf(f, "yun139: member level probe failed, assuming no single-file limit: %v", err)
+	}
+	v := maxFileSizeForLevel(typ, name)
+	info := memberLevelInfo{maxFileSize: v, typeCode: typ, typeName: name}
+	memberLevelCache.Lock()
+	memberLevelCache.byAccount[key] = info
+	memberLevelCache.Unlock()
+	f.memberMaxFileSize = v
+	f.memberLevelType = typ
+	f.memberLevelName = name
+	if f.memberMaxFileSize > 0 {
+		fs.Debugf(f, "yun139: member level detected %q (type=%s), max single-file upload %d bytes", name, typ, f.memberMaxFileSize)
+	}
+}
+
+// maxFileSize returns the effective single-file upload limit: an explicit
+// max_file_size overrides the detected member limit; 0 means no limit.
+func (f *Fs) maxFileSize() int64 {
+	if f.opt.MaxFileSize > 0 {
+		return int64(f.opt.MaxFileSize)
+	}
+	return f.memberMaxFileSize
+}
+
+// errTooLarge builds a NoRetryError for a file larger than the member limit, so
+// copy/sync skip it immediately instead of wasting a full multi-part upload.
+func errTooLarge(leaf string, size, limit int64, level string) error {
+	return fserrors.NoRetryError(fmt.Errorf(
+		"yun139: file %q is %d bytes, exceeding the %s single-file upload limit of %d bytes",
+		leaf, size, level, limit))
+}
+
+// noRetryOnMemberQuota wraps a server 04010319 (权益不足) rejection in a
+// NoRetryError so the low-level/upper retries do not resend the whole large
+// file (each retry redoes every part PUT). Other errors pass through unchanged.
+func noRetryOnMemberQuota(err error) error {
+	if err == nil {
+		return nil
+	}
+	var ae *apiError
+	if errors.As(err, &ae) && ae.Code == memberQuotaErrorCode {
+		fs.Errorf(nil, "yun139: upload rejected by member quota (%s 权益不足): %v", memberQuotaErrorCode, err)
+		return fserrors.NoRetryError(fmt.Errorf("yun139: upload rejected by member quota (%s 权益不足): %w", memberQuotaErrorCode, err))
+	}
+	return err
 }
 
 // ------------------------------------------------------------ names --------
@@ -367,6 +553,10 @@ type Fs struct {
 	familyRootID string // server-side root catalog ID of the family cloud
 
 	userDomainID string // <user-domain-id>-style domain id, learned from queryFamilyCloud
+
+	memberMaxFileSize int64  // 本账号单文件上传上限;0=未知/无限制(fail-open)
+	memberLevelName   string // 探测到的等级名(如"白银会员"),仅用于日志
+	memberLevelType   string // 探测到的 type code(如"1001"),仅用于日志
 }
 
 // Object describes a yun139 object
@@ -1119,17 +1309,17 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 	}
 
 	f := &Fs{
-		name:       name,
-		root:       parsePath(root),
-		opt:        *opt,
-		m:          m,
+		name: name,
+		root: parsePath(root),
+		opt:  *opt,
+		m:    m,
 		httpClient: fshttp.NewClientCustom(ctx, func(t *http.Transport) {
 			if opt.DisableHTTP2 {
 				t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 			}
 		}),
-		space:      opt.Space,
-		svcType:    svcTypePersonal,
+		space:   opt.Space,
+		svcType: svcTypePersonal,
 	}
 	if opt.Space == spaceFamily {
 		f.svcType = svcTypeFamily
@@ -1174,6 +1364,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err := f.refreshToken(ctx); err != nil {
 		return nil, err
 	}
+
+	// Probe the account's member tier once (fail-open) to learn the single-file
+	// upload limit, so oversized files are skipped up front instead of wasting a
+	// full multi-part upload that the server rejects with 04010319.
+	f.probeAndCacheMemberLevel(ctx)
 
 	// Auto-discover the userDomainId (the <digits> id batchCopy and
 	// quota need) from queryFamilyCloud. The official client caches
@@ -1985,6 +2180,11 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	if size == 0 {
 		return nil, fs.ErrorCantUploadEmptyFiles
 	}
+	if limit := f.maxFileSize(); limit > 0 && size > limit {
+		fs.Logf(f, "SKIP %s: %d bytes exceeds the member single-file upload limit of %d bytes (tier %q); skipping to avoid a wasted multi-part upload",
+			src.Remote(), size, limit, f.memberLevelName)
+		return nil, errTooLarge(src.Remote(), size, limit, f.memberLevelName)
+	}
 	leaf, dirID, err := f.dirCache.FindPath(ctx, src.Remote(), true)
 	if err != nil {
 		return nil, err
@@ -2108,6 +2308,11 @@ func buildCreateBody(dirID, leaf string, size int64, hashHex string, partInfos [
 // for hashing (already done) and for reading each part on demand via
 // io.SectionReader, so memory use is bounded by chunkSize.
 func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, leaf string, size int64, hashHex string) (*uploadResult, error) {
+	if limit := f.maxFileSize(); limit > 0 && size > limit {
+		fs.Logf(f, "SKIP %s: %d bytes exceeds the member single-file upload limit of %d bytes (tier %q); skipping to avoid a wasted multi-part upload",
+			leaf, size, limit, f.memberLevelName)
+		return nil, errTooLarge(leaf, size, limit, f.memberLevelName)
+	}
 	chunkSize := int64(f.opt.PartSize)
 	if chunkSize <= 0 {
 		chunkSize = api.DefaultChunkSize
@@ -2209,11 +2414,11 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	}
 	if f.space == spaceFamily {
 		if err := f.familyCall(ctx, callPath, callBody, &resp); err != nil {
-			return nil, fmt.Errorf("create: %w", err)
+			return nil, noRetryOnMemberQuota(fmt.Errorf("create: %w", err))
 		}
 	} else {
 		if err := f.personalCall(ctx, callPath, callBody, &resp); err != nil {
-			return nil, fmt.Errorf("create: %w", err)
+			return nil, noRetryOnMemberQuota(fmt.Errorf("create: %w", err))
 		}
 	}
 	fs.Debugf(f, "yun139: create returned %d part URLs, rapid=%v exists=%v", len(resp.Data.PartInfos), resp.Data.RapidUpload, resp.Data.Exists)
@@ -2225,7 +2430,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		return &uploadResult{fileID: resp.Data.FileID, fileName: leaf, hashHex: hashHex}, nil
 	}
 	if !resp.Success {
-		return nil, &apiError{Code: resp.Code, Message: resp.Message}
+		return nil, noRetryOnMemberQuota(&apiError{Code: resp.Code, Message: resp.Message})
 	}
 	if len(resp.Data.PartInfos) == 0 {
 		return nil, errors.New("create returned no upload URL")
@@ -2287,7 +2492,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 			return nil, fmt.Errorf("getUploadUrl: %w", err)
 		}
 		if !urlResp.Success {
-			return nil, &apiError{Code: urlResp.Code, Message: urlResp.Message}
+			return nil, noRetryOnMemberQuota(&apiError{Code: urlResp.Code, Message: urlResp.Message})
 		}
 		allParts = append(allParts, urlResp.Data.PartInfos...)
 	}
@@ -2350,10 +2555,10 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		}
 	}
 	if err := f.call(ctx, cmplHost+cmplPath, cmpl, &cmplResp); err != nil {
-		return nil, fmt.Errorf("complete: %w", err)
+		return nil, noRetryOnMemberQuota(fmt.Errorf("complete: %w", err))
 	}
 	if !cmplResp.Success {
-		return nil, &apiError{Code: cmplResp.Code, Message: cmplResp.Message}
+		return nil, noRetryOnMemberQuota(&apiError{Code: cmplResp.Code, Message: cmplResp.Message})
 	}
 	return &uploadResult{fileID: resp.Data.FileID, fileName: leaf, hashHex: hashHex}, nil
 }

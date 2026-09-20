@@ -114,6 +114,13 @@ type QueryRoutePolicyResp struct {
 // with {"authToken":..., "userId":...}).
 const AuthTokenRefreshURL = "https://note-njs.yun.139.com/yun-note/user/authTokenRefresh"
 
+// MemberLevelURL queries the current account's member tier (会员等级).
+// POST body {"memberTypeList":[]}; the Authorization: Basic header alone is
+// enough (no Cookie needed, measured 2026-09-20). data non-empty carries
+// [{type,typeName}], e.g. {"type":"1001","typeName":"白银会员"}; empty = 无会员.
+// It is a var (not a const) so tests can point it at a local httptest server.
+var MemberLevelURL = "https://vip.yun.139.com/m4c/openapi/userIdentity"
+
 // ------------------------------------------------------- personal -------
 
 // PersonalFileItem is one entry in the PersonalNew listing.
