@@ -8,9 +8,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rclone/rclone/backend/yun139/api"
 	"github.com/rclone/rclone/fs/fserrors"
+	"github.com/rclone/rclone/fs/object"
 )
 
 // TestMaxFileSizeForLevel checks the tier -> single-file limit mapping,
@@ -199,5 +201,24 @@ func TestErrTooLarge_NoRetry(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("errTooLarge missing %q: %v", want, err)
 		}
+	}
+}
+
+// TestOpenChunkWriterTooLarge_NoRetry verifies the multi-thread copy path
+// (OpenChunkWriter) also rejects an oversized file up front, before any chunk
+// is downloaded to the local temp file. This is the path large files actually
+// take in rclone sync --max-size 0, and it is the earliest size-known point.
+func TestOpenChunkWriterTooLarge_NoRetry(t *testing.T) {
+	f := &Fs{opt: Options{MaxFileSize: 8 << 30}}
+	src := object.NewStaticObjectInfo("big.bin", time.Now(), int64(9<<30), true, nil, nil)
+	_, _, err := f.OpenChunkWriter(context.Background(), "big.bin", src)
+	if err == nil {
+		t.Fatal("OpenChunkWriter: want error for oversized file")
+	}
+	if !fserrors.IsNoRetryError(err) {
+		t.Errorf("err not NoRetryError: %v", err)
+	}
+	if !strings.Contains(err.Error(), "big.bin") || !strings.Contains(err.Error(), "8") {
+		t.Errorf("err missing path/limit: %v", err)
 	}
 }
