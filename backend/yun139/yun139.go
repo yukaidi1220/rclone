@@ -3207,6 +3207,15 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	if size < 0 {
 		return info, nil, errors.New("yun139: can't upload files of unknown size")
 	}
+	// The multi-thread copy engine starts a download before the ChunkWriter's
+	// Close() runs, so checking the member single-file limit here (size is known
+	// up front) avoids downloading an oversized file to a local temp file only to
+	// reject it at upload time. This is the earliest point for the chunk path.
+	if limit := f.maxFileSize(); limit > 0 && size > limit {
+		fs.Logf(f, "SKIP %s: %d bytes exceeds the member single-file upload limit of %d bytes (tier %q); skipping to avoid a wasted multi-part upload",
+			remote, size, limit, f.memberLevelName)
+		return info, nil, errTooLarge(remote, size, limit, f.memberLevelName)
+	}
 	leaf, dirID, err := f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
 		return info, nil, err
