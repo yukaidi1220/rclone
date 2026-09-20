@@ -49,7 +49,7 @@ func TestQueryMemberLevel(t *testing.T) {
 		_, _ = r.Body.Read(body)
 		gotBody = string(body)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"success":true,"code":"0","message":"OK","data":[{"type":"1001","typeName":"白银会员"}]}`))
+		_, _ = w.Write([]byte(`{"resultCode":"0","resultDesc":"请求成功接收并处理","data":[{"type":"1001","typeName":"白银会员"}]}`))
 	}))
 	defer srv.Close()
 
@@ -87,7 +87,7 @@ func TestQueryMemberLevel(t *testing.T) {
 func TestQueryMemberLevel_NoMember(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"success":true,"code":"0","message":"OK","data":[]}`))
+		_, _ = w.Write([]byte(`{"resultCode":"0","resultDesc":"请求成功接收并处理","data":[]}`))
 	}))
 	defer srv.Close()
 	old := api.MemberLevelURL
