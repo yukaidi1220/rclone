@@ -319,10 +319,9 @@ func (f *Fs) queryMemberLevel(ctx context.Context) (typeCode, typeName string, e
 		return "", "", fmt.Errorf("yun139: query member level: read: %w", err)
 	}
 	var env struct {
-		Success bool   `json:"success"`
-		Code    string `json:"code"`
-		Message string `json:"message"`
-		Data    []struct {
+		ResultCode string `json:"resultCode"` // 0 = OK; the userIdentity envelope uses resultCode/resultDesc
+		ResultDesc string `json:"resultDesc"`
+		Data       []struct {
 			Type     string `json:"type"`
 			TypeName string `json:"typeName"`
 		} `json:"data"`
@@ -330,8 +329,8 @@ func (f *Fs) queryMemberLevel(ctx context.Context) (typeCode, typeName string, e
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return "", "", fmt.Errorf("yun139: query member level: decode: %w", err)
 	}
-	if !env.Success || (env.Code != "" && env.Code != "0") {
-		return "", "", &apiError{Code: env.Code, Message: env.Message}
+	if env.ResultCode != "" && env.ResultCode != "0" {
+		return "", "", &apiError{Code: env.ResultCode, Message: env.ResultDesc}
 	}
 	if len(env.Data) == 0 {
 		// 无会员:userIdentity 对无会员号返回 data 空(实测 2026-09-20)。
