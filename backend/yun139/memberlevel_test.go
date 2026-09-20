@@ -144,6 +144,28 @@ func TestMaxFileSizeOverride(t *testing.T) {
 	}
 }
 
+// TestNoMemberCheck: no_member_check disables the size guard entirely, so
+// maxFileSize() is 0 (unlimited) even when a max_file_size or a detected
+// member limit would otherwise apply.
+func TestNoMemberCheck(t *testing.T) {
+	// overrides even an explicit max_file_size
+	f := &Fs{opt: Options{NoMemberCheck: true, MaxFileSize: 1 << 30}}
+	if got := f.maxFileSize(); got != 0 {
+		t.Errorf("maxFileSize() with no_member_check = %d, want 0 (unlimited)", got)
+	}
+	// overrides a detected member limit
+	f2 := &Fs{opt: Options{NoMemberCheck: true}, memberMaxFileSize: memberLimitSilver}
+	if got := f2.maxFileSize(); got != 0 {
+		t.Errorf("maxFileSize() with no_member_check (detected) = %d, want 0", got)
+	}
+	// probeAndCacheMemberLevel with no_member_check keeps the limit at 0
+	f3 := &Fs{opt: Options{NoMemberCheck: true}}
+	f3.probeAndCacheMemberLevel(context.Background())
+	if f3.memberMaxFileSize != 0 {
+		t.Errorf("probeAndCacheMemberLevel with no_member_check set limit = %d, want 0", f3.memberMaxFileSize)
+	}
+}
+
 // TestUploadTooLarge_NoRetry: an oversized file is rejected before any
 // create/putPart request is made, with a NoRetryError identifying the file.
 func TestUploadTooLarge_NoRetry(t *testing.T) {

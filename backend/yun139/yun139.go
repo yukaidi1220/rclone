@@ -101,7 +101,8 @@ type Options struct {
 	UploadConcurrency int                  `config:"upload_concurrency"`
 	RegionCode        string               `config:"region_code"` // "province:city" 上传调度节点码,如 531:543(江苏无锡);留空不发送
 	DisableHTTP2      bool                 `config:"disable_http2"`
-	MaxFileSize       fs.SizeSuffix        `config:"max_file_size"` // 单文件上传上限覆盖;0=按会员等级自动
+	MaxFileSize       fs.SizeSuffix        `config:"max_file_size"`   // 单文件上传上限覆盖;0=按会员等级自动
+	NoMemberCheck     bool                 `config:"no_member_check"` // 跳过会员等级探测与单文件上限检查,任意大小直接上传
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -190,6 +191,16 @@ func init() {
 				"skipped with a NoRetryError instead of wasting a full multi-part upload " +
 				"that the server rejects with 04010319 (权益不足).",
 			Default:  fs.SizeSuffix(0),
+			Advanced: true,
+		}, {
+			Name: "no_member_check",
+			Help: "Disable the automatic member-tier size check.\n\n" +
+				"By default NewFs probes the account's member tier (vip userIdentity) " +
+				"and skips files larger than the tier's single-file upload limit " +
+				"(no-member 5G / silver 8G / gold 20G / diamond 500G). Set this to " +
+				"skip that probe and upload files of any size, letting the server " +
+				"reject an oversized file (04010319 权益不足) instead. Default false.",
+			Default:  false,
 			Advanced: true,
 		}, {
 			Name:     config.ConfigEncoding,
@@ -346,6 +357,13 @@ func (f *Fs) queryMemberLevel(ctx context.Context) (typeCode, typeName string, e
 // only then is a live probe issued. Any probe failure is fail-open (记为 0,只记
 // Debug 日志), never blocking the mount.
 func (f *Fs) probeAndCacheMemberLevel(ctx context.Context) {
+	// no_member_check disables the whole member-tier size guard: do not probe,
+	// do not cache, and treat the limit as 0 (unlimited) so nothing is skipped
+	// client-side. The server still rejects oversized files (04010319 权益不足).
+	if f.opt.NoMemberCheck {
+		f.memberMaxFileSize = 0
+		return
+	}
 	if f.opt.MaxFileSize > 0 {
 		f.memberMaxFileSize = int64(f.opt.MaxFileSize)
 		return
@@ -381,7 +399,11 @@ func (f *Fs) probeAndCacheMemberLevel(ctx context.Context) {
 
 // maxFileSize returns the effective single-file upload limit: an explicit
 // max_file_size overrides the detected member limit; 0 means no limit.
+// no_member_check disables the guard entirely (always 0 / unlimited).
 func (f *Fs) maxFileSize() int64 {
+	if f.opt.NoMemberCheck {
+		return 0
+	}
 	if f.opt.MaxFileSize > 0 {
 		return int64(f.opt.MaxFileSize)
 	}
