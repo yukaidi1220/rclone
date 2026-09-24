@@ -109,13 +109,18 @@ const (
 	dirFindAttempts = 4
 	dirFindDelay    = 2 * time.Second
 
-	// renameDeadline bounds the rename retry loop after Update's delete step:
-	// the name index is released asynchronously, and the pacer's default budget
-	// (~4.5s) is too short.
+	// renameDeadline bounds the rename retry loop in Update and the copy/move
+	// paths: the name index is released asynchronously after a delete, and the
+	// pacer's default budget (~4.5s) is too short.
 	renameDeadline = 60 * time.Second
 
 	// tempSuffix is the suffix appended to Update's temporary upload name.
 	tempSuffix = ".rclone-tmp-"
+
+	// backupSuffix is the suffix appended to the OLD object's name while an
+	// Update swaps in new content, so the old bytes stay reachable (and
+	// restorable) until the new object has taken over the real name.
+	backupSuffix = ".rclone-old-"
 
 	// recyclePageSize is the page size for QueryRecycleData. Whether the
 	// server honours pageNum is unknown (early probing was inconclusive
@@ -726,6 +731,15 @@ type Fs struct {
 	zoneMu     *sync.Mutex // protects zoneURL / zoneLoaded (a pointer so the NewFs tempF copy is safe)
 	zoneURL    string      // upload endpoint from GetZoneInfo, lazily discovered
 	zoneLoaded bool        // whether zoneURL has been fetched successfully
+
+	// renameDeadlineOverride shortens renameWithBackoff's deadline; tests set
+	// it so a persistently failing rename does not sleep for the full budget.
+	renameDeadlineOverride time.Duration
+
+	// listBudgetOverride shortens the eventual-consistency listing budget
+	// (copyVisibilityBudget); tests set it so a missing entry does not stall
+	// for the full budget.
+	listBudgetOverride time.Duration
 }
 
 // Object describes a wopan object
@@ -1702,9 +1716,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 // Update in to the object with the modTime given of the given size.
 //
 // Direct overwrite cannot change the mtime, so the new content is uploaded
-// under a temporary name, the old object is deleted, and the temp is renamed
-// into place. The receiver is then refreshed in place so that verify (which
-// reuses it) compares against the new object.
+// under a temporary name, the old object is parked under a backup name, and the
+// temp is renamed into place; the backup is dropped once the new content owns
+// the name. The old object is never deleted before its replacement is complete,
+// so a failed or interrupted update leaves the file readable. The receiver is
+// then refreshed in place so that verify (which reuses it) compares against the
+// new object.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	size := src.Size()
 	if size < 0 {
@@ -1717,10 +1734,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if err != nil {
 		return err
 	}
-	// Step 3 renames the temp into the existing name. A name the server would
-	// silently truncate (>100 runes, e.g. created from the app) must fail
-	// before anything is uploaded or deleted - otherwise the old object is
-	// gone and the content reappears under a truncated name.
+	// The install rename (step 3) puts the new object under this exact name. A
+	// name the server would silently truncate (>100 runes, e.g. created from
+	// the app) must fail before anything is uploaded or renamed - otherwise the
+	// update cannot ever complete under the name the user asked for.
 	if err := validateName(leaf); err != nil {
 		return err
 	}
@@ -1730,32 +1747,101 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if err := validateName(leaf); err != nil {
 		return err
 	}
-	tempLeaf := tempName(leaf)
 
-	// Step 1: upload the new content under a temporary name. A failure here
-	// is reported as-is and may be retried whole: a mid-stream failure leaves
-	// nothing behind, and the rare lost-response case leaves a tmp orphan that
-	// sync cleans up (§4.8.3).
+	// Lossless Update, in four steps:
+	//
+	//	1. upload the new content under a temporary name
+	//	2. park the old object under a backup name
+	//	3. rename the temporary object onto the real name
+	//	4. drop the backup
+	//
+	// The old content is untouched until the new content is completely on the
+	// server, so a failed or interrupted upload leaves the file readable the
+	// whole time, and the window in which the real name is absent spans two
+	// renames rather than the whole upload.
+	tempLeaf := tempName(o.fs.opt.Enc, leaf)
+
+	// Step 1. A failure here is reported as-is and may be retried whole: the
+	// old object is untouched. A multipart failure leaves only orphaned parts,
+	// which are not visible as a file; a single-part upload whose response was
+	// lost can leave a temp file behind, which costs quota and is removable
+	// with --include "*rclone-tmp-*".
 	tmpData, err := o.fs.uploadSingle(ctx, in, dirID, tempLeaf, size, src)
 	if err != nil {
 		return err
 	}
 
-	// Steps 2 and 3 happen after the temp object exists. Any failure from here
-	// on must not trigger copy.go's whole-file retry (which would upload yet
-	// another temp each round), and must never delete the temp - once the rename
-	// result is unknown, the temp id IS the new file's id.
-	//
-	// Step 2: delete the old object. The server is idempotent here.
-	if err := o.fs.deleteFile(ctx, o.id); err != nil {
-		return fserrors.NoLowLevelRetryError(fmt.Errorf("wopan: delete old object: %w", err))
+	// From here on the temp object exists, so a whole-file retry could never
+	// repair the state it left: it would upload yet another temp every round.
+	// Every error below is marked NoLowLevelRetry to suppress that retry, and
+	// renameWithBackoff strips the pacer's RetryError marker at the source so
+	// the marking actually holds for transport-level failures too. Nothing is
+	// deleted on a path whose outcome is unknown: once a rename result is
+	// unknown, the id it was issued for IS the file's id.
+	oldID := o.id
+	backupLeaf := backupName(o.fs.opt.Enc, leaf)
+
+	// Step 2: park the old object. Only its name moves - the id and the bytes
+	// are unchanged - so this is reversible until step 3 succeeds.
+	if err := o.fs.renameWithBackoff(ctx, oldID, backupLeaf); err != nil {
+		// Nothing is deleted here: the park's outcome is uncertain (the request
+		// may have landed), so the old content is either still under the real
+		// name or under backupLeaf - both recoverable. Deleting the temp would
+		// not help either: if the park landed, the temp is the only copy of
+		// the new content, and a stray temp only costs quota anyway
+		// (removable with --include "*rclone-tmp-*").
+		return noLowLevelRetry(fmt.Errorf("wopan: rename old object to the backup name %q: %w", backupLeaf, err))
 	}
-	// Step 3: rename the temp into place, with a time-deadline backoff.
+
+	// Step 3: move the new content onto the real name.
 	if err := o.fs.renameWithBackoff(ctx, tmpData.WcFileID, leaf); err != nil {
-		return fserrors.NoLowLevelRetryError(fmt.Errorf("wopan: rename temp object: %w", err))
+		// A failed rename does not mean the move did not happen: if the
+		// response was lost, the install may well have landed. The server
+		// never overwrites on rename, so a listing settles it - and the two
+		// answers need opposite handling.
+		//
+		//   - the name holds the NEW id: the install landed. The update has
+		//     succeeded; report that, and let step 4 drop the backup.
+		//   - the name does not hold it: the install did not land. Put the old
+		//     object back under its own name.
+		//
+		// The listing is best-effort: if it fails, the safe reading is "did not
+		// land" (the restore is harmless when it did land - it simply fails
+		// with the name taken - whereas treating a non-landed install as
+		// success would leave the real name empty).
+		landed, lerr := o.fs.leafHolds(ctx, dirID, leaf, tmpData.WcFileID)
+		if lerr != nil {
+			fs.Debugf(o, "wopan: install rename failed (%v) and the confirming listing failed too (%v), assuming it did not land", err, lerr)
+		}
+		if landed {
+			fs.Debugf(o, "wopan: install rename reported %v but %q holds the new object, so the update succeeded", err, leaf)
+		} else {
+			// Put the old object back under its own name. If even that fails,
+			// the old content is still intact under backupLeaf, which the
+			// error names so the file can be recovered by hand.
+			//
+			// The temp object is deliberately NOT deleted here: the listing
+			// may have been wrong (or raced a concurrent writer), in which
+			// case the temp id holds the only copy of the new content.
+			if rerr := o.fs.renameWithBackoff(ctx, oldID, leaf); rerr != nil {
+				return noLowLevelRetry(fmt.Errorf(
+					"wopan: rename new object to %q: %w (the previous content is still intact under the backup name %q, but renaming it back to %q also failed: %v)",
+					leaf, err, backupLeaf, leaf, rerr))
+			}
+			return noLowLevelRetry(fmt.Errorf("wopan: rename new object to %q: %w", leaf, err))
+		}
 	}
-	// Step 4: refresh the receiver in place, in pure memory.
+
+	// The new content owns the name now, so the update has succeeded. Refresh
+	// the receiver before step 4 so that a failure to drop the backup cannot
+	// turn a completed update into a reported error.
 	o.refreshFromUpload(ctx, src, tmpData, size)
+
+	// Step 4: drop the backup. The file is already correct, so a failure here
+	// only leaks quota - never fail the update over it.
+	if err := o.fs.deleteFile(ctx, oldID); err != nil {
+		fs.Errorf(o, "wopan: update succeeded but removing the backup %q failed, it still consumes quota: %v", backupLeaf, err)
+	}
 	return nil
 }
 
@@ -1768,9 +1854,10 @@ func (o *Object) Remove(ctx context.Context) error {
 // recycle-bin entries the delete created.
 //
 // This is the single collection point for file deletion: Remove and Update's
-// step 2 both go through here, so the snapshot-before-delete ordering lives in
-// one place. The snapshot is taken BEFORE the delete (red line) - entries
-// already in it belong to the user and must never be destroyed.
+// step 4 (dropping the parked backup) both go through here, so the
+// snapshot-before-delete ordering lives in one place. The snapshot is taken
+// BEFORE the delete (red line) - entries already in it belong to the user and
+// must never be destroyed.
 func (f *Fs) deleteFile(ctx context.Context, id string) error {
 	var snap map[string][]string
 	if f.opt.HardDelete {
@@ -1839,17 +1926,40 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 // tempName builds Update's temporary upload name, keeping the result within the
 // 100-rune name limit.
-func tempName(leaf string) string {
-	return truncateName(leaf, tempSuffix+random.String(8))
+func tempName(enc encoder.MultiEncoder, leaf string) string {
+	return truncateName(enc, leaf, tempSuffix+random.String(8))
+}
+
+// backupName builds the name the OLD object is parked under while Update swaps
+// in new content. Like tempName it stays within the 100-rune limit.
+func backupName(enc encoder.MultiEncoder, leaf string) string {
+	return truncateName(enc, leaf, backupSuffix+random.String(8))
 }
 
 // truncateName appends suffix to leaf, truncating leaf first so the total stays
 // within the 100-rune name limit.
-func truncateName(leaf, suffix string) string {
+//
+// Truncating an ENCODED name is not just a matter of cutting at a rune
+// boundary: the encoder represents a reserved character as an escape group
+// (QuoteRune plus one rune, or QuoteRune plus two hex digits for an invalid
+// byte), so a cut inside a group leaves a name that decodes to something else
+// entirely - a stray QuoteRune, or hex digits read back as ordinary characters.
+// The encoder is therefore used as its own oracle: a well-formed encoded name
+// survives a decode/re-encode round trip unchanged, so trailing runes are
+// dropped until that holds. Only a handful of runes are ever affected, because
+// malformedness is confined to the tail.
+func truncateName(enc encoder.MultiEncoder, leaf, suffix string) string {
 	max := 100 - utf8.RuneCountInString(suffix)
 	runes := []rune(leaf)
 	if len(runes) > max {
 		runes = runes[:max]
+		for len(runes) > 0 {
+			s := string(runes)
+			if enc.FromStandardName(enc.ToStandardName(s)) == s {
+				break
+			}
+			runes = runes[:len(runes)-1]
+		}
 	}
 	return string(runes) + suffix
 }
@@ -2379,6 +2489,111 @@ func (f *Fs) renameObject(ctx context.Context, id, name string) error {
 	})
 }
 
+// noLowLevelRetry marks err as not worthy of copy.go's whole-file retry.
+//
+// fserrors.NoLowLevelRetryError alone is not enough for an error that came back
+// from f.pacer.Call: the pacer wraps an exhausted-retry transport failure in
+// fserrors.RetryError (fs/pacer.go pacerInvoker), and copy.go tests
+// IsRetryError BEFORE ShouldRetry - and ShouldRetry is the only place the
+// NoLowLevelRetry marker is honoured. Without stripping the pacer's marker
+// first, the whole-file retry fires anyway and re-uploads the file, which is
+// precisely what the marker exists to prevent. Business errors are unaffected:
+// the pacer does not wrap those, so this is a no-op for them.
+func noLowLevelRetry(err error) error {
+	return fserrors.NoLowLevelRetryError(stripPacerRetry(err))
+}
+
+// stripPacerRetry removes the fserrors.RetryError marker that f.pacer.Call adds
+// to an exhausted-retry transport failure.
+//
+// fserrors.IsRetryError walks the WHOLE error chain, so a marker anywhere in it
+// counts. That is why callers must strip at the source, before any fmt.Errorf
+// adds context on top: once a marker is buried, removing it would mean throwing
+// away the surrounding message. Here the marker is the outermost wrapper, which
+// is the shape pacerInvoker produces.
+func stripPacerRetry(err error) error {
+	for {
+		if _, ok := err.(fserrors.Retrier); !ok {
+			return err
+		}
+		u, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return err
+		}
+		inner := u.Unwrap()
+		if inner == nil {
+			return err
+		}
+		err = inner
+	}
+}
+
+// renameTimeout returns the rename retry deadline. It is a method so tests can
+// shorten the 60s production budget; without that a test driving a persistently
+// failing rename would sleep through the whole backoff.
+func (f *Fs) renameTimeout() time.Duration {
+	if f.renameDeadlineOverride > 0 {
+		return f.renameDeadlineOverride
+	}
+	return renameDeadline
+}
+
+// listBudget returns the budget for waiting out the listing's visibility delay.
+// It is a method so tests can shorten it.
+func (f *Fs) listBudget() time.Duration {
+	if f.listBudgetOverride > 0 {
+		return f.listBudgetOverride
+	}
+	return copyVisibilityBudget
+}
+
+// leafHolds reports whether the file named leaf currently has the given id,
+// waiting out the listing's visibility delay.
+//
+// leaf must be in the SAME encoded form the rename was issued with; the
+// conversion to the standard form that listings use happens here, so a caller
+// cannot accidentally compare an encoded name against standard ones.
+//
+// It is the oracle for a rename whose outcome is unknown. The server never
+// overwrites on rename, so if the name is held by the very object that was being
+// moved there, the move landed; a different id means somebody else owns the name
+// now. An entry that is absent at the end of the budget reports false.
+func (f *Fs) leafHolds(ctx context.Context, dirID, leaf, id string) (bool, error) {
+	// listDirEntries returns standard names.
+	standard := f.opt.Enc.ToStandardName(leaf)
+	deadline := time.Now().Add(f.listBudget())
+	backoff := time.Second
+	for {
+		entries, err := f.listDirEntries(ctx, dirID)
+		if err != nil {
+			return false, err
+		}
+		for _, item := range entries {
+			if item.Type == fileTypeFile && strings.EqualFold(item.Name, standard) {
+				return item.ID == id, nil
+			}
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false, nil
+		}
+		// Never oversleep past the deadline: the backoff starts at a second,
+		// which would otherwise dwarf a short budget.
+		wait := backoff
+		if wait > remaining {
+			wait = remaining
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(wait):
+		}
+		if backoff < 8*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
 // renameWithBackoff renames a file, retrying transiently until a time deadline.
 //
 // The name index is released asynchronously after a delete, so a rename to a
@@ -2389,7 +2604,7 @@ func (f *Fs) renameObject(ctx context.Context, id, name string) error {
 // delays the terminal error for a genuine concurrent-update conflict. The
 // pacer's default budget (~4.5s) is too short, so the deadline is tracked here.
 func (f *Fs) renameWithBackoff(ctx context.Context, id, name string) error {
-	deadline := time.Now().Add(renameDeadline)
+	deadline := time.Now().Add(f.renameTimeout())
 	start := time.Now()
 	backoff := time.Second
 	for {
@@ -2399,6 +2614,13 @@ func (f *Fs) renameWithBackoff(ctx context.Context, id, name string) error {
 		if err == nil {
 			return nil
 		}
+		// Drop the pacer's RetryError marker here, at the source: this function
+		// has already spent its own retry budget, so telling a caller to retry
+		// again is misleading, and every caller wraps the error with context -
+		// once the marker is buried under a fmt.Errorf it can no longer be
+		// removed, and copy.go's IsRetryError (which walks the whole chain)
+		// would trigger a whole-file retry that this marker exists to prevent.
+		err = stripPacerRetry(err)
 		code := ""
 		var ae *apiError
 		if asAPIError(err, &ae) {

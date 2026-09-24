@@ -235,10 +235,12 @@ degrades to the slower transfer instead of corrupting data.
   into itself. Wait a few seconds and repeat the command - the retry applies
   cleanly.
 - **Renaming onto an existing name fails with `file name already in use`**;
-  the server never overwrites on rename. When two concurrent updates race,
-  the loser reports the error and the next run repairs it. A rename that
+  the server never overwrites on rename. A rename that
   differs only in case (`Case.txt` → `case.txt`) is accepted and then
-  silently does nothing.
+  silently does nothing. This also governs concurrent updates of the same
+  file: the loser's restore cannot win back a name the winner has already
+  taken, so it reports an error naming the `.rclone-old-` backup it left
+  behind (see "Transfers and temporary files") and the next run repairs it.
 - **Names are stored verbatim, including characters other services reject.**
   A fullwidth question mark (`？`, U+FF1F) and an ASCII `?` are two different
   names and can coexist in one directory, and trailing spaces, dots, tabs
@@ -275,11 +277,30 @@ is using the directory while another client deletes it.
 
 ## Transfers and temporary files
 
-Updating an existing file uploads the new content under a temporary name
-(`name.rclone-tmp-XXXXXXXX`) and then renames it over the old one. If rclone
-is interrupted between the two steps, the temporary file may remain on the
-server. It never overwrites anything, but it does consume quota. Leftover
-temporary files can be removed with:
+Updating an existing file is lossless: the new content is uploaded under a
+temporary name (`name.rclone-tmp-XXXXXXXX`), the old file is then renamed to
+`name.rclone-old-XXXXXXXX`, and only once that has succeeded is the new file
+renamed onto the real name. The old file is therefore never deleted before its
+replacement is complete, and a failed or interrupted upload leaves the file
+readable under its own name.
+
+If the final rename fails, rclone checks which file actually holds the real name:
+if the new content got there after all (the rename may have taken effect even
+though its response was lost) the update counts as successful and the backup is
+dropped; otherwise the old file is renamed back. If the old file cannot be
+restored either, the error names the `.rclone-old-` backup that still holds the
+previous content.
+
+If rclone is killed mid-update, a temporary or backup file may remain on the
+server. Neither overwrites anything, but both consume quota.
+
+A `.rclone-old-` file must not be deleted blindly: if the process was killed
+between the two renames, the old content lives only under the backup name, and
+deleting it loses the file. Check that the real name exists first, and recover a
+missing file by renaming the backup back to the real name.
+
+Leftover `.rclone-tmp-` files are safe to remove once the real name is present,
+since the new content is re-uploaded on the next attempt:
 
 ```console
 rclone delete remote:path --include "*rclone-tmp-*" --rmdirs
