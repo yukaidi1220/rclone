@@ -1504,8 +1504,16 @@ func (f *Fs) String() string {
 // Features returns the optional features of this Fs
 func (f *Fs) Features() *fs.Features { return f.features }
 
-// Precision return the precision of this Fs
-func (f *Fs) Precision() time.Duration { return time.Second }
+// Precision returns the precision of this Fs.
+//
+// ModTimeNotSupported is deliberate: the server stamps its own clock on every
+// upload and ignores any client-supplied mtime, so a returned ModTime never
+// matches the one the caller asked for. With a real precision rclone sees the
+// mismatch, cannot fix it without re-uploading (SetModTime returns
+// ErrorCantSetModTime), and so rewrites every file on every sync. Reporting
+// "not supported" makes rclone compare on size instead - unchanged files are
+// left alone. Use --checksum to compare content where the size matches.
+func (f *Fs) Precision() time.Duration { return fs.ModTimeNotSupported }
 
 // Hashes returns the supported hash sets.
 // The personal-space listing carries a server-computed SHA-256
