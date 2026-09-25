@@ -622,8 +622,9 @@ func init() {
 			Help:      "Refresh token. Obtain from an existing OpenList wopan storage config, or by capturing the app login flow.",
 			Sensitive: true,
 		}, {
-			Name:      "access_token",
-			Help:      "Access token - refreshed automatically, do not set manually.",
+			Name: "access_token",
+			Help: "Access token - refreshed automatically, do not set manually.\n\n" +
+				"Only set this if you want a fully static token that rclone never refreshes.",
 			Advanced:  true,
 			Sensitive: true,
 		}, {
@@ -636,13 +637,21 @@ func init() {
 			Advanced:  true,
 			Sensitive: true,
 		}, {
-			Name:     "no_refresh",
-			Help:     "Never refresh the token. Use when the same account is shared with another program.",
+			Name: "no_refresh",
+			Help: "Never refresh the token. Use when the same account is shared with another program.\n\n" +
+				"Set this when the same account is also in use by another program such as " +
+				"OpenList - see [Sharing an account with OpenList](#sharing-an-account-with-openlist) below.",
 			Default:  false,
 			Advanced: true,
 		}, {
-			Name:     "hard_delete",
-			Help:     "Delete permanently instead of putting files into the recycle bin.",
+			Name: "hard_delete",
+			Help: "Delete permanently instead of putting files into the recycle bin.\n\n" +
+				"Deleting files from the recycle bin still works, so quota is only released " +
+				"immediately with this flag. Note that permanent deletion works by purging the " +
+				"file from the recycle bin: when the bin holds more entries than the server is " +
+				"willing to page out, files beyond that page can only be moved into the bin " +
+				"(rclone logs a warning) - empty the recycle bin from the app to restore full " +
+				"hard delete.",
 			Default:  false,
 			Advanced: true,
 		}, {
@@ -664,11 +673,11 @@ func init() {
 			Advanced: true,
 		}, {
 			Name: "upload_cutoff",
-			Help: "Cutoff for switching to chunked upload.\n\n" +
+			Help: "Cutoff for switching to chunked upload. Defaults to 64Mi.\n\n" +
 				"Any files larger than this will be uploaded in chunks of chunk_size. " +
 				"Smaller files are sent as a single request, where the server's ETag is " +
 				"the content MD5 immediately at upload time, while chunked files never " +
-				"carry a content MD5.",
+				"carry a content MD5 - see [Chunked uploads](#chunked-uploads) below.",
 			Default:  fs.SizeSuffix(64 * 1024 * 1024),
 			Advanced: true,
 		}, {
@@ -690,7 +699,8 @@ func init() {
 				"This is the number of chunks of the same file that are uploaded " +
 				"concurrently. The server accepts out-of-order parts within one " +
 				"upload session and assembles them by part index. Increasing this " +
-				"may speed up transfers of large files, at the cost of more memory.",
+				"may speed up transfers of large files, at the cost of more memory - " +
+				"see [Chunked uploads](#chunked-uploads) below.",
 			Default:  4,
 			Advanced: true,
 		}, {
@@ -701,12 +711,20 @@ func init() {
 			// before being encrypted, and Go would silently replace invalid
 			// UTF-8 bytes with U+FFFD, making the name irreversible.
 			//
-			// No Left*/Right*/Percent flags: List returns the stored name
-			// verbatim without a ToStandardName pass, so any extra wire-side
-			// escaping could never be undone on read. fstests FsEncoding
-			// round-trips all cases with this setting, i.e. the server stores
-			// trailing spaces, dots, HT/VT and percent signs verbatim.
-			Default: encoder.Standard | encoder.EncodeInvalidUtf8,
+			// EncodeQuestion|EncodeAsterisk|EncodeLtGt is required: the
+			// server refuses ? * < > in a name with
+			// '1009 名称中含有非法字符', and the upload path reports that
+			// rejection as a bare HTTP 500. The encoder's fullwidth
+			// substitutes for exactly those characters are stored verbatim,
+			// so escaping them is what makes such names work at all. The
+			// other characters EncodeWin would escape (: " |) are stored
+			// verbatim by the server and are left alone.
+			//
+			// No Left*/Right*/Percent flags: List decodes through
+			// ToStandardName, so the wire-side spelling of a name is what
+			// comes back; fstests FsEncoding round-trips all cases with this
+			// setting.
+			Default: encoder.Standard | encoder.EncodeQuestion | encoder.EncodeAsterisk | encoder.EncodeLtGt | encoder.EncodeInvalidUtf8,
 		}},
 	})
 }
