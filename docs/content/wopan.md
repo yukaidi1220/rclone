@@ -98,9 +98,12 @@ The advanced options are:
   out-of-order parts within one upload session and assembles them by part
   index - see [Chunked uploads](#chunked-uploads) below.
 - `--wopan-encoding`: the encoding for the backend. The default is `Standard`
-  plus `EncodeInvalidUtf8` and should normally be left alone. The server
-  stores file names verbatim (including trailing spaces, dots and tabs), so
-  no additional escaping flags are needed.
+  plus `EncodeQuestion`, `EncodeAsterisk`, `EncodeLtGt` and `EncodeInvalidUtf8`
+  and should normally be left alone. The server rejects `?`, `*`, `<` and `>`
+  in a file name, so the encoder escapes them to their fullwidth equivalents,
+  which the server stores verbatim. The other characters those flags would
+  cover in a Windows-style encoding (`:`, `"` and `|`) are stored verbatim and
+  are deliberately left unescaped, as are trailing spaces, dots and tabs.
 
 ## Modified time and hashes
 

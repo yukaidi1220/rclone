@@ -314,3 +314,81 @@ func TestProbeCase60HardDeleteTiming(t *testing.T) {
 		t.Logf("case60: hard delete #%d took %s", i, time.Since(start).Round(time.Millisecond))
 	}
 }
+
+// TestProbeLosslessUpdate exercises the four-step lossless Update against a real
+// account: upload new content under a temp name, park the old object, install
+// the new one under the real name, drop the backup. The point is that the real
+// name is readable with the OLD content right up until the install, and with
+// the NEW content afterwards - never absent, never stale.
+func TestProbeLosslessUpdate(t *testing.T) {
+	if os.Getenv("WOPAN_PROBE") == "" {
+		t.Skip("set WOPAN_PROBE=1")
+	}
+	f := probeOpenFs(t)
+	ctx := context.Background()
+
+	// A same-name second upload with a different size is exactly the case the
+	// lossless flow exists for.
+	const first = "first-content-4b"               // 16 bytes
+	const second = "second-content-that-is-longer" // 30 bytes
+	obj := probePut(ctx, t, f, "update-target.txt", first)
+	t.Logf("step 0: uploaded %d bytes, id=%s", len(first), obj.id)
+
+	got, err := probeReadBestEffort(ctx, obj)
+	require.NoError(t, err)
+	t.Logf("step 0: content before update = %q", got)
+
+	// The real Update.
+	src := fsobject.NewStaticObjectInfo(probeRoot+"/update-target.txt", time.Now(), int64(len(second)), true, nil, nil)
+	require.NoError(t, obj.Update(ctx, strings.NewReader(second), src))
+	t.Logf("step 1: Update returned; object now reports size=%d id=%s", obj.size, obj.id)
+
+	// The name must hold the NEW content.
+	time.Sleep(3 * time.Second)
+	after, err := probeReadBestEffort(ctx, obj)
+	require.NoError(t, err)
+	t.Logf("step 2: content after update = %q (want %q)", after, second)
+	if after != second {
+		t.Errorf("after Update the file reads %q, want %q", after, second)
+	}
+
+	// No temp or backup name may survive the completed update.
+	rootID := mustDirID(ctx, t, f, "")
+	entries, err := f.listDirEntries(ctx, rootID)
+	require.NoError(t, err)
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name)
+		if strings.Contains(e.Name, "rclone-tmp-") || strings.Contains(e.Name, "rclone-old-") {
+			t.Errorf("a temp/backup name survived a completed update: %q", e.Name)
+		}
+	}
+	t.Logf("step 3: listing after update = %v", names)
+}
+
+// TestProbeLosslessUpdateSameSize exercises the same flow with the SAME size and
+// different bytes. A size-based staleness check cannot detect this case, so it
+// is the one that catches a server reusing old content for a name it has seen
+// before.
+func TestProbeLosslessUpdateSameSize(t *testing.T) {
+	if os.Getenv("WOPAN_PROBE") == "" {
+		t.Skip("set WOPAN_PROBE=1")
+	}
+	f := probeOpenFs(t)
+	ctx := context.Background()
+
+	const first = "AAAAAAAAAAAAAAAAAAAA"  // 20 bytes
+	const second = "BBBBBBBBBBBBBBBBBBBB" // 20 bytes, same size
+	obj := probePut(ctx, t, f, "same-size.txt", first)
+
+	src := fsobject.NewStaticObjectInfo(probeRoot+"/same-size.txt", time.Now(), int64(len(second)), true, nil, nil)
+	require.NoError(t, obj.Update(ctx, strings.NewReader(second), src))
+
+	time.Sleep(3 * time.Second)
+	after, err := probeReadBestEffort(ctx, obj)
+	require.NoError(t, err)
+	t.Logf("same-size update: read %q, want %q (size %d)", after, second, obj.size)
+	if after != second {
+		t.Errorf("same-size Update left %q, want %q - the server reused the old content", after, second)
+	}
+}
