@@ -129,8 +129,11 @@ func init() {
 				Help:  "Family cloud (新家庭云)",
 			}},
 		}, {
-			Name:     "family_id",
-			Help:     "Family cloud ID (required when space is family).",
+			Name: "family_id",
+			Help: "Family cloud ID (required when space is family).\n\n" +
+				"A numeric id, e.g. 1303251918616070593. With exactly one family cloud it may be left " +
+				"blank and is auto-discovered; with several it must be set, and the backend refuses to " +
+				"guess. Family names can repeat, so only the id selects unambiguously.",
 			Advanced: true,
 		}, {
 			Name:      "root_folder_id",
@@ -139,7 +142,7 @@ func init() {
 			Sensitive: true,
 		}, {
 			Name: "user_domain_id",
-			Help: "The <user-domain-id>-style user domain id.\\n\\n" +
+			Help: "The <user-domain-id>-style user domain id.\n\n" +
 				"Found in the official client's request URLs ('u=' query param, " +
 				"also returned by user/getUser and queryFamilyCloud). Optional: " +
 				"when blank, the phone number is used where the server accepts it.",
@@ -147,7 +150,9 @@ func init() {
 		}, {
 			Name: "hard_delete",
 			Help: "Delete permanently instead of moving files to the recycle bin.\n\n" +
-				"Only applies to the personal space.",
+				"Only applies to the personal space. 139 exposes no API to list or " +
+				"restore the recycle bin, so a file deleted without this flag cannot " +
+				"be recovered through rclone.",
 			Default:  false,
 			Advanced: true,
 		}, {
@@ -161,18 +166,22 @@ func init() {
 		}, {
 			Name: "part_size",
 			Help: "Part size for uploads.\n\n" +
-				"Files larger than this are uploaded in parts of this size. Must be a multiple of 64 bytes. " +
-				"The official client uses 100 MiB.",
+				"Files larger than this are uploaded in parts of this size. Must be a multiple of 64 bytes; " +
+				"the server rejects parts smaller than 5 MiB. The official client uses 100 MiB. Larger " +
+				"parts mean fewer upload requests per file.",
 			Default:  fs.SizeSuffix(personalPartSize),
 			Advanced: true,
 		}, {
 			Name:     "upload_concurrency",
-			Help:     "Concurrency for part uploads within a single file.",
+			Help:     "Concurrency for part uploads within a single file. A higher value speeds up large-file uploads at the cost of more concurrent connections.",
 			Default:  4,
 			Advanced: true,
 		}, {
-			Name:     "region_code",
-			Help:     "userRegion 上传调度节点码,格式 province:city,如 531:543(江苏无锡)。官方 PC 客户端会随 create 发送;设置后 personal 上传也带 userRegion 以就近调度。留空则不发送。",
+			Name: "region_code",
+			Help: "Upload scheduling node code, in province:city form, e.g. 531:543 (Wuxi, Jiangsu).\n\n" +
+				"The official PC client sends this with /file/create; when set, personal-space " +
+				"uploads carry a userRegion so the server schedules a nearby upload CDN, which can " +
+				"noticeably affect node choice and throughput. Leave blank to omit.",
 			Advanced: true,
 		}, {
 			Name: "disable_http2",
@@ -189,7 +198,9 @@ func init() {
 				"0 (default) auto-detects the member tier (vip userIdentity) and uses " +
 				"no-member 5G / silver 8G / gold 20G / diamond 500G. Larger files are " +
 				"skipped with a NoRetryError instead of wasting a full multi-part upload " +
-				"that the server rejects with 04010319 (权益不足).",
+				"that the server rejects with 04010319 (权益不足). Set a non-zero value to " +
+				"force a specific cap regardless of the detected tier. Ignored when " +
+				"no_member_check is set.",
 			Default:  fs.SizeSuffix(0),
 			Advanced: true,
 		}, {
@@ -246,6 +257,20 @@ type apiError struct {
 func (e *apiError) Error() string {
 	return fmt.Sprintf("yun139: API error %s: %s", e.Code, e.Message)
 }
+
+// familyNotFoundCode is the family-space answer when modifyContentInfo is
+// asked to rename content the server has not indexed yet. A rename issued
+// immediately after the task that created the entry can see this, so the
+// caller retries it for a bounded window.
+const familyNotFoundCode = "1809111402"
+
+// copyVisibilityTimeout bounds the wait for an entry a copy or move task
+// just created to become visible, and the retry of a rename that races the
+// server's indexing of it. It is a variable so tests can shorten it.
+var copyVisibilityTimeout = 30 * time.Second
+
+// copyVisibilityInterval is the pause between those visibility reads.
+const copyVisibilityInterval = time.Second
 
 // ------------------------------------------------------- member level ------
 
@@ -2148,9 +2173,15 @@ func quotaToUsage(diskMiB, freeMiB int64) *fs.Usage {
 // ============================================================================
 
 // uploadResult is the outcome of one Put/Update upload.
+//
+// fileName is the name the server reported for the entry it created, empty
+// when the reply omitted it. It is not defaulted to the requested name: the
+// caller has to distinguish "the server said it stored this name" from "the
+// server said nothing", and only the first is evidence of where the upload
+// landed.
 type uploadResult struct {
 	fileID   string
-	fileName string // server-side name after auto_rename
+	fileName string
 	hashHex  string
 }
 
@@ -2206,17 +2237,34 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 			src.Remote(), size, limit, f.memberLevelName)
 		return nil, errTooLarge(src.Remote(), size, limit, f.memberLevelName)
 	}
-	leaf, dirID, err := f.dirCache.FindPath(ctx, src.Remote(), true)
+	leafStd, dirID, err := f.dirCache.FindPath(ctx, src.Remote(), true)
 	if err != nil {
 		return nil, err
 	}
 	if err := f.validateName(src.Remote()); err != nil {
 		return nil, err
 	}
-	leaf = f.opt.Enc.FromStandardName(leaf)
+	leaf := f.opt.Enc.FromStandardName(leafStd)
 	res, err := f.uploadFile(ctx, in, dirID, leaf, size)
 	if err != nil {
+		// The create call may have registered an entry before the upload
+		// failed; drop it so a failed Put leaves nothing at the target path.
+		if res != nil && res.fileID != "" {
+			f.discardUpload(ctx, res.fileID, dirID, f.space == spaceFamily)
+		}
 		return nil, err
+	}
+	// /hcy/file/create never overwrites: a name the directory already holds
+	// makes the server store the content under a suffixed name instead. Put
+	// must write at the requested path, so land the upload there.
+	landed, err := f.uploadedLeaf(ctx, dirID, res, leafStd)
+	if err != nil {
+		return nil, err
+	}
+	if landed != leafStd {
+		if err := f.settleAutoRename(ctx, dirID, leafStd, res.fileID); err != nil {
+			return nil, err
+		}
 	}
 	o := &Object{
 		fs:      f,
@@ -2228,7 +2276,110 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		hashMu:  &sync.Mutex{},
 		urlMu:   &sync.Mutex{},
 	}
+	if f.space == spaceFamily {
+		o.serverPath = f.familySrvPath(dirID)
+	}
 	return o, nil
+}
+
+// settleAutoRename lands an upload the server stored under a different name
+// at the requested leaf. /hcy/file/create never overwrites: when the leaf is
+// already held, the new content goes to a suffixed name and the held entry
+// stays put. The held entry is parked under a backup name, the new content is
+// renamed into place, and the parked entry is then deleted. A failure before
+// the new content is in place restores the parked entry's name, so the
+// previous content is never lost.
+func (f *Fs) settleAutoRename(ctx context.Context, dirID, leafStd, newID string) error {
+	family := f.space == spaceFamily
+	var held *listEntry
+	var dirHeld bool
+	err := f.listAll(ctx, dirID, func(e listEntry) bool {
+		if strings.EqualFold(e.name, leafStd) {
+			if e.isDir {
+				dirHeld = true
+			} else {
+				held = &e
+			}
+			return true
+		}
+		return false
+	})
+	if err != nil {
+		return err
+	}
+	if dirHeld {
+		// A directory holds the requested name, so a file cannot take it and
+		// the rename would be stored under an appended name instead. Report
+		// that rather than a landing at a path that is still a directory.
+		f.discardUpload(ctx, newID, dirID, family)
+		return fmt.Errorf("yun139: cannot land %q: a directory holds that name", leafStd)
+	}
+	if held == nil || held.id == newID {
+		// Nothing holds the leaf any more; only the name is left to set.
+		if err := f.renameObject(ctx, newID, f.opt.Enc.FromStandardName(leafStd), dirID, family); err != nil {
+			f.discardUpload(ctx, newID, dirID, family)
+			return err
+		}
+		return nil
+	}
+	// The backup name is built from the held entry's own name, not from the
+	// requested leaf: the two can differ in case (the held entry is matched
+	// case-insensitively), and a backup built from the requested spelling would
+	// make the server append the entry's real extension to it.
+	backupLeaf := backupLeafName(held.name)
+	// The held entry is parked so the upload can take the leaf. A failed park
+	// does not mean the entry is still there: the server answers success when
+	// it stores the entry under a name other than the requested one, so the
+	// entry is located by id. Treating a moved entry as unmoved would leave it
+	// parked under a name nothing cleans up; treating an unmoved one as moved
+	// would abandon the leaf.
+	heldAt := backupLeaf
+	if err := f.renameObject(ctx, held.id, f.opt.Enc.FromStandardName(backupLeaf), dirID, family); err != nil {
+		name, found, lerr := f.entryName(ctx, dirID, held.id)
+		if lerr != nil || !found || strings.EqualFold(name, leafStd) {
+			f.discardUpload(ctx, newID, dirID, family)
+			return fmt.Errorf("yun139: park existing %q: %w", leafStd, err)
+		}
+		// The rename took effect under a name the reply did not report; the
+		// leaf is free, so the upload can still take it.
+		heldAt = name
+	}
+	if err := f.renameObject(ctx, newID, f.opt.Enc.FromStandardName(leafStd), dirID, family); err != nil {
+		// Put the held entry back under its name, then drop the upload that
+		// could not take its place.
+		if rerr := f.renameObject(ctx, held.id, f.opt.Enc.FromStandardName(leafStd), dirID, family); rerr != nil {
+			fs.Errorf(f, "yun139: restore %q after failed upload: %v (previous content remains at %q)", leafStd, rerr, heldAt)
+		}
+		f.discardUpload(ctx, newID, dirID, family)
+		return err
+	}
+	// The new content is in place; drop the parked entry. A failure here
+	// leaves the old content under the backup name, which the next upload
+	// of this leaf removes.
+	if err := f.deleteObject(ctx, held.id, held.srvPath, family); err != nil {
+		fs.Errorf(f, "yun139: delete parked %q after upload: %v", heldAt, err)
+	}
+	f.cleanupOldBackups(ctx, dirID, held.name, newID)
+	return nil
+}
+
+// discardUpload removes an upload that could not be given its requested name,
+// so a failed Put leaves no entry the caller never asked for. dirID supplies
+// the parent whose server-side path a family delete task addresses.
+func (f *Fs) discardUpload(ctx context.Context, id, dirID string, family bool) {
+	srvPath := ""
+	if family {
+		srvPath = f.familySrvPath(dirID)
+		if srvPath == "" {
+			if err := f.primeSrvPathFor(ctx, dirID); err != nil {
+				fs.Debugf(f, "yun139: prime srvPath for %s: %v", dirID, err)
+			}
+			srvPath = f.familySrvPath(dirID)
+		}
+	}
+	if err := f.deleteObject(ctx, id, srvPath, family); err != nil {
+		fs.Errorf(f, "yun139: remove upload %s that could not take its name: %v", id, err)
+	}
 }
 
 // uploadFile is the single upload pipeline used by both Put and Update.
@@ -2448,13 +2599,13 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	// exists under this name.
 	if resp.Success && resp.Data.FileID != "" &&
 		(resp.Data.RapidUpload || (resp.Data.Exists != nil && *resp.Data.Exists) || len(resp.Data.PartInfos) == 0) {
-		return &uploadResult{fileID: resp.Data.FileID, fileName: leaf, hashHex: hashHex}, nil
+		return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName, hashHex: hashHex}, nil
 	}
 	if !resp.Success {
 		return nil, noRetryOnMemberQuota(&apiError{Code: resp.Code, Message: resp.Message})
 	}
 	if len(resp.Data.PartInfos) == 0 {
-		return nil, errors.New("create returned no upload URL")
+		return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, errors.New("create returned no upload URL")
 	}
 	// PUT every part in parallel, in batches of maxPartsPerRequest.
 	// The first batch's URLs came from /file/create; the rest come from
@@ -2510,10 +2661,10 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 			err = f.call(ctx, u, urlBody, &urlResp)
 			return shouldRetry(ctx, err)
 		}); err != nil {
-			return nil, fmt.Errorf("getUploadUrl: %w", err)
+			return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, fmt.Errorf("getUploadUrl: %w", err)
 		}
 		if !urlResp.Success {
-			return nil, noRetryOnMemberQuota(&apiError{Code: urlResp.Code, Message: urlResp.Message})
+			return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, noRetryOnMemberQuota(&apiError{Code: urlResp.Code, Message: urlResp.Message})
 		}
 		allParts = append(allParts, urlResp.Data.PartInfos...)
 	}
@@ -2548,7 +2699,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return nil, fmt.Errorf("put part: %w", err)
+		return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, fmt.Errorf("put part: %w", err)
 	}
 	// Finally, mark the file complete. Mirrors the official client:
 	// contentHash + contentHashAlgorithm + fileId + uploadId.
@@ -2576,12 +2727,12 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		}
 	}
 	if err := f.call(ctx, cmplHost+cmplPath, cmpl, &cmplResp); err != nil {
-		return nil, noRetryOnMemberQuota(fmt.Errorf("complete: %w", err))
+		return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, noRetryOnMemberQuota(fmt.Errorf("complete: %w", err))
 	}
 	if !cmplResp.Success {
-		return nil, noRetryOnMemberQuota(&apiError{Code: cmplResp.Code, Message: cmplResp.Message})
+		return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, noRetryOnMemberQuota(&apiError{Code: cmplResp.Code, Message: cmplResp.Message})
 	}
-	return &uploadResult{fileID: resp.Data.FileID, fileName: leaf, hashHex: hashHex}, nil
+	return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName, hashHex: hashHex}, nil
 }
 
 // putPart PUTs a single part to its pre-signed URL.
@@ -2643,6 +2794,17 @@ func (f *Fs) putPart(ctx context.Context, partIdx, total int, r io.Reader, url s
 	return nil
 }
 
+// restoreOldName puts the old object back under the requested leaf after a
+// failed update. The object is addressed by id, so it returns to the requested
+// name even when a rename had stored it under a name this code did not choose.
+// A restore that fails names the place the content was last seen, so it is
+// still findable.
+func (o *Object) restoreOldName(ctx context.Context, leaf, dirID, lastSeen string) {
+	if err := o.fs.renameObject(ctx, o.id, leaf, dirID, o.fs.space == spaceFamily); err != nil {
+		fs.Errorf(o, "yun139: restore old name %q after failed update: %v (old content remains at %q)", leaf, err, lastSeen)
+	}
+}
+
 // Update in to the object with the modTime given of the given size.
 //
 // The 139 API has no in-place update, so the new content is uploaded under
@@ -2656,14 +2818,14 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if size == 0 {
 		return fs.ErrorCantUploadEmptyFiles
 	}
-	leaf, dirID, err := o.fs.dirCache.FindPath(ctx, o.remote, true)
+	leafStd, dirID, err := o.fs.dirCache.FindPath(ctx, o.remote, true)
 	if err != nil {
 		return err
 	}
 	if err := o.fs.validateName(o.remote); err != nil {
 		return err
 	}
-	leaf = o.fs.opt.Enc.FromStandardName(leaf)
+	leaf := o.fs.opt.Enc.FromStandardName(leafStd)
 
 	// Lossless Update: rename the old file away FIRST, upload the new
 	// file under the target name, and only delete the renamed old file
@@ -2680,64 +2842,212 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	// semantics: personal /hcy/file/update replaces the whole name,
 	// family modifyContentInfo keeps the extension, so use a backup
 	// name that keeps the same extension for family.
-	backupLeaf := leaf + ".rclone-old-" + random.String(8)
-	oldPath := o.remote
-	backupRemote := path.Join(path.Dir(o.remote), backupLeaf)
-	if err := o.fs.renameObject(ctx, o.id, o.fs.opt.Enc.FromStandardName(backupLeaf), dirID, o.fs.space == spaceFamily); err != nil {
-		// The rename is best-effort; if the server refuses (e.g. name
-		// too long), fall back to delete-then-upload.
-		fs.Debugf(o, "yun139: pre-rename failed (%v), falling back to delete-then-upload", err)
-		if err := o.fs.deleteObject(ctx, o.id, o.serverPath, o.fs.space == spaceFamily); err != nil {
-			return fserrors.NoLowLevelRetryError(fmt.Errorf("yun139: delete old object: %w", err))
+	// The backup name is built in the STANDARD domain and encoded once: the
+	// encoder is not a fixed point for every leaf (an invalid UTF-8 byte
+	// encodes to a multi-rune escape group), so encoding an already-encoded
+	// leaf would produce a name that decodes to something else.
+	backupLeaf := backupLeafName(leafStd)
+	family := o.fs.space == spaceFamily
+	oldID := o.id
+	oldAt := backupLeaf
+	// The old entry is parked before the upload so a failed update never
+	// leaves the requested path empty. A failed pre-rename does not mean the
+	// rename did not happen: the server answers success when it stores the
+	// entry under a name other than the requested one, so the entry is looked
+	// up by id to learn where it actually is. Assuming either way loses the
+	// old content - assuming it moved leaves it parked under a name the
+	// restore arm cannot find, assuming it stayed skips the restore.
+	oldMoved := false
+	if err := o.fs.renameObject(ctx, o.id, o.fs.opt.Enc.FromStandardName(backupLeaf), dirID, family); err != nil {
+		name, found, lerr := o.fs.entryName(ctx, dirID, o.id)
+		switch {
+		case lerr != nil:
+			return fmt.Errorf("yun139: update %q: pre-rename failed (%v) and the old entry could not be located: %w", leaf, err, lerr)
+		case !found:
+			return fmt.Errorf("yun139: update %q: pre-rename failed (%v) and the old entry is not in its directory", leaf, err)
+		case strings.EqualFold(name, leafStd):
+			// The rename did not take effect: the old content still holds
+			// the requested name, so the upload has to win it by itself.
+			fs.Debugf(o, "yun139: pre-rename failed (%v), uploading under the target name", err)
+		default:
+			// The rename took effect under a name the reply did not report.
+			fs.Debugf(o, "yun139: pre-rename stored the old entry as %q", name)
+			oldMoved = true
+			oldAt = name
 		}
-		backupRemote = ""
+	} else {
+		oldMoved = true
 	}
-	_ = oldPath
-	_ = backupRemote
 	res, err := o.fs.uploadFile(ctx, in, dirID, leaf, size)
 	if err != nil {
-		// Upload failed: try to restore the old file's name.
-		if backupRemote != "" {
-			if rerr := o.fs.renameObject(ctx, o.id, o.fs.opt.Enc.FromStandardName(leaf), dirID, o.fs.space == spaceFamily); rerr != nil {
-				fs.Errorf(o, "yun139: restore old name after failed update: %v", rerr)
-			}
+		// Upload failed: drop the entry it may have created, then put the old
+		// content back under the name the caller asked for. A create reply
+		// that names the entry the receiver came from is a dedup answer, not
+		// a new entry: discarding that id would destroy the old content,
+		// wherever the pre-rename left it.
+		if res != nil && res.fileID != "" && res.fileID != oldID {
+			o.fs.discardUpload(ctx, res.fileID, dirID, family)
+		}
+		if oldMoved {
+			o.restoreOldName(ctx, leaf, dirID, oldAt)
 		}
 		return err
 	}
-	// Upload complete: the new file is in place. Refresh the
-	// receiver, then delete the renamed old file. If the delete fails
-	// the new file is correct; the old file lingers under the backup
-	// name for the user to clean up.
-	oldID := o.id
+	// The upload must end up under the target name. A name the server still
+	// holds (the pre-rename failed, or a concurrent upload) makes it store the
+	// content under a suffixed name; landing it is the same operation Put
+	// performs, and it is lossless because settleAutoRename only drops the
+	// entry it parked.
+	landed, err := o.fs.uploadedLeaf(ctx, dirID, res, leafStd)
+	if err != nil {
+		if oldMoved {
+			o.restoreOldName(ctx, leaf, dirID, oldAt)
+		}
+		return err
+	}
+	if landed != leafStd {
+		if serr := o.fs.settleAutoRename(ctx, dirID, leafStd, res.fileID); serr != nil {
+			if oldMoved {
+				// Put the old object back under the name the caller asked
+				// for. If that name is taken the old content stays where it
+				// was last seen, which the error names.
+				o.restoreOldName(ctx, leaf, dirID, oldAt)
+			}
+			return fmt.Errorf("yun139: update %q: landing the upload failed: %w", leaf, serr)
+		}
+		// settleAutoRename dropped the entry that held the leaf. The parked
+		// old entry is not that one, and it is left to cleanupOldBackups
+		// below, which removes every backup of this leaf - so do not delete
+		// it here as well.
+		oldMoved = false
+	}
+	// Upload complete: the new file is in place. Refresh the receiver, then
+	// delete the old file. If the delete fails the new file is correct; the
+	// old file lingers under its backup name for the user to clean up.
 	o.id = res.fileID
 	o.size = size
 	o.modTime = src.ModTime(ctx)
 	o.hashMu.Lock()
 	o.sha256 = res.hashHex
 	o.hashMu.Unlock()
-	if backupRemote != "" {
+	// A rapidUpload that matched the old content's hash answers with the id of
+	// the entry it deduplicated against, which can be the parked old entry
+	// itself; deleting that id would remove the content the receiver now
+	// points at.
+	if oldMoved && oldID != res.fileID {
 		if err := o.fs.deleteObject(ctx, oldID, o.serverPath, o.fs.space == spaceFamily); err != nil {
-			fs.Errorf(o, "yun139: delete backup after update: %v", err)
+			fs.Errorf(o, "yun139: delete old content after update: %v", err)
 		}
 	}
 	// Clean up orphaned backups from a PREVIOUS killed run targeting the
 	// same file (a crash between pre-rename and the new upload leaves
 	// <name>.rclone-old-XXXX behind). Only touch entries whose base name
-	// starts with this object's leaf - never delete anything else.
-	o.fs.cleanupOldBackups(ctx, dirID, leaf)
+	// starts with this object's leaf - never delete anything else. The
+	// listing carries STANDARD names, so pass the standard leaf.
+	o.fs.cleanupOldBackups(ctx, dirID, leafStd, o.id)
 	o.fs.dirCache.FlushDir(path.Dir(o.remote))
 	return nil
 }
 
-// cleanupOldBackups deletes files in dirID whose names start with
-// leaf+".rclone-old-" - the leftovers of an Update that crashed after
-// renaming the old file away. The new file is already in place when
-// this runs, so the orphan is safe to remove.
-func (f *Fs) cleanupOldBackups(ctx context.Context, dirID, leaf string) {
-	prefix := leaf + ".rclone-old-"
+// backupParts splits a leaf into the part a backup name grows from and the
+// extension it must keep. A name that is all extension (".gitignore") has no
+// stem to build on: it keeps the empty stem and hands the whole name to ext,
+// so the backup still ends with it.
+func backupParts(leafStd string) (stem, ext string) {
+	ext = path.Ext(leafStd)
+	stem = strings.TrimSuffix(leafStd, ext)
+	return stem, ext
+}
+
+// backupLeafName builds the name an entry is parked under while an update
+// replaces it. The family space appends the renamed entry's own extension to a
+// requested name that does not end with it, so the backup keeps the leaf's
+// extension and a dotless leaf is parked under a dotless name: parking the
+// entry and restoring it both then land under the name that was asked for.
+// A leaf that is all extension (".gitignore") has no stem, so the marker goes
+// in front of the whole name instead and the backup still ends with it.
+func backupLeafName(leafStd string) string {
+	stem, ext := backupParts(leafStd)
+	if stem == "" {
+		return "rclone-old-" + random.String(8) + ext
+	}
+	return stem + "-rclone-old-" + random.String(8) + ext
+}
+
+// backupPrefix is the leading part of every backup name for a leaf, so a
+// listing can recognise the leftovers of an interrupted update.
+func backupPrefix(leafStd string) string {
+	stem, _ := backupParts(leafStd)
+	if stem == "" {
+		return "rclone-old-"
+	}
+	return stem + "-rclone-old-"
+}
+
+// backupRandomLen is the length of the distinguishing marker in a backup name
+// (see random.String for its alphabet).
+const backupRandomLen = 8
+
+// isBackupMarker reports whether s is the marker backupLeafName generates:
+// exactly backupRandomLen characters from random.String's consonant/vowel/digit
+// pattern. Requiring the shape the generator produces keeps the cleanup of one
+// leaf away from a user file that merely looks similar.
+func isBackupMarker(s string) bool {
+	const (
+		vowel     = "aeiou"
+		consonant = "bcdfghjklmnpqrstvwxyz"
+		digit     = "0123456789"
+	)
+	pattern := [backupRandomLen]string{consonant, vowel, consonant, vowel, consonant, vowel, consonant, digit}
+	if len(s) != backupRandomLen {
+		return false
+	}
+	for i := 0; i < backupRandomLen; i++ {
+		if !strings.ContainsRune(pattern[i], rune(s[i])) {
+			return false
+		}
+	}
+	return true
+}
+
+// isBackupOf reports whether name is a backup of leafStd: the leaf's prefix,
+// then the marker, then the leaf's extension. Matching the whole shape and not
+// just the prefix keeps the cleanup of one leaf away from the backups of a
+// sibling whose name merely starts with the same text ("plain" vs "plain.txt").
+//
+// The comparison folds case because the server does: live-measured, it treats
+// the spellings of a pair as one entry ("casecheck.txt"/"CaseCheck.txt",
+// "ünïcode.txt"/"Ünïcode.txt", "Kelvin.txt"/"Kelvin.txt" each resolve to a
+// single id), so a case-variant spelling of a backup name addresses the same
+// entry. A parked entry is named from its own spelling, which can differ in
+// case from the requested leaf, and a backup that only matched the requested
+// spelling would be left behind for good.
+func isBackupOf(name, leafStd string) bool {
+	rest, ok := strings.CutPrefix(strings.ToLower(name), strings.ToLower(backupPrefix(leafStd)))
+	if !ok {
+		return false
+	}
+	_, ext := backupParts(leafStd)
+	rest, ok = strings.CutSuffix(rest, strings.ToLower(ext))
+	if !ok || !isBackupMarker(rest) {
+		return false
+	}
+	return true
+}
+
+// cleanupOldBackups deletes files in dirID whose names are backups of the leaf
+// - the leftovers of an Update that crashed after renaming the old file away.
+// The new file is already in place when this runs, so the orphan is safe to
+// remove.
+//
+// keepID is the id of the entry the caller now treats as the live content; it
+// is never removed, because an upload the server deduplicated can answer with
+// the id of the entry it parked, which would otherwise be deleted as a backup
+// of itself.
+func (f *Fs) cleanupOldBackups(ctx context.Context, dirID, leaf, keepID string) {
 	var orphans []listEntry
 	err := f.listAll(ctx, dirID, func(e listEntry) bool {
-		if !e.isDir && strings.HasPrefix(e.name, prefix) {
+		if !e.isDir && e.id != keepID && isBackupOf(e.name, leaf) {
 			orphans = append(orphans, e)
 		}
 		return false
@@ -2776,7 +3086,8 @@ func (f *Fs) deleteObject(ctx context.Context, id, srvPath string, family bool) 
 		if err != nil {
 			return err
 		}
-		return f.familyTaskPoll(ctx, taskID)
+		_, err = f.familyTaskPoll(ctx, taskID)
+		return err
 	}
 	if f.opt.HardDelete {
 		return f.deleteTask(ctx, "/hcy/file/batchDelete", id)
@@ -2803,7 +3114,8 @@ func (f *Fs) deleteTask(ctx context.Context, endpoint, id string) error {
 		// Some endpoints complete synchronously; nothing to poll.
 		return nil
 	}
-	return f.taskGet(ctx, out.Data.TaskID, "delete")
+	_, err = f.taskGet(ctx, out.Data.TaskID, "delete")
+	return err
 }
 
 // renameObject renames a file or folder.
@@ -2840,18 +3152,84 @@ func (f *Fs) renameObject(ctx context.Context, id, newName, dirID string, family
 		}
 		body["contentID"] = id
 		body["contentName"] = newName
-		return f.pacer.Call(func() (bool, error) {
-			err := f.familyCall(ctx, path, body, nil)
-			return shouldRetry(ctx, err)
-		})
+		// A rename issued right after the task that created the entry can
+		// race the server's own indexing: the copy task reports success
+		// before the new content is visible to modifyContentInfo, which
+		// then answers '1809111402: 目录或文件不存在'. Retry that answer
+		// for a bounded window; any other business error is returned as
+		// is. This is not a transport retry, so it does not go through
+		// shouldRetry.
+		deadline := time.Now().Add(copyVisibilityTimeout)
+		for {
+			var out struct {
+				UpdateContentInfoRes struct {
+					ContentName string `json:"contentName"`
+				} `json:"updateContentInfoRes"`
+			}
+			err := f.pacer.Call(func() (bool, error) {
+				return shouldRetry(ctx, f.familyCall(ctx, path, body, &out))
+			})
+			var ae *apiError
+			if err == nil || !errors.As(err, &ae) || ae.Code != familyNotFoundCode || time.Now().After(deadline) {
+				if err == nil {
+					if lerr := f.confirmRename(ctx, dirID, id, f.opt.Enc.ToStandardName(newName), out.UpdateContentInfoRes.ContentName); lerr != nil {
+						return lerr
+					}
+				}
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(copyVisibilityInterval):
+			}
+		}
 	}
 	return f.pacer.Call(func() (bool, error) {
+		var out struct {
+			Data struct {
+				Name string `json:"name"`
+			} `json:"data"`
+		}
 		err := f.personalCall(ctx, "/hcy/file/update", api.PersonalUpdateReq{
 			FileID: id,
 			Name:   newName,
-		}, nil)
-		return shouldRetry(ctx, err)
+		}, &out)
+		if err != nil {
+			return shouldRetry(ctx, err)
+		}
+		if lerr := f.confirmRename(ctx, dirID, id, f.opt.Enc.ToStandardName(newName), out.Data.Name); lerr != nil {
+			return false, lerr
+		}
+		return false, nil
 	})
+}
+
+// checkRenameLanded returns an error when the server stored the renamed entry
+// under a name other than the requested one.
+//
+// A rename onto a name the directory already holds does not overwrite: the
+// server keeps the existing entry and stores the renamed one under a suffixed
+// name, answering success either way. The name the reply reports is therefore
+// the only signal that the requested name was not taken, and a caller that
+// assumed success would leave the entry at a path nobody asked for.
+//
+// The family space additionally appends the source's extension whenever the
+// requested name does not already end with it, so a rename to plain stores
+// plain.mkv and a rename to other.mp4 stores other.mp4.mkv (verified live:
+// the reply reports the appended name). That is a different name from the one
+// requested, so it is refused like any other miss: rclone records the path it
+// was asked for, and reporting success would leave every later lookup, move
+// and delete addressing a path the server does not hold.
+//
+// An empty answer carries no information and is accepted: the caller's
+// failure path deletes the upload, and deleting on an unknown outcome would
+// destroy the content when the rename did land.
+func checkRenameLanded(requested, stored string) error {
+	if stored == "" || stored == requested {
+		return nil
+	}
+	return fmt.Errorf("yun139: rename %q: server stored it as %q", requested, stored)
 }
 
 // Remove deletes the object
@@ -2859,13 +3237,13 @@ func (o *Object) Remove(ctx context.Context) error {
 	return o.fs.deleteObject(ctx, o.id, o.serverPath, o.fs.space == spaceFamily)
 }
 
-// Move a file or directory
-// Move a file using the server-side batch-move API.
+// Move moves a file using the server-side batch-move API.
 //
-// Signature follows fs.Mover: destination is a full remote path.
-// Same-directory moves are a rename (batchMove with a changed name);
-// cross-directory moves use the batch-move task. Returns the new
-// object, or ErrorCantMove so the engine falls back to copy+delete.
+// Signature follows fs.Mover: destination is a full remote path. A move
+// that stays in one directory is issued as a plain rename, because the
+// server rejects a batchMove to the directory the file already lives in.
+// Returns the new object, or ErrorCantMove so the engine falls back to
+// copy+delete.
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	srcObj, ok := src.(*Object)
 	if !ok {
@@ -2883,22 +3261,84 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 	srcLeaf := srcObj.leaf()
 	if f.space == spaceFamily {
-		// No native family move (new PC client has no move button).
-		// Fall back to copy + delete (safe: the engine does the same
-		// when we return ErrorCantMove).
-		if err := f.familyCopy(ctx, srcObj, dstDirID); err != nil {
+		// No native family move: createBatchOprTaskV2 rejects taskType 3,
+		// so the move is a copy followed by deleting the source. The copy
+		// takes only a destination directory and keeps the source's name,
+		// so a move that changes the leaf renames the copy afterwards.
+		// The task detail echoes the id of the entry it created, which
+		// identifies the copy exactly; a copy that does not end up under
+		// the requested name is removed again and the move refused, so
+		// the content is never left only under a name the caller was not
+		// told about, and never silently duplicated either.
+		//
+		// The source's parent is resolved through the SOURCE's dircache:
+		// a source from another Fs of the same account carries a remote
+		// path relative to that Fs's root.
+		_, srcDirID, srcErr := srcObj.fs.dirCache.FindPath(ctx, srcObj.remote, false)
+		if srcErr == nil && srcDirID == dstDirID && dstLeaf == srcLeaf {
+			// Same directory and same name: nothing to do. Copying here
+			// would duplicate the file.
+			return srcObj, nil
+		}
+		newID, err := f.familyCopy(ctx, srcObj, dstDirID)
+		if err != nil {
 			return nil, err
+		}
+		o, err := f.resolveCopyLeaf(ctx, dstDirID, remote, srcObj.id, newID)
+		if err != nil {
+			f.removeCopy(ctx, newID, dstDirID, srcObj.id)
+			return nil, fmt.Errorf("yun139: move to %q: %w", dstLeaf, err)
 		}
 		if err := f.deleteObject(ctx, srcObj.id, srcObj.serverPath, true); err != nil {
 			return nil, err
 		}
-		return f.NewObject(ctx, remote)
+		return o, nil
+	}
+	// A move that stays in the same directory is a pure rename: the
+	// server rejects batchMove to the directory the file already lives
+	// in with '04010317: 移动失败，无法移动到自身、自身所在目录、自身子目录下',
+	// so skip the task entirely and just rename in place.
+	//
+	// The source's parent is resolved through the SOURCE's dircache, not
+	// this one: a source from another Fs of the same account carries a
+	// remote path relative to that Fs's root, and resolving it here would
+	// map it onto this root and mistake a cross-root move for a rename in
+	// place. FindPath (not path.Dir) is what maps a bare leaf to that
+	// Fs's root; path.Dir would turn it into ".".
+	//
+	// An unresolvable source directory leaves the same-directory case
+	// undecidable, so fall through to the batch-move task rather than
+	// fail the move.
+	_, srcDirID, err := srcObj.fs.dirCache.FindPath(ctx, srcObj.remote, false)
+	if err == nil && srcDirID == dstDirID {
+		if dstLeaf == srcLeaf {
+			// Same directory and same name: nothing to do. The server
+			// would reject the no-op batchMove as well.
+			return srcObj, nil
+		}
+		if err := f.renameObject(ctx, srcObj.id, f.opt.Enc.FromStandardName(dstLeaf), dstDirID, false); err != nil {
+			return nil, err
+		}
+		o, err := f.newObjectVisible(ctx, remote)
+		if err != nil {
+			return nil, err
+		}
+		// A rename onto a name the directory already holds does not
+		// overwrite: the server keeps the existing entry and parks the
+		// moved file under a suffixed name. The object at remote would
+		// then be the old one, so refuse to report a move that did not
+		// land rather than hand back the wrong object.
+		if got := o.(*Object).id; got != srcObj.id {
+			return nil, fmt.Errorf("yun139: rename %q: server kept the existing entry (moved file is under another name)", dstLeaf)
+		}
+		return o, nil
 	}
 	taskID, err := f.moveTaskID(ctx, srcObj.id, dstDirID)
 	if err != nil {
 		return nil, err
 	}
-	if err := f.taskGet(ctx, taskID, "move"); err != nil {
+	_, err = f.taskGet(ctx, taskID, "move")
+	if err != nil {
 		return nil, err
 	}
 	// The batch-move keeps the id; if the leaf changed (rename-in-move),
@@ -2908,9 +3348,16 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 			return nil, err
 		}
 	}
-	o, err := f.NewObject(ctx, remote)
+	o, err := f.newObjectVisible(ctx, remote)
 	if err != nil {
 		return nil, err
+	}
+	// The same non-overwrite rule applies across directories: if the
+	// destination name was already taken the server keeps the existing
+	// entry and parks the moved file under a suffixed name, so the
+	// object at remote would be the old one.
+	if got := o.(*Object).id; got != srcObj.id {
+		return nil, fmt.Errorf("yun139: move to %q: server kept the existing entry (moved file is under another name)", dstLeaf)
 	}
 	return o, nil
 }
@@ -2990,95 +3437,270 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		// Different account/family - the API cannot server-side copy.
 		return nil, fs.ErrorCantCopy
 	}
-	dstLeaf, dstDirID, err := f.dirCache.FindPath(ctx, remote, true)
+	_, dstDirID, err := f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
 		return nil, err
 	}
 	if err := f.validateName(remote); err != nil {
 		return nil, err
 	}
+	// The server never overwrites: a batch copy whose destination name is
+	// already taken is auto-renamed to a suffixed name, so the copy cannot
+	// be given the requested leaf and would have to be removed again. The
+	// engine replaces an existing file with a bandwidth copy instead, whose
+	// Update path renames the old entry away before uploading and is
+	// lossless, so refuse here while nothing has been created yet. Refusing
+	// afterwards would leave the auto-renamed copy behind as an orphan.
+	taken, err := f.leafTaken(ctx, dstDirID, path.Base(remote))
+	if err != nil {
+		return nil, err
+	}
+	if taken {
+		fs.Debugf(srcObj, "Destination name %q is taken; using a bandwidth copy to replace it", path.Base(remote))
+		return nil, fs.ErrorCantCopy
+	}
 	if f.space == spaceFamily {
-		if err := f.familyCopy(ctx, srcObj, dstDirID); err != nil {
+		newID, err := f.familyCopy(ctx, srcObj, dstDirID)
+		if err != nil {
 			return nil, err
 		}
-		// The family copy task has no direct id echo; re-resolve.
-		o, err := f.NewObject(ctx, remote)
-		if err == nil {
-			return o, nil
+		o, err := f.resolveCopyLeaf(ctx, dstDirID, remote, srcObj.id, newID)
+		if err != nil {
+			// The copy exists but cannot be given the requested name;
+			// remove it so a failed copy leaves nothing behind.
+			f.removeCopy(ctx, newID, dstDirID, srcObj.id)
+			return nil, err
 		}
-		// Fall through to the same findNewCopy+rename path as personal.
-		if o, err2 := f.resolveCopyLeaf(ctx, srcObj, dstDirID, dstLeaf); err2 == nil {
-			return o, nil
-		}
-		return nil, err
+		return o, nil
 	}
 	taskID, err := f.copyTaskID(ctx, srcObj.id, dstDirID)
 	if err != nil {
 		return nil, err
 	}
-	if err := f.taskGet(ctx, taskID, "copy"); err != nil {
+	newID, err := f.taskGet(ctx, taskID, "copy")
+	if err != nil {
 		return nil, err
 	}
-	o, err := f.NewObject(ctx, remote)
-	if err == nil {
-		return o, nil
+	o, err := f.resolveCopyLeaf(ctx, dstDirID, remote, srcObj.id, newID)
+	if err != nil {
+		f.removeCopy(ctx, newID, dstDirID, srcObj.id)
+		return nil, err
 	}
-	return f.resolveCopyLeaf(ctx, srcObj, dstDirID, dstLeaf)
+	return o, nil
 }
 
-// resolveCopyLeaf finds the server-created copy and, when the server
-// auto-renamed it (batchCopy lands under <src>_<timestamp>.<ext> or
-// <src>(1).<ext> instead of the requested leaf), renames it to the
-// requested leaf and returns the object at remote. If nothing was
-// found, returns ErrorObjectNotFound.
-func (f *Fs) resolveCopyLeaf(ctx context.Context, srcObj *Object, dstDirID, dstLeaf string) (fs.Object, error) {
-	o, err := f.findNewCopy(ctx, srcObj, dstDirID)
+// resolveCopyLeaf turns the id of a freshly created copy into an Object at
+// remote. The batch copy keeps the source's name, so a copy to a different
+// leaf is renamed to the requested one; both spaces support that. newID
+// comes from the task detail and identifies the copy exactly, so the entry
+// is never confused with one that already occupied the destination.
+//
+// srcID is the id of the object the copy was made from. A task that reports
+// the source's id instead of the copy's must be refused: resolving it would
+// hand back the source, and a rename or a cleanup driven by that id would
+// act on the original file rather than on a copy.
+func (f *Fs) resolveCopyLeaf(ctx context.Context, dstDirID, remote, srcID, newID string) (fs.Object, error) {
+	if newID == "" || newID == srcID {
+		return nil, errors.New("yun139: copy task reported no new id")
+	}
+	leaf := path.Base(remote)
+	o, err := f.newObjectByID(ctx, dstDirID, remote, newID)
 	if err != nil {
 		return nil, err
 	}
 	newObj := o.(*Object)
-	if newObj.leaf() == dstLeaf {
+	if newObj.leaf() == leaf {
 		return o, nil
 	}
 	// The server put the copy under a different name (auto_rename).
-	// Rename it to the requested leaf; both spaces support this.
-	if err := f.renameObject(ctx, newObj.id, f.opt.Enc.FromStandardName(dstLeaf), dstDirID, f.space == spaceFamily); err != nil {
-		return nil, fmt.Errorf("yun139: rename copy to %q: %w", dstLeaf, err)
+	if err := f.renameObject(ctx, newObj.id, f.opt.Enc.FromStandardName(leaf), dstDirID, f.space == spaceFamily); err != nil {
+		return nil, fmt.Errorf("yun139: rename copy to %q: %w", leaf, err)
 	}
-	newObj.remote = path.Join(f.root, dstLeaf)
-	return newObj, nil
-}
-
-// findNewCopy lists dstDirID and returns the first file entry that is
-// not srcObj, matches its size, and appeared after the copy started.
-// The family copy task does not echo the new id, and a same-directory
-// copy is auto-renamed by the server, so this is the only reliable way
-// to resolve the copy result.
-func (f *Fs) findNewCopy(ctx context.Context, srcObj *Object, dstDirID string) (fs.Object, error) {
-	var found listEntry
-	start := time.Now().Add(-2 * time.Minute)
-	err := f.listAll(ctx, dstDirID, func(e listEntry) bool {
-		if e.isDir || e.id == srcObj.id || e.size != srcObj.size {
-			return false
-		}
-		if e.modTime.Before(start) {
-			return false
-		}
-		found = e
-		return true
-	})
+	// A rename onto a name the directory already holds does not
+	// overwrite: the server keeps the existing entry and parks the
+	// renamed file under a suffixed name. Re-read the entry by id and
+	// require it to carry the requested name, so a copy that did not
+	// land is reported instead of returning the wrong object.
+	//
+	// The comparison is exact on purpose, even on the family space, where
+	// a rename also appends the source's extension when the requested name
+	// does not end with it: the server then holds a name the caller never
+	// asked for, and reporting the copy as landed would leave the content
+	// at a path nobody can look up.
+	got, err := f.newObjectByID(ctx, dstDirID, remote, newID)
 	if err != nil {
 		return nil, err
 	}
-	if found.id == "" {
-		return nil, fs.ErrorObjectNotFound
+	if got.(*Object).leaf() != leaf {
+		return nil, fmt.Errorf("yun139: copy did not land under %q: the server stored it as %q", leaf, got.(*Object).leaf())
 	}
-	return f.newObjectWithInfo(ctx, path.Join(f.root, found.name), found)
+	return got, nil
+}
+
+// newObjectVisible returns the object at remote, retrying while the entry is
+// not yet visible. 139 is eventually consistent, so a rename that has landed
+// can still be missing from a listing for a moment and a single read would
+// report a completed operation as failed.
+//
+// An entry that is present but carries a different id is returned as is: that
+// is a real collision, not a visibility lag, and the caller decides on it.
+func (f *Fs) newObjectVisible(ctx context.Context, remote string) (fs.Object, error) {
+	deadline := time.Now().Add(copyVisibilityTimeout)
+	for {
+		o, err := f.NewObject(ctx, remote)
+		if err == nil {
+			return o, nil
+		}
+		if !errors.Is(err, fs.ErrorObjectNotFound) || time.Now().After(deadline) {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(copyVisibilityInterval):
+		}
+	}
+}
+
+// leafTaken reports whether dirID already holds an entry named leaf. A
+// server-side copy cannot be given a name the directory holds, so the copy
+// path consults this before creating anything.
+//
+// The comparison is on the standard (decoded) name: a listing reports the
+// wire spelling of a name, which the encoder may have escaped.
+func (f *Fs) leafTaken(ctx context.Context, dirID, leaf string) (bool, error) {
+	taken := false
+	err := f.listAll(ctx, dirID, func(e listEntry) bool {
+		if strings.EqualFold(e.name, leaf) {
+			taken = true
+			return true
+		}
+		return false
+	})
+	if err != nil {
+		return false, err
+	}
+	return taken, nil
+}
+
+// newObjectByID returns the entry with the given id in dstDirID, carrying
+// the name the server actually gave it. remote is the requested destination
+// path, which supplies the directory the entry lives in; Object.Remote is
+// relative to the Fs root, so only the leaf is replaced.
+//
+// The listing is polled because 139 is eventually consistent: an entry a
+// task just created can take a few seconds to appear, and a single read
+// would report a completed operation as missing.
+func (f *Fs) newObjectByID(ctx context.Context, dstDirID, remote, id string) (fs.Object, error) {
+	var found listEntry
+	deadline := time.Now().Add(copyVisibilityTimeout)
+	for {
+		err := f.listAll(ctx, dstDirID, func(e listEntry) bool {
+			if e.id != id {
+				return false
+			}
+			found = e
+			return true
+		})
+		if err != nil {
+			return nil, err
+		}
+		if found.id != "" {
+			return f.newObjectWithInfo(ctx, path.Join(path.Dir(remote), found.name), found)
+		}
+		if time.Now().After(deadline) {
+			return nil, fs.ErrorObjectNotFound
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(copyVisibilityInterval):
+		}
+	}
+}
+
+// entryName reports the standard name the entry with id carries in dirID.
+//
+// A reply that omits the name of a rename or an upload leaves the caller
+// unable to tell whether the entry landed at the requested path or under a
+// name the server chose. 139 is eventually consistent, so the listing is
+// polled before the entry is declared absent. found is false when no entry
+// with that id shows up in dirID.
+func (f *Fs) entryName(ctx context.Context, dirID, id string) (name string, found bool, err error) {
+	deadline := time.Now().Add(copyVisibilityTimeout)
+	for {
+		var e listEntry
+		err := f.listAll(ctx, dirID, func(cand listEntry) bool {
+			if cand.id != id {
+				return false
+			}
+			e = cand
+			return true
+		})
+		if err != nil {
+			return "", false, err
+		}
+		if e.id != "" {
+			return e.name, true, nil
+		}
+		if time.Now().After(deadline) {
+			return "", false, nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", false, ctx.Err()
+		case <-time.After(copyVisibilityInterval):
+		}
+	}
+}
+
+// uploadedLeaf reports the standard name an upload carries in dirID.
+//
+// The create reply names the entry it stored. A reply that omits the field
+// would otherwise be read as the requested name, and an entry the server
+// stored under a suffixed name would slip past the caller's landing check.
+// An unnamed entry is therefore looked up by id.
+func (f *Fs) uploadedLeaf(ctx context.Context, dirID string, res *uploadResult, leafStd string) (string, error) {
+	if res.fileName != "" {
+		return f.opt.Enc.ToStandardName(res.fileName), nil
+	}
+	name, found, err := f.entryName(ctx, dirID, res.fileID)
+	if err != nil {
+		return "", err
+	}
+	if !found {
+		return "", fmt.Errorf("yun139: upload %q: the entry is not in its directory", leafStd)
+	}
+	return name, nil
+}
+
+// confirmRename checks that a rename left the entry under the requested name.
+//
+// The reply names the entry the server stored when it reports one. An empty
+// answer carries no information, so the entry is located by id: the server
+// answers success when it stores a rename onto a held name under a suffixed
+// name, and a caller that read silence as success would address a path the
+// server does not hold.
+func (f *Fs) confirmRename(ctx context.Context, dirID, id, requestedStd, reportedWire string) error {
+	if reportedWire != "" {
+		return checkRenameLanded(requestedStd, f.opt.Enc.ToStandardName(reportedWire))
+	}
+	name, found, err := f.entryName(ctx, dirID, id)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("yun139: rename %q: the entry is not in its directory", requestedStd)
+	}
+	return checkRenameLanded(requestedStd, name)
 }
 
 // sameCloud reports whether fs belongs to the same 139 account (and, for
 // family, the same family cloud), so ids are interchangeable.
 func (f *Fs) sameCloud(other *Fs) bool {
+	if f.accountKey() != other.accountKey() {
+		return false
+	}
 	if f.space != other.space {
 		return false
 	}
@@ -3092,9 +3714,9 @@ func (f *Fs) sameCloud(other *Fs) bool {
 func (o *Object) leaf() string { return path.Base(o.remote) }
 
 // familyCopy copies srcObj (file or dir) into dstDirID inside the family
-// cloud via createBatchOprTaskV2 taskType=1, then polls the task
-// (captured 2026-09-03).
-func (f *Fs) familyCopy(ctx context.Context, srcObj *Object, dstDirID string) error {
+// cloud via createBatchOprTaskV2 taskType=1, then polls the task. It
+// returns the id of the created entry, which the task detail echoes.
+func (f *Fs) familyCopy(ctx context.Context, srcObj *Object, dstDirID string) (string, error) {
 	return f.familyCopyID(ctx, srcObj.id, dstDirID, srcObj.isDir)
 }
 
@@ -3128,8 +3750,9 @@ func (f *Fs) primeSrvPathFor(ctx context.Context, dirID string) error {
 	return nil
 }
 
-// familyCopyID copies the given content/catalog id into dstDirID.
-func (f *Fs) familyCopyID(ctx context.Context, id, dstDirID string, isDir bool) error {
+// familyCopyID copies the given content/catalog id into dstDirID and
+// returns the id of the created entry.
+func (f *Fs) familyCopyID(ctx context.Context, id, dstDirID string, isDir bool) (string, error) {
 	// The server's batchOprTask requires the destination's server-side
 	// path. The cache may be cold for a directory we never listed
 	// (typical for a freshly-discovered family cloud); prime it on
@@ -3159,7 +3782,7 @@ func (f *Fs) familyCopyID(ctx context.Context, id, dstDirID string, isDir bool) 
 	}
 	taskID, err := f.familyBatchOprTask(ctx, req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	return f.familyTaskPoll(ctx, taskID)
 }
@@ -3180,7 +3803,39 @@ func (f *Fs) familyDeleteID(ctx context.Context, id, srvPath string) error {
 	if err != nil {
 		return err
 	}
-	return f.familyTaskPoll(ctx, taskID)
+	_, err = f.familyTaskPoll(ctx, taskID)
+	return err
+}
+
+// removeCopy deletes an entry a copy task created, so a copy that cannot be
+// given the requested name does not linger under a name the caller never
+// asked for. A failure to remove it is logged, not returned: the caller is
+// already reporting why the operation did not complete.
+//
+// dstDirID is the directory the copy was made into; for family the delete
+// task addresses the entry by its parent's server-side path, and the cache
+// may be cold for a directory that was never listed, so it is primed on
+// demand.
+//
+// srcID is the id of the object the copy was made from; an id equal to it
+// names the original rather than a copy and is never removed.
+func (f *Fs) removeCopy(ctx context.Context, id, dstDirID, srcID string) {
+	if id == "" || id == srcID {
+		return
+	}
+	srvPath := ""
+	if f.space == spaceFamily {
+		srvPath = f.familySrvPath(dstDirID)
+		if srvPath == "" {
+			if err := f.primeSrvPathFor(ctx, dstDirID); err != nil {
+				fs.Debugf(f, "yun139: prime srvPath for %s: %v", dstDirID, err)
+			}
+			srvPath = f.familySrvPath(dstDirID)
+		}
+	}
+	if err := f.deleteObject(ctx, id, srvPath, f.space == spaceFamily); err != nil {
+		fs.Errorf(f, "yun139: remove unwanted copy %s: %v", id, err)
+	}
 }
 
 // copyTaskID performs one batchCopy and returns the task id.
@@ -3367,9 +4022,28 @@ func (w *yun139ChunkWriter) Close(ctx context.Context) error {
 	if _, err := w.tmp.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	_, err := w.f.uploadFromRandom(ctx, w.tmp, w.dirID, w.leaf, w.size, hex.EncodeToString(h.Sum(nil)))
+	res, err := w.f.uploadFromRandom(ctx, w.tmp, w.dirID, w.leaf, w.size, hex.EncodeToString(h.Sum(nil)))
 	if err != nil {
+		if res != nil && res.fileID != "" {
+			w.f.discardUpload(ctx, res.fileID, w.dirID, w.f.space == spaceFamily)
+		}
 		return fmt.Errorf("yun139: chunk writer upload: %w", err)
+	}
+	// /hcy/file/create never overwrites: a name the directory already holds
+	// makes the server store the content under a suffixed name instead. The
+	// caller looks the object up at the requested path once Close returns, so
+	// the upload has to land there - otherwise the old entry is found, the
+	// verification compares against it, and the new content is left under a
+	// name nobody asked for.
+	leafStd := w.f.opt.Enc.ToStandardName(w.leaf)
+	landed, err := w.f.uploadedLeaf(ctx, w.dirID, res, leafStd)
+	if err != nil {
+		return err
+	}
+	if landed != leafStd {
+		if err := w.f.settleAutoRename(ctx, w.dirID, leafStd, res.fileID); err != nil {
+			return fmt.Errorf("yun139: chunk writer settle upload name: %w", err)
+		}
 	}
 	return nil
 }
@@ -3574,6 +4248,17 @@ type taskPollResult struct {
 			TaskID string `json:"taskId"`
 			Status string `json:"status"` // Running | Succeed | Failed
 		} `json:"taskInfo"`
+		// BatchFileResults carries one entry per file of a batch copy or
+		// move. For a copy, rstFile is the created entry while fileId and
+		// srcFile describe the source, so only rstFile identifies the
+		// copy.
+		BatchFileResults []struct {
+			ErrCode string `json:"errCode"`
+			FileID  string `json:"fileId"`
+			RstFile struct {
+				FileID string `json:"fileId"`
+			} `json:"rstFile"`
+		} `json:"batchFileResults"`
 	} `json:"data"`
 }
 
@@ -3598,14 +4283,17 @@ func taskStatusFailed(status string) bool {
 	return false
 }
 
-// taskGet polls /hcy/task/get until the task finishes.
+// taskGet polls /hcy/task/get until the task finishes and returns the id of
+// the entry a copy created, which the response carries in
+// data.batchFileResults[].rstFile.fileId. A move or delete reports no new
+// entry, so the id is empty for those.
 //
 // Delete / move / copy on 139 are task-based: the mutating call returns
 // a taskId immediately and the change happens in the background. rclone
 // callers expect the operation to be done when the call returns, so we
 // poll. The official client polls ~1/s; we pace ourselves with the
 // pacer and give up after 60s.
-func (f *Fs) taskGet(ctx context.Context, taskID, what string) error {
+func (f *Fs) taskGet(ctx context.Context, taskID, what string) (string, error) {
 	body := map[string]any{"taskId": taskID}
 	deadline := time.Now().Add(60 * time.Second)
 	for {
@@ -3615,23 +4303,28 @@ func (f *Fs) taskGet(ctx context.Context, taskID, what string) error {
 			return shouldRetry(ctx, err)
 		})
 		if err != nil {
-			return fmt.Errorf("yun139: poll %s task: %w", what, err)
+			return "", fmt.Errorf("yun139: poll %s task: %w", what, err)
 		}
 		if !out.Success {
-			return &apiError{Code: out.Code, Message: out.Message}
+			return "", &apiError{Code: out.Code, Message: out.Message}
 		}
 		switch {
 		case taskStatusDone(out.Data.TaskInfo.Status):
-			return nil
+			for _, r := range out.Data.BatchFileResults {
+				if r.RstFile.FileID != "" {
+					return r.RstFile.FileID, nil
+				}
+			}
+			return "", nil
 		case taskStatusFailed(out.Data.TaskInfo.Status):
-			return fmt.Errorf("yun139: %s task %s failed", what, taskID)
+			return "", fmt.Errorf("yun139: %s task %s failed", what, taskID)
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("yun139: %s task %s did not finish in 60s", what, taskID)
+			return "", fmt.Errorf("yun139: %s task %s did not finish in 60s", what, taskID)
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return "", ctx.Err()
 		case <-time.After(time.Second):
 		}
 	}
@@ -3713,13 +4406,17 @@ func (f *Fs) familyBatchOprTask(ctx context.Context, req familyBatchReq) (string
 }
 
 // familyTaskPoll polls queryBatchOprTaskDetailV3 until the task
-// completes. State machine (captured 2026-09-03):
+// completes, and returns the id of the entry a copy created
+// (contentList[].rstID). State machine (captured 2026-09-03):
 //
 //	taskStatus 0 = running, 1 = running, 2 = success,
 //	taskResultCode 1 means success, 0 means failed.
-//	contentList[].reason == "0000" is success; any other code is the
-//	per-item error.
-func (f *Fs) familyTaskPoll(ctx context.Context, taskID string) error {
+//
+// The per-item fields vary with the task type rather than the operation
+// family: a copy carries the id of the entry it created in rstID, while a
+// delete reports no rstID at all. Only the task-level taskResultCode is a
+// success signal; the per-item reason is not compared against any code.
+func (f *Fs) familyTaskPoll(ctx context.Context, taskID string) (string, error) {
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		body := map[string]any{
@@ -3744,9 +4441,8 @@ func (f *Fs) familyTaskPoll(ctx context.Context, taskID string) error {
 				TaskResultCode *int `json:"taskResultCode"`
 			} `json:"batchOprTask"`
 			ContentList []struct {
-				SrcID  string `json:"srcID"`
-				RstID  string `json:"rstID"`
-				Reason string `json:"reason"`
+				SrcID string `json:"srcID"`
+				RstID string `json:"rstID"`
 			} `json:"contentList"`
 		}
 		err := f.pacer.Call(func() (bool, error) {
@@ -3754,10 +4450,10 @@ func (f *Fs) familyTaskPoll(ctx context.Context, taskID string) error {
 			return shouldRetry(ctx, err)
 		})
 		if err != nil {
-			return fmt.Errorf("yun139: poll family task: %w", err)
+			return "", fmt.Errorf("yun139: poll family task: %w", err)
 		}
 		if out.Result.ResultCode != "0" {
-			return &apiError{Code: out.Result.ResultCode, Message: out.Result.ResultDesc}
+			return "", &apiError{Code: out.Result.ResultCode, Message: out.Result.ResultDesc}
 		}
 		switch out.BatchOprTask.TaskStatus {
 		case 0, 1:
@@ -3765,18 +4461,30 @@ func (f *Fs) familyTaskPoll(ctx context.Context, taskID string) error {
 		case 2:
 			// Success only when resultCode==1.
 			if out.BatchOprTask.TaskResultCode != nil && *out.BatchOprTask.TaskResultCode == 1 {
-				return nil
+				for _, c := range out.ContentList {
+					if c.RstID != "" {
+						return c.RstID, nil
+					}
+				}
+				// No entry was created. That is the normal outcome of a
+				// delete, which carries no rstID; a copy that produced
+				// nothing is reported as an unidentified copy by the
+				// caller. A copy that DID land without echoing its id
+				// cannot be identified, so it is left in place and named
+				// here rather than guessed at by name.
+				fs.Debugf(f, "yun139: family task %s created no identifiable entry; a copy that landed without an echoed id is left in place", taskID)
+				return "", nil
 			}
-			return fmt.Errorf("yun139: family task %s finished with resultCode %v", taskID, out.BatchOprTask.TaskResultCode)
+			return "", fmt.Errorf("yun139: family task %s finished with resultCode %v", taskID, out.BatchOprTask.TaskResultCode)
 		case 3:
-			return fmt.Errorf("yun139: family task %s failed", taskID)
+			return "", fmt.Errorf("yun139: family task %s failed", taskID)
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("yun139: family task %s did not finish in 60s", taskID)
+			return "", fmt.Errorf("yun139: family task %s did not finish in 60s", taskID)
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return "", ctx.Err()
 		case <-time.After(time.Second):
 		}
 	}
