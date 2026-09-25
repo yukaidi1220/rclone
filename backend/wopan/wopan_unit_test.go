@@ -20,6 +20,7 @@ import (
 
 	"github.com/rclone/rclone/backend/wopan/api"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
@@ -430,16 +431,42 @@ func TestUnitShootingTime(t *testing.T) {
 }
 
 func TestUnitTempNameTruncate(t *testing.T) {
+	enc := encoder.Standard | encoder.EncodeInvalidUtf8
 	suffix := ".rclone-tmp-12345678" // 20 runes
 
 	// A short leaf passes through unchanged.
-	assert.Equal(t, "a.txt"+suffix, truncateName("a.txt", suffix))
+	assert.Equal(t, "a.txt"+suffix, truncateName(enc, "a.txt", suffix))
 
 	// A long leaf is truncated so the total is exactly the 100-rune limit.
 	long := strings.Repeat("名", 200) // 200 CJK runes
-	got := truncateName(long, suffix)
+	got := truncateName(enc, long, suffix)
 	assert.Equal(t, 100, utf8.RuneCountInString(got), "total must be at most 100 runes")
 	assert.True(t, strings.HasSuffix(got, suffix), "suffix must be preserved")
+
+	// A leaf whose encoded form has an escape group straddling the cut point:
+	// 78 chars plus one escaped byte encodes to 81 runes and the body is cut at
+	// 80, so a naive rune-slice would leave half an escape group behind. This
+	// is what makes the round-trip assertion below non-vacuous - a CJK-only
+	// leaf is a no-op for this encoder, so the check would be trivially true.
+	straddle := enc.FromStandardName(strings.Repeat("x", 78) + "\xff")
+	require.Equal(t, 81, utf8.RuneCountInString(straddle), "escape group layout changed")
+
+	// tempName itself must respect the limit, not just truncateName: the suffix
+	// carries a random 8-rune id, so the helper's own arithmetic is what keeps
+	// a long leaf uploadable.
+	tmp := tempName(enc, straddle)
+	assert.LessOrEqual(t, utf8.RuneCountInString(tmp), 100,
+		"tempName must fit the 100-rune limit, got %d", utf8.RuneCountInString(tmp))
+	assert.Contains(t, tmp, tempSuffix)
+	assert.Equal(t, tmp, enc.FromStandardName(enc.ToStandardName(tmp)),
+		"tempName must not split an escape group")
+
+	bak := backupName(enc, straddle)
+	assert.LessOrEqual(t, utf8.RuneCountInString(bak), 100,
+		"backupName must fit the 100-rune limit, got %d", utf8.RuneCountInString(bak))
+	assert.Contains(t, bak, backupSuffix)
+	assert.Equal(t, bak, enc.FromStandardName(enc.ToStandardName(bak)),
+		"backupName must not split an escape group")
 }
 
 // stepClock is an injected clock: it advances only when purgeRecycle sleeps, so
@@ -797,6 +824,9 @@ func newUnitTestFs(transport http.RoundTripper) *Fs {
 			UploadCutoff:      64 * 1024 * 1024,
 			ChunkSize:         8 * 1024 * 1024,
 			UploadConcurrency: 4,
+			// The real default, so tests exercise the encoded-name paths
+			// (a zero encoder would make encoding a no-op).
+			Enc: encoder.Standard | encoder.EncodeInvalidUtf8,
 		},
 		spaceType: spacePersonal,
 		tok: &tokenState{
@@ -1547,4 +1577,778 @@ func TestUnitDisableHTTP2Negotiation(t *testing.T) {
 	require.NoError(t, err)
 	defer res.Body.Close()
 	assert.Equal(t, 1, res.ProtoMajor, "disable_http2 must negotiate HTTP/1.1")
+}
+
+// ------------------------------------------------- lossless Update ----------
+
+// updateTransport records the calls Update makes and can be told to fail one of
+// them, so every recovery branch can be driven without a server.
+//
+// Renames are counted by call order because the update issues up to three of
+// them (park, install, restore) and only their sequence distinguishes the
+// branches under test.
+type updateTransport struct {
+	mu sync.Mutex
+	// ops is the call order, each entry prefixed by its kind.
+	ops []string
+	// renames/uploads/deletes hold the name (or id) of each call of that kind.
+	renames []string
+	// renameIDs holds the object id each rename targeted, in call order. The
+	// lossless flow renames two different objects (old, then new), so a test
+	// that only checks the target NAMES cannot tell a correct update from one
+	// that renames the wrong object and then deletes the file at the real name.
+	renameIDs []string
+	uploads   []string
+	deletes   []string
+
+	// failUpload makes the upload answer with a business error.
+	failUpload bool
+	// failRenameAt holds 1-based rename ordinals that answer with a business
+	// error.
+	failRenameAt []int
+	// failRenameTransport reports whether the rename of this object fails at
+	// the transport level, i.e. with a bare error rather than an RSP_CODE. It
+	// is a predicate rather than an ordinal because the pacer retries
+	// internally: an ordinal would only fail the first attempt and the retry
+	// would succeed, so the error would never surface. The pacer turns these
+	// into fserrors.RetryError, the shape the code under test must strip
+	// before marking the error NoLowLevelRetry.
+	failRenameTransport func(id, name string) bool
+	// failDelete makes the backup delete answer with a business error.
+	failDelete bool
+
+	// names maps a directory-visible name to the object id that holds it, so
+	// the listing can answer leafHolds. Renames update it: a rename moves the
+	// id, and the server never overwrites, so a rename onto a held name fails
+	// with the name-occupied code unless the holder is the id being moved.
+	names map[string]string
+	// listFails makes every listing answer with a business error.
+	listFails bool
+	// renameLandsButFails models a lost response: the rename takes effect on
+	// the server but the call reports an error. The server state must still be
+	// updated, because that is the whole point of the case.
+	renameLandsButFails map[string]bool
+	// dirEntries maps a name to the id of a DIRECTORY holding it, so a test can
+	// put a same-named directory beside a file: only the file may answer
+	// leafHolds.
+	dirEntries map[string]string
+	// hideEntry maps a name to the number of page-0 listings that omit it,
+	// modelling the directory index's visibility delay. The counter drops by
+	// one per listing served, so the entry appears once it reaches zero.
+	hideEntry map[string]int
+	// failRenameOnce maps "id->name" to the number of leading rename attempts
+	// that answer with the transient name-occupied code - what the server
+	// returns while a just-freed name's index is still being released. The
+	// counter drops by one per attempt, after which the rename succeeds.
+	failRenameOnce map[string]int
+	// listCalls counts the listings served, so a test can prove leafHolds
+	// polled rather than trusting a single answer.
+	listCalls int
+}
+
+func (t *updateTransport) renameOrdinalFail(n int) bool {
+	for _, f := range t.failRenameAt {
+		if f == n {
+			return true
+		}
+	}
+	return false
+}
+
+// applyRename moves id to name in the modelled server state, dropping whatever
+// name held it before.
+func (t *updateTransport) applyRename(id, name string) {
+	if t.names == nil {
+		t.names = map[string]string{}
+	}
+	for n, held := range t.names {
+		if held == id {
+			delete(t.names, n)
+		}
+	}
+	t.names[name] = id
+}
+
+// listResp answers a listing with the current modelled server state, encrypted
+// the way the real DATA field is. Only page 0 carries the entries: listAll pages
+// until it sees an empty page, so returning them again would never terminate.
+func (t *updateTransport) listResp(fields map[string]any) *http.Response {
+	if t.listFails {
+		return okResp(`{"STATUS":"200","MSG":"ok","LOGID":"L","RSP":{"RSP_CODE":"9999","RSP_DESC":"boom","DATA":""}}`)
+	}
+	t.listCalls++
+	pageNum := 0
+	if v, ok := fields["pageNum"].(float64); ok {
+		pageNum = int(v)
+	}
+	files := []map[string]any{}
+	if pageNum == 0 {
+		for n, id := range t.names {
+			// hideEntry models the index's visibility delay: the entry is
+			// absent for the first N listings, then appears.
+			if left, ok := t.hideEntry[n]; ok && left > 0 {
+				t.hideEntry[n] = left - 1
+				continue
+			}
+			files = append(files, map[string]any{"id": id, "name": n, "type": fileTypeFile})
+		}
+		for n, id := range t.dirEntries {
+			files = append(files, map[string]any{"id": id, "name": n, "type": fileTypeDir})
+		}
+	}
+	payload, _ := json.Marshal(map[string]any{"files": files})
+	enc, err := aesEncrypt(payload, aesKeyFor(chanWoHome, testAccessToken))
+	if err != nil {
+		return okResp(`{"STATUS":"200","MSG":"ok","LOGID":"L","RSP":{"RSP_CODE":"9999","RSP_DESC":"encrypt","DATA":""}}`)
+	}
+	return okResp(`{"STATUS":"200","MSG":"ok","LOGID":"L","RSP":{"RSP_CODE":"0000","RSP_DESC":"ok","DATA":"` + enc + `"}}`)
+}
+
+func (t *updateTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Upload parts carry the target name as a multipart form field.
+	if strings.HasSuffix(r.URL.Path, "/openapi/client/upload2C") {
+		name := ""
+		if mr, err := r.MultipartReader(); err == nil {
+			for {
+				p, err := mr.NextPart()
+				if err != nil {
+					break
+				}
+				b, _ := io.ReadAll(p)
+				if p.FormName() == "fileName" {
+					name = string(b)
+				}
+			}
+		}
+		t.uploads = append(t.uploads, name)
+		t.ops = append(t.ops, "upload:"+name)
+		if t.failUpload {
+			return okResp(`{"code":"9999","msg":"boom"}`), nil
+		}
+		return okResp(`{"code":"0000","data":{"fid":"new-fid","wcFileId":"new-id"},"msg":"ok"}`), nil
+	}
+
+	raw, _ := io.ReadAll(r.Body)
+	var req struct {
+		Header struct {
+			Key string `json:"key"`
+		} `json:"header"`
+		Body map[string]any `json:"body"`
+	}
+	_ = json.Unmarshal(raw, &req)
+	ok := `{"STATUS":"200","MSG":"ok","LOGID":"L","RSP":{"RSP_CODE":"0000","RSP_DESC":"ok","DATA":""}}`
+	boom := `{"STATUS":"200","MSG":"ok","LOGID":"L","RSP":{"RSP_CODE":"9999","RSP_DESC":"boom","DATA":""}}`
+	// nameOccupied is the real "target name already taken" code, which is what
+	// the server answers when a rename would overwrite another object.
+	nameOccupied := `{"STATUS":"200","MSG":"ok","LOGID":"L","RSP":{"RSP_CODE":"` + codeNameOccupied + `","RSP_DESC":"name occupied","DATA":""}}`
+
+	// The operation parameters travel AES-encrypted in body.param, so the
+	// recorded name/id has to be decrypted before it can be asserted on.
+	fields := map[string]any{}
+	if enc, ok := req.Body["param"].(string); ok && enc != "" {
+		if plain, err := aesDecrypt(enc, aesKeyFor(chanWoHome, testAccessToken)); err == nil {
+			_ = json.Unmarshal(plain, &fields)
+		}
+	}
+
+	switch req.Header.Key {
+	case "QueryAllFiles":
+		return t.listResp(fields), nil
+	case "RenameFileOrDirectory":
+		name, _ := fields["name"].(string)
+		id, _ := fields["id"].(string)
+		t.renames = append(t.renames, name)
+		t.renameIDs = append(t.renameIDs, id)
+		t.ops = append(t.ops, "rename:"+name)
+		// A transient name-occupied answer: the server does this while a
+		// just-freed name's index is still being released, and a retry by id
+		// heals it. Checked before the state below so the attempt leaves the
+		// server untouched, exactly like the real transient window.
+		if left, ok := t.failRenameOnce[id+"->"+name]; ok && left > 0 {
+			t.failRenameOnce[id+"->"+name] = left - 1
+			return okResp(nameOccupied), nil
+		}
+		// The server never overwrites: a rename onto a name another object
+		// holds fails with the name-occupied code, which is what makes the
+		// listing a trustworthy oracle for a lost response.
+		if held, ok := t.names[name]; ok && held != id {
+			return okResp(nameOccupied), nil
+		}
+		if t.renameLandsButFails[id+"->"+name] {
+			t.applyRename(id, name)
+			return nil, errors.New("simulated lost response")
+		}
+		if t.failRenameTransport != nil && t.failRenameTransport(id, name) {
+			// A transport-level failure: the handler returns no response at
+			// all, which is what makes f.call fail with a bare error and the
+			// pacer wrap it in fserrors.RetryError. Nothing changed server-side.
+			return nil, errors.New("simulated transport failure")
+		}
+		if t.renameOrdinalFail(len(t.renames)) {
+			return okResp(boom), nil
+		}
+		t.applyRename(id, name)
+	case "DeleteFile":
+		id := ""
+		if list, ok := fields["fileList"].([]any); ok && len(list) > 0 {
+			id, _ = list[0].(string)
+		}
+		t.deletes = append(t.deletes, id)
+		t.ops = append(t.ops, "delete:"+id)
+		if t.failDelete {
+			return okResp(boom), nil
+		}
+		for n, held := range t.names {
+			if held == id {
+				delete(t.names, n)
+			}
+		}
+	}
+	return okResp(ok), nil
+}
+
+// newUpdateFixture builds an Fs with dir/a.bin cached, an object for it, and the
+// matching source info, so Update runs entirely offline.
+func newUpdateFixture(t *testing.T, tr *updateTransport, newSize int64) (*Fs, *Object, fs.ObjectInfo) {
+	t.Helper()
+	f := newUnitTestFs(tr)
+	// A configured upload_zone keeps GetZoneInfo (and its own dispatcher call)
+	// out of the recorded sequence.
+	f.opt.UploadZone = "https://zone.example"
+	// Keep a failing-rename test fast: the production budget is 60s.
+	f.renameDeadlineOverride = 50 * time.Millisecond
+	// And a missing listing entry fast: the production budget is 20s.
+	f.listBudgetOverride = 50 * time.Millisecond
+	// Model the server's name index: the old object currently holds "a.bin".
+	if tr.names == nil {
+		tr.names = map[string]string{}
+	}
+	tr.names["a.bin"] = "old-id"
+	// FindRoot short-circuits on the empty root (no network) and must come
+	// first: _findRoot flushes the cache, so seed "dir" only afterwards.
+	require.NoError(t, f.dirCache.FindRoot(context.Background(), false))
+	f.dirCache.Put("dir", "dir-id")
+	o := &Object{fs: f, remote: "dir/a.bin", id: "old-id", fid: "old-fid", size: 10}
+	src := fsobject.NewStaticObjectInfo("dir/a.bin", time.Now(), newSize, true, nil, nil)
+	return f, o, src
+}
+
+// TestUnitUpdateLosslessHappyPath locks the order that makes the update
+// lossless: the new content is uploaded first, the old object is only parked
+// (never deleted) once that succeeded, the new object is installed under the
+// real name, and only then is the backup dropped.
+func TestUnitUpdateLosslessHappyPath(t *testing.T) {
+	tr := &updateTransport{}
+	_, o, src := newUpdateFixture(t, tr, 99)
+
+	require.NoError(t, o.Update(context.Background(), bytes.NewReader(make([]byte, 99)), src))
+
+	require.Len(t, tr.ops, 4, "expected upload, park, install, drop-backup: %v", tr.ops)
+	assert.True(t, strings.HasPrefix(tr.ops[0], "upload:"), "the upload must come first, got %v", tr.ops)
+	require.Len(t, tr.uploads, 1)
+	assert.True(t, strings.HasPrefix(tr.uploads[0], "a.bin.rclone-tmp-"),
+		"the new content goes to a temp name, got %q", tr.uploads[0])
+	require.Len(t, tr.renames, 2)
+	assert.True(t, strings.HasPrefix(tr.renames[0], "a.bin.rclone-old-"),
+		"the old object is parked under a backup name, got %q", tr.renames[0])
+	assert.Equal(t, "a.bin", tr.renames[1], "the new object must be installed under the real name")
+	assert.Equal(t, []string{"old-id"}, tr.deletes, "only the old object may be deleted")
+
+	// The IDs matter as much as the names: renaming the OLD object onto the real
+	// name (instead of the new one) produces exactly the same name sequence and
+	// then deletes the file that is actually at the real name - silent data
+	// loss. Assert which object each rename targeted.
+	assert.Equal(t, []string{"old-id", "new-id"}, tr.renameIDs,
+		"the park must move the OLD object and the install must move the NEW one")
+
+	// The receiver must describe the new content.
+	assert.Equal(t, "new-id", o.id)
+	assert.Equal(t, "new-fid", o.fid)
+	assert.Equal(t, int64(99), o.size)
+}
+
+// TestUnitUpdateUploadFailureLeavesOldObject is the core data-safety lock: when
+// the upload fails, the old object must not be touched at all - no rename, no
+// delete - so the file is still readable under its own name.
+func TestUnitUpdateUploadFailureLeavesOldObject(t *testing.T) {
+	tr := &updateTransport{failUpload: true}
+	_, o, src := newUpdateFixture(t, tr, 99)
+
+	err := o.Update(context.Background(), bytes.NewReader(make([]byte, 99)), src)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "boom")
+	assert.False(t, fserrors.IsNoLowLevelRetryError(err),
+		"an upload failure leaves the old object intact, so a whole-file retry is safe")
+	assert.Len(t, tr.ops, 1, "nothing may happen after a failed upload: %v", tr.ops)
+	require.Len(t, tr.uploads, 1)
+	assert.True(t, strings.HasPrefix(tr.uploads[0], "a.bin.rclone-tmp-"), "got %q", tr.uploads[0])
+	assert.Empty(t, tr.renames, "the old object must not be parked before the new content is on the server")
+	assert.Empty(t, tr.deletes, "the old object must never be deleted before the new one is in place")
+	assert.Equal(t, "old-id", o.id, "the receiver must keep describing the old object")
+}
+
+// TestUnitUpdateParkFailureKeepsOldObject covers a failure of the park rename:
+// the error must stop the whole-file retry (a retry would upload another temp)
+// and must not delete anything, since the park's outcome is uncertain.
+func TestUnitUpdateParkFailureKeepsOldObject(t *testing.T) {
+	tr := &updateTransport{failRenameAt: []int{1}}
+	_, o, src := newUpdateFixture(t, tr, 99)
+
+	err := o.Update(context.Background(), bytes.NewReader(make([]byte, 99)), src)
+	require.Error(t, err)
+	assert.True(t, fserrors.IsNoLowLevelRetryError(err), "got: %v", err)
+	assert.Contains(t, err.Error(), "backup name")
+	assert.Equal(t, "old-id", o.id)
+	assert.Empty(t, tr.deletes, "an uncertain park must not trigger any delete")
+	assert.Len(t, tr.renames, 1, "the install must not be attempted after a failed park")
+}
+
+// TestUnitUpdateInstallFailureRestoresOldObject covers the recoverable branch:
+// installing the new object fails, so the old object is renamed back to the
+// real name and the file stays reachable.
+func TestUnitUpdateInstallFailureRestoresOldObject(t *testing.T) {
+	tr := &updateTransport{failRenameAt: []int{2}}
+	_, o, src := newUpdateFixture(t, tr, 99)
+
+	err := o.Update(context.Background(), bytes.NewReader(make([]byte, 99)), src)
+	require.Error(t, err)
+	assert.True(t, fserrors.IsNoLowLevelRetryError(err), "got: %v", err)
+	require.Len(t, tr.renames, 3, "park, install, restore: %v", tr.renames)
+	assert.Equal(t, "a.bin", tr.renames[2], "the restore must put the OLD object back under the real name")
+	assert.Equal(t, "old-id", tr.renameIDs[2], "the restore must target the OLD object, not the temp")
+	// The temp is deliberately NOT deleted: the listing may have been wrong or
+	// raced a concurrent writer, in which case it holds the only copy of the
+	// new content. Assert the invariant rather than only the delete count.
+	assert.Empty(t, tr.deletes, "nothing may be deleted when the install failed")
+	assert.Equal(t, "old-id", o.id, "the receiver still describes the old object")
+	assert.Equal(t, "old-id", tr.names["a.bin"], "the old content must own the real name again")
+	assert.NotContains(t, tr.deletes, "new-id", "the temp must never be deleted on this path")
+}
+
+// TestUnitUpdateTransportFailureSuppressesWholeFileRetry locks the interaction
+// that makes NoLowLevelRetryError a no-op on its own: f.pacer.Call wraps an
+// exhausted-retry transport failure in fserrors.RetryError, and copy.go checks
+// IsRetryError BEFORE ShouldRetry (the only place the NoLowLevelRetry marker is
+// honoured). A transport-level rename failure must therefore come back with the
+// pacer's marker already stripped, or the whole file is re-uploaded each round.
+func TestUnitUpdateTransportFailureSuppressesWholeFileRetry(t *testing.T) {
+	// Fail the park at the transport level: no RSP_CODE, just a dead connection.
+	tr := &updateTransport{failRenameTransport: func(id, _ string) bool { return id == "old-id" }}
+	_, o, src := newUpdateFixture(t, tr, 99)
+
+	err := o.Update(context.Background(), bytes.NewReader(make([]byte, 99)), src)
+	require.Error(t, err)
+	assert.True(t, fserrors.IsNoLowLevelRetryError(err), "got: %v", err)
+	assert.False(t, fserrors.IsRetryError(err),
+		"the pacer's RetryError marker must be stripped, or copy.go retries the whole file")
+	assert.False(t, fserrors.ShouldRetry(err),
+		"ShouldRetry must see the NoLowLevelRetry marker, got: %v", err)
+	assert.Equal(t, "old-id", o.id, "the receiver must still describe the old object")
+	assert.Empty(t, tr.deletes, "a transport-failed park must not delete anything")
+	// The park never succeeded, so nothing may have been moved onto the real
+	// name, and the temp upload must not have been repeated.
+	assert.Len(t, tr.uploads, 1, "a whole-file retry would re-upload the temp")
+	for i, id := range tr.renameIDs {
+		assert.Equal(t, "old-id", id, "rename %d must target the old object", i)
+	}
+}
+
+// TestUnitUpdateTransportFailureOnInstallRestores locks the same interaction on
+// the install step, where the consequence is worse: the temp object exists, so a
+// whole-file retry would upload another temp every round while the real name
+// stays empty.
+func TestUnitUpdateTransportFailureOnInstallRestores(t *testing.T) {
+	// Fail only the install (new object) at the transport level, so the restore
+	// of the old object can still succeed.
+	tr := &updateTransport{failRenameTransport: func(id, _ string) bool { return id == "new-id" }}
+	_, o, src := newUpdateFixture(t, tr, 99)
+
+	err := o.Update(context.Background(), bytes.NewReader(make([]byte, 99)), src)
+	require.Error(t, err)
+	assert.True(t, fserrors.IsNoLowLevelRetryError(err), "got: %v", err)
+	assert.False(t, fserrors.IsRetryError(err), "the pacer's RetryError marker must be stripped")
+	assert.Len(t, tr.uploads, 1, "a whole-file retry would re-upload the temp")
+	assert.Empty(t, tr.deletes, "nothing may be deleted when the install failed")
+	// The last rename must be the restore: the OLD object back under the real
+	// name. Without it the file would be left only under the backup name.
+	require.NotEmpty(t, tr.renames)
+	last := len(tr.renames) - 1
+	assert.Equal(t, "a.bin", tr.renames[last], "the last rename must restore the real name")
+	assert.Equal(t, "old-id", tr.renameIDs[last], "the restore must target the OLD object")
+}
+
+// TestUnitUpdateRestoreRetriesTransientName locks the retry at the restore call
+// site. The restore targets the name the park just vacated, which is exactly the
+// window in which the server answers with the transient name-occupied code, so
+// a single-shot restore would leave the file only under the backup name.
+func TestUnitUpdateRestoreRetriesTransientName(t *testing.T) {
+	// The install fails terminally (a plain business error, not the transient
+	// code), and the first restore attempt hits the name-release window.
+	tr := &updateTransport{
+		failRenameAt:   []int{2},
+		failRenameOnce: map[string]int{"old-id->a.bin": 1},
+	}
+	_, o, src := newUpdateFixture(t, tr, 99)
+
+	err := o.Update(context.Background(), bytes.NewReader(make([]byte, 99)), src)
+	require.Error(t, err, "the install failure must still be reported")
+
+	// park, install, restore attempt 1 (transient), restore attempt 2.
+	require.Len(t, tr.renames, 4, "the transient restore must have been retried: %v", tr.renames)
+	assert.Equal(t, "a.bin", tr.renames[3], "the last rename must restore the real name")
+	assert.Equal(t, "old-id", tr.renameIDs[3], "the restore must target the OLD object")
+	assert.Equal(t, "old-id", tr.names["a.bin"], "the old content must own the real name again")
+}
+
+// TestUnitUpdateInstallAndRestoreFailureNamesTheBackup is the worst case: the
+// install fails and the restore fails too. The old bytes are still under the
+// backup name, so the error must name it - that is the only pointer the user
+// gets to recover the file by hand.
+func TestUnitUpdateInstallAndRestoreFailureNamesTheBackup(t *testing.T) {
+	tr := &updateTransport{failRenameAt: []int{2, 3}}
+	_, o, src := newUpdateFixture(t, tr, 99)
+
+	err := o.Update(context.Background(), bytes.NewReader(make([]byte, 99)), src)
+	require.Error(t, err)
+	assert.True(t, fserrors.IsNoLowLevelRetryError(err), "got: %v", err)
+	assert.Contains(t, err.Error(), "a.bin.rclone-old-", "the error must name the backup holding the old content")
+	assert.Contains(t, err.Error(), "still intact")
+	assert.Empty(t, tr.deletes)
+}
+
+// TestUnitUpdateLostResponseInstallCountsAsSuccess locks the case where the
+// install rename LANDS but its response is lost. Reporting failure there is
+// wrong twice over: the update actually succeeded, and the restore that would
+// otherwise follow burns a second 60s deadline and then tells the user the
+// wrong thing. The listing is the oracle that tells the two apart.
+func TestUnitUpdateLostResponseInstallCountsAsSuccess(t *testing.T) {
+	// The install takes effect server-side but always reports an error.
+	tr := &updateTransport{renameLandsButFails: map[string]bool{"new-id->a.bin": true}}
+	_, o, src := newUpdateFixture(t, tr, 99)
+
+	err := o.Update(context.Background(), bytes.NewReader(make([]byte, 99)), src)
+	require.NoError(t, err, "a landed install must not be reported as a failure")
+
+	// The park and the install are the only renames: no restore may follow.
+	for i, id := range tr.renameIDs {
+		want := "old-id"
+		if i > 0 {
+			want = "new-id"
+		}
+		assert.Equal(t, want, id, "rename %d", i)
+	}
+	// The backup is still dropped, and the receiver describes the new content.
+	assert.Equal(t, []string{"old-id"}, tr.deletes, "the backup must still be dropped")
+	assert.Equal(t, "new-id", o.id)
+	assert.Equal(t, int64(99), o.size)
+}
+
+// TestUnitUpdateInstallFailureRestoresWhenListingSaysNotLanded is the other half
+// of the oracle: when the name does NOT hold the new id, the install genuinely
+// did not land and the old object must go back.
+func TestUnitUpdateInstallFailureRestoresWhenListingSaysNotLanded(t *testing.T) {
+	// The install fails with a business error and does not touch the server.
+	tr := &updateTransport{failRenameAt: []int{2}}
+	_, o, src := newUpdateFixture(t, tr, 99)
+
+	err := o.Update(context.Background(), bytes.NewReader(make([]byte, 99)), src)
+	require.Error(t, err)
+	require.Len(t, tr.renames, 3, "park, install, restore: %v", tr.renames)
+	assert.Equal(t, "a.bin", tr.renames[2], "the old object must be restored")
+	assert.Equal(t, "old-id", tr.renameIDs[2])
+	assert.Equal(t, "old-id", o.id)
+}
+
+// TestUnitUpdateInstallListingUnavailableStillRestores proves the conservative
+// default: if the confirming listing itself fails, the code must assume the
+// install did not land and restore, because the opposite mistake would leave the
+// real name empty.
+func TestUnitUpdateInstallListingUnavailableStillRestores(t *testing.T) {
+	tr := &updateTransport{failRenameAt: []int{2}, listFails: true}
+	_, o, src := newUpdateFixture(t, tr, 99)
+
+	err := o.Update(context.Background(), bytes.NewReader(make([]byte, 99)), src)
+	require.Error(t, err)
+	require.Len(t, tr.renames, 3, "park, install, restore: %v", tr.renames)
+	assert.Equal(t, "old-id", tr.renameIDs[2], "a failed listing must default to restoring")
+	assert.Equal(t, "old-id", o.id)
+}
+
+// TestUnitEncodingEscapesServerRefusedCharacters locks the registered encoding
+// default against the characters the server refuses. A name holding ? * < > is
+// rejected with '1009 名称中含有非法字符' - and on the upload path that
+// rejection surfaces as a bare HTTP 500 - so the encoder must rewrite exactly
+// those, and must leave the characters the server does store alone.
+func TestUnitEncodingEscapesServerRefusedCharacters(t *testing.T) {
+	// Read the default off the registry, so dropping a flag from the option
+	// fails here rather than silently changing what reaches the server.
+	ri, err := fs.Find("wopan")
+	require.NoError(t, err)
+	var def encoder.MultiEncoder
+	for _, opt := range ri.Options {
+		if opt.Name == config.ConfigEncoding {
+			var ok bool
+			def, ok = opt.Default.(encoder.MultiEncoder)
+			require.True(t, ok, "the encoding default must be a MultiEncoder")
+		}
+	}
+	require.NotZero(t, def, "the wopan encoding option must have a default")
+	enc := def
+
+	// Refused by the server, so they must be rewritten.
+	for _, r := range "?*<>" {
+		standard := "a" + string(r) + "b.txt"
+		encoded := enc.FromStandardName(standard)
+		assert.NotEqual(t, standard, encoded, "%q must be escaped before it reaches the server", r)
+		assert.Equal(t, standard, enc.ToStandardName(encoded),
+			"%q must decode back to the name the caller used", r)
+	}
+
+	// Stored verbatim by the server, so escaping them would rename files.
+	// (The slash is excluded: it is the path separator and Standard escapes
+	// it like every other backend does.)
+	for _, r := range `:"|` {
+		standard := "a" + string(r) + "b.txt"
+		assert.Equal(t, standard, enc.FromStandardName(standard),
+			"%q is stored verbatim and must not be escaped", r)
+	}
+
+	// A byte that is not valid UTF-8 cannot survive the round trip to the
+	// server unescaped, and it is not a rune, so it needs its own case.
+	invalid := "a\xffb.txt"
+	encodedInvalid := enc.FromStandardName(invalid)
+	assert.NotEqual(t, invalid, encodedInvalid,
+		"an invalid UTF-8 byte must be escaped before it reaches the server")
+	assert.Equal(t, invalid, enc.ToStandardName(encodedInvalid),
+		"an escaped invalid byte must decode back to the byte the caller used")
+}
+
+// TestUnitLeafHoldsMatchesEncodedNames is the regression lock for the encoding
+// mismatch: the rename is issued with an ENCODED leaf, while listDirEntries
+// returns STANDARD names, so leafHolds must convert before comparing. Without
+// that, a name holding a reserved character (which the encoder escapes) would
+// never match and every lost-response install would be misread as not landed.
+func TestUnitLeafHoldsMatchesEncodedNames(t *testing.T) {
+	enc := encoder.Standard | encoder.EncodeInvalidUtf8
+	// A name the encoder rewrites, so the encoded and standard forms differ.
+	// The \xff is a raw invalid UTF-8 byte, which the encoder escapes.
+	const standard = "a*b\xffc"
+	encoded := enc.FromStandardName(standard)
+	require.NotEqual(t, standard, encoded, "the encoder must rewrite this name for the test to mean anything")
+	require.Contains(t, encoded, string(encoder.QuoteRune), "the encoder must have escaped a byte")
+
+	// The listing serves STANDARD names.
+	tr := &updateTransport{names: map[string]string{standard: "id-1"}}
+	f := newUnitTestFs(tr)
+	f.listBudgetOverride = 20 * time.Millisecond
+
+	// The caller passes the encoded form, exactly as Update does.
+	got, err := f.leafHolds(context.Background(), "dir-id", encoded, "id-1")
+	require.NoError(t, err)
+	assert.True(t, got, "an encoded leaf must match the standard name from the listing")
+
+	// And it must still reject a different holder.
+	got, err = f.leafHolds(context.Background(), "dir-id", encoded, "id-2")
+	require.NoError(t, err)
+	assert.False(t, got)
+}
+
+// TestUnitLeafHolds locks the oracle itself: it reports the id that holds a name,
+// treats a different holder as false, and reports false for a name nobody holds.
+func TestUnitLeafHolds(t *testing.T) {
+	tr := &updateTransport{names: map[string]string{"a.bin": "id-1", "b.bin": "id-2"}}
+	f := newUnitTestFs(tr)
+	f.listBudgetOverride = 20 * time.Millisecond
+
+	got, err := f.leafHolds(context.Background(), "dir-id", "a.bin", "id-1")
+	require.NoError(t, err)
+	assert.True(t, got, "the name holds this id")
+
+	got, err = f.leafHolds(context.Background(), "dir-id", "a.bin", "id-9")
+	require.NoError(t, err)
+	assert.False(t, got, "a different object holds the name")
+
+	got, err = f.leafHolds(context.Background(), "dir-id", "missing.bin", "id-1")
+	require.NoError(t, err)
+	assert.False(t, got, "nobody holds the name")
+
+	// A listing failure is reported, so the caller can pick the safe default.
+	f2 := newUnitTestFs(&updateTransport{listFails: true})
+	f2.listBudgetOverride = 20 * time.Millisecond
+	_, err = f2.leafHolds(context.Background(), "dir-id", "a.bin", "id-1")
+	require.Error(t, err, "a listing failure must be surfaced")
+
+	// Names are case-insensitive, so a listing that reports a different case
+	// than the name the rename was issued with must still match - the server
+	// may normalise the case, and a miss here would misread a landed install
+	// as "did not land" and report a successful update as failed.
+	tr.names["C.BIN"] = "id-3"
+	got, err = f.leafHolds(context.Background(), "dir-id", "c.bin", "id-3")
+	require.NoError(t, err)
+	assert.True(t, got, "the comparison must ignore case")
+}
+
+// TestUnitLeafHoldsIgnoresDirectories locks the type filter: only a FILE entry
+// may answer the oracle. The listing holds both files and directories, and a
+// directory can never be the object a rename moved, so matching one would make
+// the oracle report a landed install that never happened.
+func TestUnitLeafHoldsIgnoresDirectories(t *testing.T) {
+	// A directory that (contrived, but this is the invariant being locked)
+	// holds the very id being looked for, with no file of that name present.
+	tr := &updateTransport{dirEntries: map[string]string{"a.bin": "id-1"}}
+	f := newUnitTestFs(tr)
+	f.listBudgetOverride = 20 * time.Millisecond
+
+	got, err := f.leafHolds(context.Background(), "dir-id", "a.bin", "id-1")
+	require.NoError(t, err)
+	assert.False(t, got, "a directory entry must never answer for a file")
+}
+
+// TestUnitLeafHoldsWaitsForVisibility locks the polling loop: the directory
+// index is eventually consistent, so an entry that is not there yet must be
+// waited for rather than read as "absent". Without the wait the oracle would
+// report a landed install as not landed whenever the listing lagged - exactly
+// the case it exists to disambiguate.
+func TestUnitLeafHoldsWaitsForVisibility(t *testing.T) {
+	// The entry is missing from the first listing and appears in the second.
+	tr := &updateTransport{
+		names:     map[string]string{"a.bin": "id-1"},
+		hideEntry: map[string]int{"a.bin": 1},
+	}
+	f := newUnitTestFs(tr)
+	// Long enough for one backoff interval (the loop starts at a second).
+	f.listBudgetOverride = 5 * time.Second
+
+	got, err := f.leafHolds(context.Background(), "dir-id", "a.bin", "id-1")
+	require.NoError(t, err)
+	assert.True(t, got, "the oracle must wait out the visibility delay")
+	// At least two page-0 listings: the first omits the entry, the second
+	// serves it. Assert the poll count loosely - the exact number also depends
+	// on how listAll pages, and pinning it would make this fail for a
+	// pagination change rather than a real regression.
+	assert.GreaterOrEqual(t, tr.listCalls, 2, "the oracle must have polled more than once")
+	assert.Equal(t, 0, tr.hideEntry["a.bin"], "the visibility counter must have been consumed")
+}
+
+// TestUnitRenameWithBackoffRetriesTransient locks the retry loop: a rename onto
+// a name whose index has just been released answers with the transient
+// name-occupied code, and only a retry by id heals it. A single-shot rename
+// would surface that as a failed update, and the restore path in particular
+// depends on it - it targets the name the park just vacated.
+func TestUnitRenameWithBackoffRetriesTransient(t *testing.T) {
+	// The first attempt answers with the transient code, the second succeeds.
+	tr := &updateTransport{failRenameOnce: map[string]int{"old-id->b.bin": 1}}
+	f := newUnitTestFs(tr)
+	f.renameDeadlineOverride = 5 * time.Second
+
+	require.NoError(t, f.renameWithBackoff(context.Background(), "old-id", "b.bin"))
+	assert.Equal(t, []string{"old-id", "old-id"}, tr.renameIDs,
+		"the transient failure must be retried, not surfaced")
+	assert.Equal(t, "old-id", tr.names["b.bin"], "the retry must have landed the rename")
+
+	// A transient answer must not move the id: that is what makes retrying
+	// safe, and what the real name-release window looks like. Drive every
+	// attempt into the transient branch so the final state is observable -
+	// with a retry that succeeds, the name ends up held either way and the
+	// invariant would be invisible.
+	tr3 := &updateTransport{failRenameOnce: map[string]int{"old-id->b.bin": 100}}
+	f3 := newUnitTestFs(tr3)
+	f3.renameDeadlineOverride = 500 * time.Millisecond
+	err := f3.renameWithBackoff(context.Background(), "old-id", "b.bin")
+	require.Error(t, err, "a persistently transient rename must eventually give up")
+	assert.Empty(t, tr3.names, "a transient answer must never move the id")
+	// The transient branch must actually have been taken. This also guards the
+	// assertion above from passing trivially: if the branch never fired, the
+	// first attempt would have succeeded and left the name held. Asserted via
+	// the counter rather than the attempt count, which would depend on how
+	// long the first attempt happened to take against the deadline.
+	assert.Less(t, tr3.failRenameOnce["old-id->b.bin"], 100,
+		"the transient branch must have been exercised")
+
+	// A terminal business error must NOT be retried: the deadline exists to
+	// heal the transient window, not to hammer a real rejection.
+	tr2 := &updateTransport{failRenameAt: []int{1}}
+	f2 := newUnitTestFs(tr2)
+	f2.renameDeadlineOverride = 5 * time.Second
+	require.Error(t, f2.renameWithBackoff(context.Background(), "old-id", "b.bin"))
+	assert.Len(t, tr2.renameIDs, 1, "a terminal error must fail on the first attempt")
+}
+
+// TestUnitUpdateBackupDeleteFailureStillSucceeds locks the step-4 contract: the
+// new content already owns the name, so failing to drop the backup only leaks
+// quota and must never be reported as a failed update (a retry would upload the
+// file again).
+func TestUnitUpdateBackupDeleteFailureStillSucceeds(t *testing.T) {
+	tr := &updateTransport{failDelete: true}
+	_, o, src := newUpdateFixture(t, tr, 99)
+
+	require.NoError(t, o.Update(context.Background(), bytes.NewReader(make([]byte, 99)), src))
+	assert.Equal(t, "new-id", o.id, "the update must still be applied to the receiver")
+	assert.Equal(t, int64(99), o.size)
+	require.Len(t, tr.ops, 4)
+	assert.Equal(t, "delete:old-id", tr.ops[3])
+}
+
+// TestUnitBackupNameTruncate locks the backup name helper: the old object's name
+// is truncated so that the suffix keeps the total inside the 100-rune limit the
+// server enforces - a too-long backup name would fail the park and abort the
+// update of a file whose name was otherwise acceptable.
+func TestUnitBackupNameTruncate(t *testing.T) {
+	enc := encoder.Standard | encoder.EncodeInvalidUtf8
+	got := backupName(enc, strings.Repeat("名", 200))
+	assert.Equal(t, 100, utf8.RuneCountInString(got), "the backup name must fit the 100-rune limit")
+	assert.Contains(t, got, ".rclone-old-")
+
+	// A short leaf keeps its full name so the backup stays recognisable.
+	assert.True(t, strings.HasPrefix(backupName(enc, "a.bin"), "a.bin.rclone-old-"))
+}
+
+// TestUnitTruncateNameKeepsEscapeIntact locks the encoder interaction in
+// truncateName: the encoder escapes a reserved character as QuoteRune followed
+// by more runes, so a cut landing inside an escape group leaves a name whose
+// tail decodes to something else entirely. A truncated name must always be a
+// well-formed encoded name, i.e. it must survive a decode/re-encode round trip.
+func TestUnitTruncateNameKeepsEscapeIntact(t *testing.T) {
+	enc := encoder.Standard | encoder.EncodeInvalidUtf8
+	suffix := ".rclone-old-12345678" // 20 runes, so the body is cut at 80
+
+	// The encoder expands an invalid byte to QuoteRune + two hex digits, so a
+	// name of 78 x's plus one invalid byte encodes to 81 runes and the 80-rune
+	// cut lands inside the escape group.
+	leaf := enc.FromStandardName(strings.Repeat("x", 78) + "\xff")
+	require.Equal(t, 81, utf8.RuneCountInString(leaf), "escape group layout changed")
+
+	got := truncateName(enc, leaf, suffix)
+	// The cut lands mid-escape: 80 runes = 78 x's + QuoteRune + one hex digit.
+	// The hex digit is dropped (not a well-formed tail), then the now-dangling
+	// QuoteRune, leaving the 78 x's + the 20-rune suffix.
+	assert.Equal(t, 98, utf8.RuneCountInString(got),
+		"the malformed escape tail must be dropped entirely")
+	assert.Equal(t, strings.Repeat("x", 78)+suffix, got)
+	assert.Equal(t, got, enc.FromStandardName(enc.ToStandardName(got)),
+		"a truncated name must survive a decode/re-encode round trip")
+
+	// The general invariant across every cut position and escape shape.
+	tails := []string{"x", "\xff", "\xff\xff", " ", "\xff "}
+	for n := 60; n <= 95; n++ {
+		for _, tail := range tails {
+			s := strings.Repeat("x", n) + tail
+			encLeaf := enc.FromStandardName(s)
+			got := truncateName(enc, encLeaf, suffix)
+			assert.LessOrEqual(t, utf8.RuneCountInString(got), 100,
+				"n=%d tail=%q exceeds the limit", n, tail)
+			assert.True(t, strings.HasSuffix(got, suffix),
+				"n=%d tail=%q lost the suffix: %q", n, tail, got)
+			assert.Equal(t, got, enc.FromStandardName(enc.ToStandardName(got)),
+				"n=%d tail=%q is not a well-formed encoded name: %q", n, tail, got)
+			// Truncation must not drop more than the malformed tail: the kept
+			// body has to stay a prefix of the encoded leaf.
+			body := strings.TrimSuffix(got, suffix)
+			assert.True(t, strings.HasPrefix(encLeaf, body),
+				"n=%d tail=%q kept %q, which is not a prefix of %q", n, tail, body, encLeaf)
+		}
+	}
 }
