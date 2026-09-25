@@ -8,6 +8,7 @@ import (
 
 	"github.com/rclone/rclone/backend/yun139/api"
 	"github.com/rclone/rclone/fs/fserrors"
+	"github.com/rclone/rclone/lib/encoder"
 )
 
 // TestPlanParts verifies the byte ranges produced by planParts for a few
@@ -149,14 +150,17 @@ func TestParsePath_CleansDotDot(t *testing.T) {
 	}
 }
 
-// TestValidateName pins the client-side name rejection: the 139 server
-// returns RSP_CODE 04000002 for the eight reserved ASCII characters
-// `" * : < > ? \ |` (probe 2026-09-19), so validateName must refuse them
-// with NoRetryError instead of pushing the name to the backend. Everything
-// the encoder can handle (control chars, leading/trailing space·dot,
-// leading tilde) and everything the server accepts (CJK, é, symbols,
-// emoji) must pass.
+// TestValidateName pins the client-side name guard: the 139 server returns
+// RSP_CODE 04000002 for the eight reserved ASCII characters
+// `" * : < > ? \ |` (probe 2026-09-19). The default encoding escapes all
+// eight to fullwidth substitutes the server stores verbatim, so a standard
+// name is never refused; validateName guards the bytes that actually go on
+// the wire and must still refuse a raw reserved character, with NoRetryError.
+// Everything the encoder handles (control chars, leading/trailing space·dot,
+// leading tilde) and everything the server accepts (CJK, é, symbols, emoji)
+// must pass.
 func TestValidateName(t *testing.T) {
+	// Raw wire bytes: still refused, since the server rejects them.
 	rejected := []string{
 		`a"b`, `a*b`, `a:b`, `a<b>`, `a?b`, `a\b`, `a|b`,
 		`qu"ote`, `"lead`, `trail"`, `star*`,
@@ -175,7 +179,7 @@ func TestValidateName(t *testing.T) {
 		"emoji😀.txt", "©®™✓", "°±²³", "→↔★☀",
 		" leading space", "trailing space ",
 		".hidden", "trailing dot.",
-		"a\tb.txt", "a\nb.txt", "~tilde", // encoder handles these
+		"a	b.txt", "a\nb.txt", "~tilde", // encoder handles these
 	}
 	for _, n := range accepted {
 		if err := validateName(n); err != nil {
@@ -187,14 +191,24 @@ func TestValidateName(t *testing.T) {
 	if err := validateName(""); err != nil {
 		t.Errorf("validateName(\"\") rejected: %v", err)
 	}
-	f := &Fs{}
-	// (f *Fs).validateName checks only the base leaf, so a reserved char in
-	// an intermediate directory must NOT trigger the file-name rejection.
-	if err := f.validateName("dir/a*name.txt"); err == nil {
-		t.Errorf("(f).validateName rejected path with reserved char in leaf: want error")
+	enc := encoder.MultiEncoder(yun139DefaultEncoding)
+	f := &Fs{opt: Options{Enc: enc}}
+	// (f *Fs).validateName encodes before checking, so a reserved character in
+	// the leaf is escaped and accepted, while a reserved character in an
+	// intermediate directory is not part of the leaf and is left alone.
+	if err := f.validateName("dir/a*name.txt"); err != nil {
+		t.Errorf("(f).validateName rejected a reserved char in the leaf, which the encoding escapes: %v", err)
 	}
 	if err := f.validateName("a:dir/name.txt"); err != nil {
 		t.Errorf("(f).validateName rejected reserved char in parent dir: %v", err)
+	}
+	// The default encoding must escape every reserved character, or the guard
+	// above would start refusing names the server can in fact store.
+	for _, r := range yun139RejectedRunes {
+		wire := enc.FromStandardName("a" + string(r) + "b")
+		if err := validateName(wire); err != nil {
+			t.Errorf("default encoding left reserved character %q on the wire as %q: %v", r, wire, err)
+		}
 	}
 }
 

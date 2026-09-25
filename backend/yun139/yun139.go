@@ -106,6 +106,24 @@ type Options struct {
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
+// yun139DefaultEncoding is the default value of the encoding option: every
+// name character the server refuses, plus the ones the encoder can round-trip.
+//
+// 139 rejects names with leading/trailing whitespace, control chars, leading
+// tilde/period, invalid UTF-8, and the eight reserved ASCII characters
+// `" * : < > ? \ |`, all with '04000002: 文件名称不符合标准'. The encoder's
+// fullwidth substitutes for the reserved characters are stored verbatim by the
+// server, so escaping them is what makes such names work at all.
+const yun139DefaultEncoding = encoder.Standard | encoder.EncodeInvalidUtf8 |
+	encoder.EncodeLeftSpace | encoder.EncodeLeftTilde |
+	encoder.EncodeLeftCrLfHtVt | encoder.EncodeRightSpace |
+	encoder.EncodeRightCrLfHtVt | encoder.EncodeLeftPeriod |
+	encoder.EncodeRightPeriod |
+	encoder.EncodeDoubleQuote | encoder.EncodeAsterisk |
+	encoder.EncodeColon | encoder.EncodeLtGt |
+	encoder.EncodeQuestion | encoder.EncodePipe |
+	encoder.EncodeBackSlash
+
 func init() {
 	fs.Register(&fs.RegInfo{
 		Name:        "yun139",
@@ -217,15 +235,7 @@ func init() {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
-			// 139 rejects names with leading/trailing whitespace, control
-			// chars, leading tilde/period, and invalid UTF-8, with
-			// '04000002: 文件名称不符合标准'. Encode them on the wire so
-			// every fstests encoding case round-trips.
-			Default: encoder.Standard | encoder.EncodeInvalidUtf8 |
-				encoder.EncodeLeftSpace | encoder.EncodeLeftTilde |
-				encoder.EncodeLeftCrLfHtVt | encoder.EncodeRightSpace |
-				encoder.EncodeRightCrLfHtVt | encoder.EncodeLeftPeriod |
-				encoder.EncodeRightPeriod,
+			Default:  yun139DefaultEncoding,
 		}},
 	})
 }
@@ -466,18 +476,19 @@ func noRetryOnMemberQuota(err error) error {
 // enforces Windows filename rules: it rejects the control chars (0x00-0x1F,
 // 0x7F) and the eight ASCII "reserved" characters `" * : < > ? \ |`, while
 // accepting CJK, accented Latin (é), BMP symbols (© ® ° ± ✓) and non-BMP
-// emoji. The backend's default encoder already encodes the control chars,
-// leading/trailing space·dot·CR·LF·HT·VT, leading tilde/period and invalid
-// UTF-8, so only the eight reserved ASCII characters below reach the server
-// raw and trip the rejection.
+// emoji. The backend's default encoder encodes the control chars,
+// leading/trailing space·dot·CR·LF·HT·VT, leading tilde/period, invalid UTF-8
+// and all eight reserved characters, so none of them reach the server raw.
 var yun139RejectedRunes = `"*:<>?\|`
 
-// validateName checks a leaf file name against yun139's storage rules.
+// validateName checks a leaf name as it will be sent to the server.
 //
-// It returns an error wrapped with NoRetryError for names containing one of
-// yun139RejectedRunes, which the server rejects deterministically with
-// RSP_CODE 04000002. The NoRetryError wrapper stops --retries from re-running
-// a whole sync round, which is pointless for a name that can never succeed.
+// It returns an error wrapped with NoRetryError for names still containing one
+// of yun139RejectedRunes. The default encoding escapes all eight to fullwidth
+// substitutes, which the server stores verbatim, so this only fires when the
+// encoding option is configured without the flags covering them. The
+// NoRetryError wrapper stops --retries from re-running a whole sync round,
+// which is pointless for a name that can never succeed.
 //
 // sanitize (replacing illegal characters) is intentionally NOT offered: sync
 // is bidirectional, and a name transformed on the way up cannot be
@@ -490,9 +501,10 @@ func validateName(leaf string) error {
 	return nil
 }
 
-// validateName checks the leaf name of remote against yun139's storage rules.
+// validateName checks the leaf name of remote against yun139's storage rules,
+// encoding it first so the check sees the name the server would receive.
 func (f *Fs) validateName(remote string) error {
-	return validateName(path.Base(remote))
+	return validateName(f.opt.Enc.FromStandardName(path.Base(remote)))
 }
 
 // ------------------------------------------------------------ Fs ----------
@@ -1765,10 +1777,10 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 
 // CreateDir makes a directory with pathID as parent and name leaf
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
+	leaf = f.opt.Enc.FromStandardName(leaf)
 	if err := validateName(leaf); err != nil {
 		return "", err
 	}
-	leaf = f.opt.Enc.FromStandardName(leaf)
 	if f.space == spaceFamily {
 		srvPath := ""
 		// The dircache remembers the root id; only fall back to
