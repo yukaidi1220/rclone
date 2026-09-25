@@ -20,6 +20,7 @@ import (
 
 	"github.com/rclone/rclone/backend/wopan/api"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
@@ -2074,6 +2075,55 @@ func TestUnitUpdateInstallListingUnavailableStillRestores(t *testing.T) {
 	require.Len(t, tr.renames, 3, "park, install, restore: %v", tr.renames)
 	assert.Equal(t, "old-id", tr.renameIDs[2], "a failed listing must default to restoring")
 	assert.Equal(t, "old-id", o.id)
+}
+
+// TestUnitEncodingEscapesServerRefusedCharacters locks the registered encoding
+// default against the characters the server refuses. A name holding ? * < > is
+// rejected with '1009 名称中含有非法字符' - and on the upload path that
+// rejection surfaces as a bare HTTP 500 - so the encoder must rewrite exactly
+// those, and must leave the characters the server does store alone.
+func TestUnitEncodingEscapesServerRefusedCharacters(t *testing.T) {
+	// Read the default off the registry, so dropping a flag from the option
+	// fails here rather than silently changing what reaches the server.
+	ri, err := fs.Find("wopan")
+	require.NoError(t, err)
+	var def encoder.MultiEncoder
+	for _, opt := range ri.Options {
+		if opt.Name == config.ConfigEncoding {
+			var ok bool
+			def, ok = opt.Default.(encoder.MultiEncoder)
+			require.True(t, ok, "the encoding default must be a MultiEncoder")
+		}
+	}
+	require.NotZero(t, def, "the wopan encoding option must have a default")
+	enc := def
+
+	// Refused by the server, so they must be rewritten.
+	for _, r := range "?*<>" {
+		standard := "a" + string(r) + "b.txt"
+		encoded := enc.FromStandardName(standard)
+		assert.NotEqual(t, standard, encoded, "%q must be escaped before it reaches the server", r)
+		assert.Equal(t, standard, enc.ToStandardName(encoded),
+			"%q must decode back to the name the caller used", r)
+	}
+
+	// Stored verbatim by the server, so escaping them would rename files.
+	// (The slash is excluded: it is the path separator and Standard escapes
+	// it like every other backend does.)
+	for _, r := range `:"|` {
+		standard := "a" + string(r) + "b.txt"
+		assert.Equal(t, standard, enc.FromStandardName(standard),
+			"%q is stored verbatim and must not be escaped", r)
+	}
+
+	// A byte that is not valid UTF-8 cannot survive the round trip to the
+	// server unescaped, and it is not a rune, so it needs its own case.
+	invalid := "a\xffb.txt"
+	encodedInvalid := enc.FromStandardName(invalid)
+	assert.NotEqual(t, invalid, encodedInvalid,
+		"an invalid UTF-8 byte must be escaped before it reaches the server")
+	assert.Equal(t, invalid, enc.ToStandardName(encodedInvalid),
+		"an escaped invalid byte must decode back to the byte the caller used")
 }
 
 // TestUnitLeafHoldsMatchesEncodedNames is the regression lock for the encoding
