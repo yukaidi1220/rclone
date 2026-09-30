@@ -2,13 +2,23 @@ package yun139
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"encoding/json"
+	"io"
+	"net/http"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/rclone/rclone/backend/yun139/api"
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestPlanParts verifies the byte ranges produced by planParts for a few
@@ -274,4 +284,165 @@ func TestSha256MidstateSinglePass(t *testing.T) {
 			}
 		}
 	}
+}
+
+// linkTransport answers the two calls PublicLink makes for a personal-space
+// object: /hcy/file/list (to resolve it) and /hcy/file/getDownloadUrl (to mint
+// the link). It records the expireSec the backend asked for.
+type linkTransport struct {
+	mu        sync.Mutex
+	url       string
+	expireSec float64
+	minted    int
+}
+
+func (t *linkTransport) expiry() (float64, int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.expireSec, t.minted
+}
+
+func (t *linkTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	body, _ := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	reply := func(v any) (*http.Response, error) {
+		b, _ := json.Marshal(v)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader(string(b))),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	}
+	switch {
+	case strings.HasSuffix(r.URL.Path, "/hcy/file/list"):
+		return reply(map[string]any{
+			"success": true,
+			"data":    map[string]any{"items": []map[string]any{fileEntry("file-1", "a.bin", 42)}},
+		})
+	case strings.HasSuffix(r.URL.Path, "/hcy/file/getDownloadUrl"):
+		var req struct {
+			ExpireSec float64 `json:"expireSec"`
+		}
+		_ = json.Unmarshal(body, &req)
+		t.expireSec = req.ExpireSec
+		t.minted++
+		return reply(map[string]any{"success": true, "data": map[string]any{"url": t.url}})
+	}
+	return reply(map[string]any{"success": false, "code": "9999", "message": "unexpected " + r.URL.Path})
+}
+
+// TestUnitPublicLink locks the rclone link contract for yun139: a personal-space
+// file resolves to the getDownloadUrl link, the requested expiry reaches the
+// API (capped at the 24h the official client asks for), and a directory path
+// fails with the bare sentinel without touching the network.
+func TestUnitPublicLink(t *testing.T) {
+	const want = "https://dl.example/a.bin?token=abc"
+	tr := &linkTransport{url: want}
+	f := newMoveTestFs(tr)
+	require.NoError(t, f.dirCache.FindRoot(context.Background(), false))
+	f.dirCache.Put("dir", "dir-id")
+
+	link, err := f.PublicLink(context.Background(), "dir/a.bin", fs.DurationOff, false)
+	require.NoError(t, err)
+	assert.Equal(t, want, link)
+	secs, minted := tr.expiry()
+	assert.Equal(t, 1, minted)
+	assert.Equal(t, float64(defaultLinkExpireSec), secs, "no --expire must ask for the client's default")
+
+	// --expire is passed through, and an over-long one is capped at 24h.
+	_, err = f.PublicLink(context.Background(), "dir/a.bin", fs.Duration(time.Hour), false)
+	require.NoError(t, err)
+	secs, _ = tr.expiry()
+	assert.Equal(t, float64(3600), secs)
+
+	_, err = f.PublicLink(context.Background(), "dir/a.bin", fs.Duration(48*time.Hour), false)
+	require.NoError(t, err)
+	secs, _ = tr.expiry()
+	assert.Equal(t, float64(maxLinkExpireSec), secs, "an expiry beyond 24h must be capped")
+
+	// A directory path returns before NewObject, so the transport is never hit.
+	fDir := newMoveTestFs(&linkTransport{url: want})
+	_, err = fDir.PublicLink(context.Background(), "dir/sub/", fs.DurationOff, false)
+	assert.Equal(t, fs.ErrorCantShareDirectories, err)
+}
+
+// TestUnitDownloadURLTTL locks the per-space cache windows: the personal cloud
+// only grants a 15-minute link (whatever expireSec asks for), so its window must
+// stay well under that, while the family cloud grants 24h.
+func TestUnitDownloadURLTTL(t *testing.T) {
+	f := newMoveTestFs(&linkTransport{})
+	assert.Equal(t, personalDownloadURLTTL, f.downloadURLTTL())
+	f.space = spaceFamily
+	assert.Equal(t, familyDownloadURLTTL, f.downloadURLTTL())
+	assert.Less(t, personalDownloadURLTTL, 15*time.Minute, "personal links only live 15 minutes")
+	assert.Less(t, familyDownloadURLTTL, 24*time.Hour, "family links live 24 hours")
+}
+
+// familyLinkTransport answers the two family-cloud calls PublicLink makes:
+// queryContentListV3 resolves the object and getFileDownLoadURLV2 mints the
+// link.
+type familyLinkTransport struct {
+	mu     sync.Mutex
+	url    string
+	minted int
+}
+
+func (t *familyLinkTransport) calls() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.minted
+}
+
+func (t *familyLinkTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	_ = r.Body.Close()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	reply := func(v any) (*http.Response, error) {
+		b, _ := json.Marshal(v)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader(string(b))),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	}
+	switch {
+	case strings.HasSuffix(r.URL.Path, "queryContentListV3"):
+		return reply(map[string]any{
+			"result":           map[string]any{"resultCode": "0", "resultDesc": "ok"},
+			"path":             "root:/",
+			"totalCount":       1,
+			"cloudContentList": []map[string]any{familyFileEntry("file-1", "a.bin", 42)},
+		})
+	case strings.HasSuffix(r.URL.Path, "getFileDownLoadURLV2"):
+		t.minted++
+		return reply(map[string]any{
+			"result":      map[string]any{"resultCode": "0", "resultDesc": "ok"},
+			"downloadURL": t.url,
+		})
+	}
+	return reply(map[string]any{"success": false, "code": "9999", "message": "unexpected " + r.URL.Path})
+}
+
+// TestUnitPublicLinkFamily covers the other space: the family cloud's link comes
+// from getFileDownLoadURLV2, which has no expiry parameter, so a requested
+// expire is ignored (with a warning) and the link is still minted per call.
+func TestUnitPublicLinkFamily(t *testing.T) {
+	const want = "https://dl.example/fam?a=1"
+	tr := &familyLinkTransport{url: want}
+	f := newFamilyMoveTestFs(tr)
+	require.NoError(t, f.dirCache.FindRoot(context.Background(), false))
+
+	link, err := f.PublicLink(context.Background(), "a.bin", fs.DurationOff, false)
+	require.NoError(t, err)
+	assert.Equal(t, want, link)
+	assert.Equal(t, 1, tr.calls())
+
+	link, err = f.PublicLink(context.Background(), "a.bin", fs.Duration(time.Hour), false)
+	require.NoError(t, err)
+	assert.Equal(t, want, link)
+	assert.Equal(t, 2, tr.calls(), "each link call must mint from the API")
 }

@@ -63,9 +63,27 @@ const (
 	// /file/getUploadUrl (the server accepts up to 100).
 	maxPartsPerRequest = 100
 
-	// downloadURLTTL bounds the reuse of a cached download URL. The client
-	// asks for expireSec:86400 (24h), so a 23h cache is safe.
-	downloadURLTTL = 23 * time.Hour
+	// Download URLs are minted per space and the server fixes their lifetime
+	// whatever the client asks for, so these cache windows are deliberately well
+	// under the granted life. A cached URL is therefore still valid when it is
+	// handed out, and the expiry path in Open stays unreachable.
+	//
+	// The personal cloud grants 900s (15 minutes): measured 2026-10-01 (206 at
+	// 5 minutes, 403 at 15 minutes), and the official client's own capture from
+	// 2026-09-03 has a expireSec:86400 request answered with
+	// expiration = issue time + 15 minutes and X-Amz-Expires=900.
+	// The family cloud's API takes no expiry parameter and grants 24h.
+	personalDownloadURLTTL = 5 * time.Minute
+	familyDownloadURLTTL   = 20 * time.Hour
+
+	// defaultLinkExpireSec is the expireSec the official client asks for (24h).
+	// rclone link overrides it with --expire.
+	defaultLinkExpireSec = 86400
+
+	// maxLinkExpireSec is the longest lifetime the official client asks a
+	// personal-space download link for, and therefore the ceiling rclone link
+	// accepts for --expire.
+	maxLinkExpireSec = 86400
 
 	// minTokenLifetime is the remaining validity under which the token is
 	// refreshed proactively (the official client uses 15 days).
@@ -4124,6 +4142,16 @@ func sha256Feed(h interface {
 // Download (Open / fetchDownloadURL / getURL)
 // ============================================================================
 
+// downloadURLTTL returns how long a fetched download URL may be reused. The
+// server fixes each space's link lifetime, so the window is per space and well
+// under the granted life (see the constants).
+func (f *Fs) downloadURLTTL() time.Duration {
+	if f.space == spaceFamily {
+		return familyDownloadURLTTL
+	}
+	return personalDownloadURLTTL
+}
+
 // downloadURL returns a cached download URL for the object, fetching a fresh
 // one when empty or expired.
 func (o *Object) downloadURL(ctx context.Context) (string, error) {
@@ -4137,8 +4165,8 @@ func (o *Object) downloadURL(ctx context.Context) (string, error) {
 		return "", err
 	}
 	o.url = url
-	o.urlExpiry = time.Now().Add(downloadURLTTL)
-	return url, nil
+	o.urlExpiry = time.Now().Add(o.fs.downloadURLTTL())
+	return o.url, nil
 }
 
 // invalidateURL drops the cached download URL.
@@ -4190,8 +4218,14 @@ func (f *Fs) fetchDownloadURL(ctx context.Context, o *Object) (string, error) {
 		}
 		return resp.DownloadURL, nil
 	}
-	// The official client requests a 24h link (expireSec:86400).
-	body := map[string]any{"fileId": o.id, "expireSec": 86400}
+	return f.fetchDownloadURLExpire(ctx, o, maxLinkExpireSec)
+}
+
+// fetchDownloadURLExpire asks for a personal-space download URL that the server
+// should keep valid for expireSec. The granted lifetime is the server's to set, so
+// callers that cache the result treat this as a request, not a promise.
+func (f *Fs) fetchDownloadURLExpire(ctx context.Context, o *Object, expireSec int) (string, error) {
+	body := map[string]any{"fileId": o.id, "expireSec": expireSec}
 	var resp api.PersonalDownloadResp
 	err := f.pacer.Call(func() (bool, error) {
 		err := f.personalCall(ctx, "/hcy/file/getDownloadUrl", body, &resp)
@@ -4215,6 +4249,56 @@ func (f *Fs) fetchDownloadURL(ctx context.Context, o *Object) (string, error) {
 		fs.Debugf(o, "yun139: download url-type=3 (unparsed host): %.120s", dl)
 	}
 	return dl, nil
+}
+
+// PublicLink returns a direct download link for the given file.
+//
+// The link is always minted fresh - it does not come from the download-URL
+// cache - so the holder gets the full lifetime the server grants.
+//
+// The personal cloud mints it with /file/getDownloadUrl, which takes an
+// expireSec, so --expire is passed through (default defaultLinkExpireSec, the
+// 86400s the official client asks for, capped at maxLinkExpireSec). The server
+// fixes the granted lifetime regardless: measured 2026-10-01 the link dies after
+// 15 minutes and is byte-identical for expireSec 3600/21600/86400, and the
+// official client's capture of 2026-09-03 agrees (a expireSec:86400 request is
+// answered with expiration = issue time + 15 minutes). The family cloud mints
+// it with getFileDownLoadURLV2, which takes no expiry parameter and grants 24h,
+// so a requested expire is ignored there with a warning.
+//
+// Either way the URL is a direct download link - anyone holding it can fetch
+// the file until it expires - and unlink is meaningless because there is no
+// stored share to revoke. Directories cannot be linked: they return
+// fs.ErrorCantShareDirectories.
+func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
+	if strings.HasSuffix(remote, "/") {
+		return "", fs.ErrorCantShareDirectories
+	}
+	obj, err := f.NewObject(ctx, remote)
+	if err != nil {
+		return "", err
+	}
+	o := obj.(*Object)
+	// The family API takes no expiry parameter.
+	if f.space == spaceFamily {
+		if expire.IsSet() {
+			fs.Logf(f, "Public Link: the 139 family cloud has no expiry parameter, ignoring the requested expiry of %v", expire)
+		}
+		// fetchDownloadURL is the uncached path.
+		return f.fetchDownloadURL(ctx, o)
+	}
+	expireSec := defaultLinkExpireSec
+	if expire.IsSet() {
+		expireSec = int(time.Duration(expire).Seconds())
+		if expireSec > maxLinkExpireSec {
+			fs.Logf(f, "Public Link: reducing expiry to %v, the longest the 139 client asks for", time.Duration(maxLinkExpireSec)*time.Second)
+			expireSec = maxLinkExpireSec
+		}
+		if expireSec < 1 {
+			expireSec = 1
+		}
+	}
+	return f.fetchDownloadURLExpire(ctx, o, expireSec)
 }
 
 // Open opens the file for read. Call Close() on the returned io.ReadCloser.
