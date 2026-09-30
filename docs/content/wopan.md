@@ -215,11 +215,11 @@ rclone link wopan:path/to/file.bin
 
 The URL is the tokenised direct-download link returned by `GetDownloadUrlV2`,
 so anyone holding it can fetch the file until it expires. wopan fixes that
-lifetime on the server at roughly 20 minutes and the API takes no expiry
-parameter, so `--expire` has no effect - rclone logs a warning and returns the
-server-issued link as-is - and `--unlink` is meaningless because there is no
-stored share to revoke. Directories cannot be linked: `rclone link` returns
-`fs.ErrorCantShareDirectories`.
+lifetime on the server at 120 minutes (measured 2026-09-30, and not extended by
+access), and the API takes no expiry parameter, so `--expire` has no effect -
+rclone logs a warning and returns the server-issued link as-is - and `--unlink`
+is meaningless because there is no stored share to revoke. Directories cannot be
+linked: `rclone link` returns `fs.ErrorCantShareDirectories`.
 
 For longer-lived or revocable sharing, use the wopan app or web client.
 
