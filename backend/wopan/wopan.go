@@ -2695,6 +2695,28 @@ func (f *Fs) fetchDownloadURL(ctx context.Context, fid string) (string, error) {
 	return resp.List[0].DownloadURL, nil
 }
 
+// PublicLink returns a direct download link for the given file.
+//
+// The link comes from GetDownloadUrlV2 and points straight at the file's
+// download endpoint, so anyone holding it can fetch the file until it expires.
+// wopan fixes that lifetime on the server (roughly 20 minutes) and the API
+// takes no expiry parameter, so a requested expire is ignored with a warning.
+// unlink is meaningless too - there is no stored share to revoke. Directories
+// cannot be linked and return fs.ErrorCantShareDirectories.
+func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
+	if strings.HasSuffix(remote, "/") {
+		return "", fs.ErrorCantShareDirectories
+	}
+	if expire.IsSet() {
+		fs.Logf(f, "Public Link: wopan links expire after about 20 minutes, ignoring the requested expiry of %v", expire)
+	}
+	obj, err := f.NewObject(ctx, remote)
+	if err != nil {
+		return "", err
+	}
+	return obj.(*Object).downloadURL(ctx)
+}
+
 // headETag returns the ETag header of a download URL.
 //
 // A response with no ETag header yields ("", nil) rather than an error, so a

@@ -2352,3 +2352,96 @@ func TestUnitTruncateNameKeepsEscapeIntact(t *testing.T) {
 		}
 	}
 }
+
+// publicLinkTransport models just enough of the server for PublicLink:
+// QueryAllFiles answers with one file entry (id/fid/name) and GetDownloadUrlV2
+// answers with a download URL. Both DATA payloads are AES-encrypted the way the
+// real server encrypts them. The mutex guards the recorded fid against the
+// test goroutine reading it while the round trip is still returning.
+type publicLinkTransport struct {
+	mu          sync.Mutex
+	downloadURL string // returned by GetDownloadUrlV2
+	askedFid    string // fid seen in the GetDownloadUrlV2 request
+}
+
+func (t *publicLinkTransport) fid() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.askedFid
+}
+
+func (t *publicLinkTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	raw, _ := io.ReadAll(r.Body)
+	var req struct {
+		Header struct {
+			Key string `json:"key"`
+		} `json:"header"`
+		Body map[string]any `json:"body"`
+	}
+	_ = json.Unmarshal(raw, &req)
+	fields := map[string]any{}
+	if enc, ok := req.Body["param"].(string); ok && enc != "" {
+		if plain, err := aesDecrypt(enc, aesKeyFor(chanWoHome, testAccessToken)); err == nil {
+			_ = json.Unmarshal(plain, &fields)
+		}
+	}
+	switch req.Header.Key {
+	case "QueryAllFiles":
+		// Only page 0 carries entries; listAll stops on the first empty page.
+		pageNum := 0
+		if v, ok := fields["pageNum"].(float64); ok {
+			pageNum = int(v)
+		}
+		files := []map[string]any{}
+		if pageNum == 0 {
+			files = append(files, map[string]any{
+				"id": "wc-1", "fid": "fid-1", "name": "a.bin", "type": fileTypeFile, "size": 42,
+			})
+		}
+		payload, _ := json.Marshal(map[string]any{"files": files})
+		return encDataResp(payload), nil
+	case "GetDownloadUrlV2":
+		if v, ok := fields["fidList"].([]any); ok && len(v) > 0 {
+			t.askedFid, _ = v[0].(string)
+		}
+		payload, _ := json.Marshal(map[string]any{
+			"type": 1,
+			"list": []map[string]any{{"fid": "fid-1", "downloadUrl": t.downloadURL}},
+		})
+		return encDataResp(payload), nil
+	}
+	return okResp(`{"STATUS":"200","MSG":"ok","LOGID":"L","RSP":{"RSP_CODE":"9999","RSP_DESC":"unexpected method","DATA":""}}`), nil
+}
+
+// encDataResp wraps an encrypted DATA payload in the standard success envelope.
+func encDataResp(payload []byte) *http.Response {
+	enc, err := aesEncrypt(payload, aesKeyFor(chanWoHome, testAccessToken))
+	if err != nil {
+		return okResp(`{"STATUS":"200","MSG":"ok","LOGID":"L","RSP":{"RSP_CODE":"9999","RSP_DESC":"encrypt failed","DATA":""}}`)
+	}
+	return okResp(`{"STATUS":"200","MSG":"ok","LOGID":"L","RSP":{"RSP_CODE":"0000","RSP_DESC":"ok","DATA":"` + enc + `"}}`)
+}
+
+// TestUnitPublicLink locks the rclone link contract for wopan: a file resolves
+// to the GetDownloadUrlV2 direct link, the object's own fid is the one
+// requested, and a directory path fails with the bare sentinel before any
+// network call.
+func TestUnitPublicLink(t *testing.T) {
+	const want = "https://download.example/a.bin?token=abc"
+	tr := &publicLinkTransport{downloadURL: want}
+	f := newUnitTestFs(tr)
+	require.NoError(t, f.dirCache.FindRoot(context.Background(), false))
+	f.dirCache.Put("dir", "dir-id")
+
+	link, err := f.PublicLink(context.Background(), "dir/a.bin", fs.DurationOff, false)
+	require.NoError(t, err)
+	assert.Equal(t, want, link)
+	assert.Equal(t, "fid-1", tr.fid(), "GetDownloadUrlV2 must be asked for the object's fid")
+
+	// A directory path returns before NewObject, so the transport is never hit.
+	fDir := newUnitTestFs(okRespTransport{})
+	_, err = fDir.PublicLink(context.Background(), "dir/sub/", fs.DurationOff, false)
+	assert.Equal(t, fs.ErrorCantShareDirectories, err)
+}
