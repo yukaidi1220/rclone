@@ -84,9 +84,11 @@ const (
 	maxSleep      = 2 * time.Second
 	decayConstant = 2 // bigger for slower decay, exponential
 
-	// downloadURLTTL is how long a fetched download URL is reused. The link is
-	// measured to expire after ~20 minutes, so the cache must be well below that.
-	downloadURLTTL = 15 * time.Minute
+	// downloadURLTTL is how long a fetched download URL is reused. The link lives
+	// exactly 120 minutes from being issued (measured 2026-09-30; it does not slide
+	// with access), so this is a quarter of the real lifetime. Raising it further
+	// needs Open to treat the expiry status code like a revoked link first.
+	downloadURLTTL = 30 * time.Minute
 
 	// hashGracePeriod is how long after an upload Hash() swallows transient
 	// errors: within the ~15s listing-visibility window the download link may
@@ -1700,6 +1702,11 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 // Open opens the file for read. Call Close() on the returned io.ReadCloser.
 //
 // A cached link that has been revoked (403) is refetched once before giving up.
+//
+// FIXME: a link that has merely aged out replies 519, not 403, so it is not
+// refetched here - and headETag treats any status >=300 as a hard failure too.
+// This is unreachable while downloadURLTTL stays well under the 120 minute server
+// lifetime of a link; raising that TTL must first cover 519 here.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	fs.FixRangeOption(options, o.size)
 	headers := fs.OpenOptionHeaders(options)
@@ -2699,7 +2706,8 @@ func (f *Fs) fetchDownloadURL(ctx context.Context, fid string) (string, error) {
 //
 // The link comes from GetDownloadUrlV2 and points straight at the file's
 // download endpoint, so anyone holding it can fetch the file until it expires.
-// wopan fixes that lifetime on the server (roughly 20 minutes) and the API
+// wopan fixes that lifetime on the server (120 minutes, measured and not extended
+// by access) and the API
 // takes no expiry parameter, so a requested expire is ignored with a warning.
 // unlink is meaningless too - there is no stored share to revoke. Directories
 // cannot be linked and return fs.ErrorCantShareDirectories.
@@ -2708,7 +2716,7 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 		return "", fs.ErrorCantShareDirectories
 	}
 	if expire.IsSet() {
-		fs.Logf(f, "Public Link: wopan links expire after about 20 minutes, ignoring the requested expiry of %v", expire)
+		fs.Logf(f, "Public Link: wopan links expire 2 hours after being issued, ignoring the requested expiry of %v", expire)
 	}
 	obj, err := f.NewObject(ctx, remote)
 	if err != nil {
