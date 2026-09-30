@@ -205,6 +205,24 @@ fails the chunk with `fs.ErrorRangeIgnored`), rclone logs
 file through the normal single-stream path, so a misbehaving source or CDN
 degrades to the slower transfer instead of corrupting data.
 
+## Public links
+
+`rclone link` returns a direct download URL for a single file:
+
+```console
+rclone link wopan:path/to/file.bin
+```
+
+The URL is the tokenised direct-download link returned by `GetDownloadUrlV2`,
+so anyone holding it can fetch the file until it expires. wopan fixes that
+lifetime on the server at roughly 20 minutes and the API takes no expiry
+parameter, so `--expire` has no effect - rclone logs a warning and returns the
+server-issued link as-is - and `--unlink` is meaningless because there is no
+stored share to revoke. Directories cannot be linked: `rclone link` returns
+`fs.ErrorCantShareDirectories`.
+
+For longer-lived or revocable sharing, use the wopan app or web client.
+
 ## Restrictions
 
 - **Empty files are not supported.** The service rejects 0-byte files, so
@@ -225,9 +243,9 @@ degrades to the slower transfer instead of corrupting data.
   existing file fails with a "failed to touch" error; sync's mtime-only
   updates (e.g. `--update`) and `--refresh-times` are handled gracefully with
   an informational message instead.
-- **Public links are not supported** (`rclone link` returns an error), nor is
-  `rclone cleanup` on the backend. `--fast-list` has no effect either: the
-  backend always lists directory by directory.
+- **`rclone cleanup` is not supported**, and `--fast-list` has no effect
+  either: the backend always lists directory by directory. (`rclone link` *is*
+  supported - see [Public links](#public-links).)
 - **Server side copy and move work only within the same remote.** Copying
   between a personal space remote and a family space remote transfers the
   data through rclone, even if it is the same account.
