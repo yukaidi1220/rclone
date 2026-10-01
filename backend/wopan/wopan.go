@@ -163,6 +163,13 @@ const (
 	// server's sensitive-word filter (RSP_DESC "您输入的文件夹名称含有敏感词！").
 	// Like codeIllegalName, it is deterministic for the given name.
 	codeSensitiveWord = "4444"
+	// codeSpaceFull is returned when the account's quota is exhausted
+	// (RSP_DESC "空间已满"). Freeing space is a manual action taken outside the
+	// run, so no retry inside it can ever succeed and it must carry
+	// NoRetryError. Left retryable it turned one full account into a retry
+	// storm - 7348 attempts in a single stage 2 run - that the logs made look
+	// like a transport fault.
+	codeSpaceFull = "2001"
 	// codeDirExists is returned by CreateDirectory when the name is taken;
 	// Mkdir must treat it as success.
 	codeDirExists = "130007"
@@ -424,6 +431,9 @@ func call(ctx context.Context, c client, rootURL, accessToken, channel, method s
 		if env.Rsp.RspCode == codeIllegalName || env.Rsp.RspCode == codeSensitiveWord {
 			return nil, fserrors.NoRetryError(fmt.Errorf("wopan: file or directory name is rejected by the server: %w", err))
 		}
+		if env.Rsp.RspCode == codeSpaceFull {
+			return nil, noSpaceError(err)
+		}
 		return nil, err
 	}
 	return decodeData(env.Rsp.Data, channel, accessToken)
@@ -434,6 +444,14 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// noSpaceError marks the exhausted-quota code (2001) as a no-retry error.
+// Freeing space is a manual cleanup outside the run, so neither the low level
+// retry ladder nor --retries can make the request succeed; retrying only turns
+// a full account into a storm of identical failures.
+func noSpaceError(err error) error {
+	return fserrors.NoRetryError(fmt.Errorf("wopan: the account has no space left: %w", err))
 }
 
 // ------------------------------------------------------------ helpers -----
@@ -2355,9 +2373,16 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, zoneURL, dirID, name 
 		return api.UploadData{}, fmt.Errorf("wopan: decode upload response (part %d/%d session %s): %w", plan.Index, total, uniqueID, err)
 	}
 	if ur.Code != successCode {
+		ae := &apiError{Code: ur.Code, Desc: ur.Msg}
+		var err error = ae
+		// An exhausted account is freed by hand outside the run, so the
+		// whole-file retry --retries offers cannot succeed either.
+		if ur.Code == codeSpaceFull {
+			err = noSpaceError(ae)
+		}
 		// Wrapped with %w so asAPIError can still unwrap the *apiError for
 		// isAuthInvalid while the message carries the part/session context.
-		return api.UploadData{}, fmt.Errorf("wopan: upload part %d/%d session %s: %w", plan.Index, total, uniqueID, &apiError{Code: ur.Code, Desc: ur.Msg})
+		return api.UploadData{}, fmt.Errorf("wopan: upload part %d/%d session %s: %w", plan.Index, total, uniqueID, err)
 	}
 	elapsed := time.Since(t0)
 	fs.Debugf(f, "wopan: uploaded part %d/%d (%v) in session %s via %s -> %s (reused=%v) in %v (%s)",
@@ -2679,9 +2704,28 @@ func (f *Fs) renameWithBackoff(ctx context.Context, id, name string) error {
 
 // ------------------------------------------------------------ download -----
 
+// downloadRequest builds the GetDownloadUrlV2 parameter for one fid.
+//
+// The family space is addressed the same way as in every other wohome call, with
+// spaceType and familyId; personal space sends neither. That asymmetry is not
+// cosmetic: an empty familyId is answered RSP_CODE 9999, so "always include the key"
+// would break the path that works today.
+//
+// The family branch follows that convention rather than a capture: the recorded
+// personal-space request in the protocol notes carries no space fields, and no
+// family-space download has been sampled yet.
+func (f *Fs) downloadRequest(fid string) api.DownloadURLRequest {
+	p := api.DownloadURLRequest{Type: "1", FidList: []string{fid}, ClientID: clientID}
+	if f.spaceType == spaceFamily {
+		p.SpaceType = f.spaceType
+		p.FamilyID = f.opt.FamilyID
+	}
+	return p
+}
+
 // fetchDownloadURL requests a fresh download URL for a fid.
 func (f *Fs) fetchDownloadURL(ctx context.Context, fid string) (string, error) {
-	p := api.DownloadURLRequest{Type: "1", FidList: []string{fid}, ClientID: clientID}
+	p := f.downloadRequest(fid)
 	var resp api.DownloadURLResponse
 	err := f.pacer.Call(func() (bool, error) {
 		data, err := f.call(ctx, chanWoHome, "GetDownloadUrlV2", p, map[string]any{"secret": true})
@@ -2711,6 +2755,11 @@ func (f *Fs) fetchDownloadURL(ctx context.Context, fid string) (string, error) {
 // takes no expiry parameter, so a requested expire is ignored with a warning.
 // unlink is meaningless too - there is no stored share to revoke. Directories
 // cannot be linked and return fs.ErrorCantShareDirectories.
+//
+// FIXME: 120 minutes is measured in the personal space only. A family-space request
+// now carries the same spaceType/familyId pair as every other wohome call, but neither
+// that parameter shape nor the granted lifetime has been sampled for a family file, so
+// downloadURLTTL's 30 minutes is applied to both spaces on personal-space evidence.
 func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
 	if strings.HasSuffix(remote, "/") {
 		return "", fs.ErrorCantShareDirectories
