@@ -177,6 +177,12 @@ type DownloadURLRequest struct {
 	Type     string   `json:"type"`
 	FidList  []string `json:"fidList"`
 	ClientID string   `json:"clientId"`
+	// SpaceType and FamilyID mean the same here as in every other wohome call: a
+	// family-space file is not addressable through the personal space. Only the
+	// family case sets them - personal must omit familyId entirely, because the
+	// server answers an empty familyId with RSP_CODE 9999.
+	SpaceType string `json:"spaceType,omitempty"`
+	FamilyID  string `json:"familyId,omitempty"`
 }
 
 // DownloadURLItem is a single fid -> download URL mapping.
