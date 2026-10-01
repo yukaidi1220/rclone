@@ -406,6 +406,18 @@ func TestUnitCallEndToEnd(t *testing.T) {
 		assert.Equal(t, "4444", ae.Code)
 	})
 
+	t.Run("space full 2001 carries NoRetryError", func(t *testing.T) {
+		srv := newServer("200", "2001", `""`)
+		defer srv.Close()
+		_, err := call(context.Background(), srv.Client(), srv.URL, testAccessToken, chanWoHome, "QueryAllFiles", nil, nil)
+		require.Error(t, err)
+		assert.True(t, fserrors.IsNoRetryError(err), "2001 must be wrapped in NoRetryError, got: %v", err)
+		assert.Contains(t, err.Error(), "no space left")
+		var ae *apiError
+		require.True(t, asAPIError(err, &ae))
+		assert.Equal(t, "2001", ae.Code)
+	})
+
 	t.Run("auth failure 1001 is flagged", func(t *testing.T) {
 		srv := newServer("200", "1001", `""`)
 		defer srv.Close()
@@ -1215,9 +1227,12 @@ type zoneRecorder struct {
 	// HTTP 500, driving the transport-level failure path of the chunked
 	// upload.
 	failPart5xx int
-	mu          sync.Mutex
-	urls        []string
-	parts       []partValues
+	// failPartCode, if non-empty, is the business code answered for failPart
+	// instead of the generic 9999.
+	failPartCode string
+	mu           sync.Mutex
+	urls         []string
+	parts        []partValues
 }
 
 type partValues struct {
@@ -1257,7 +1272,11 @@ func (z *zoneRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
 			}, nil
 		}
 		if idx, err := strconv.Atoi(pv.Get("partIndex")); err == nil && idx == z.failPart {
-			body = `{"code":"9999","msg":"boom"}`
+			if z.failPartCode != "" {
+				body = `{"code":"` + z.failPartCode + `","msg":"space full"}`
+			} else {
+				body = `{"code":"9999","msg":"boom"}`
+			}
 		} else if pv.Get("partIndex") != "" && pv.Get("partIndex") != pv.Get("totalPart") {
 			body = `{"code":"0000","data":{},"msg":"ok"}`
 		}
@@ -1396,6 +1415,30 @@ func TestUnitUploadPart5xxRetryable(t *testing.T) {
 	assert.Contains(t, err.Error(), "500 Internal Server Error")
 	assert.False(t, fserrors.IsNoRetryError(err), "a chunked-path 5xx must stay retryable")
 	assert.Equal(t, 3, len(rec.parts), "parts 4+ must never reach the server after part 3 failed")
+}
+
+// TestUnitUploadPartSpaceFullNoRetry locks the quota mapping: 2001 (空间已满) is
+// freed by hand outside the run, so the chunked path must mark it no-retry
+// rather than burning the whole-file retry on a request that cannot succeed.
+// A rerun that ignores this produced 7348 identical failures in one stage 2.
+func TestUnitUploadPartSpaceFullNoRetry(t *testing.T) {
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example", failPart: 3, failPartCode: codeSpaceFull}
+	f := newUnitTestFs(rec)
+	f.zoneURL = "https://zone-from-server.example"
+	f.zoneLoaded = true
+	// Serial worker, same determinism reasoning as TestUnitUploadPartFailure.
+	f.opt.UploadConcurrency = 1
+
+	size := int64(65<<20) + 1 // 8 parts
+	src := fsobject.NewStaticObjectInfo("a", time.Now(), size, true, nil, nil)
+	_, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, size)), "dirID", "big.bin", size, src)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no space left")
+	assert.True(t, fserrors.IsNoRetryError(err), "2001 must be wrapped in NoRetryError, got: %v", err)
+	// The apiError must stay reachable through the wrappers.
+	var ae *apiError
+	require.True(t, asAPIError(err, &ae))
+	assert.Equal(t, codeSpaceFull, ae.Code)
 }
 
 // TestUnitNewFsOptionValidation checks the fail-fast validation of the
@@ -2444,4 +2487,22 @@ func TestUnitPublicLink(t *testing.T) {
 	fDir := newUnitTestFs(okRespTransport{})
 	_, err = fDir.PublicLink(context.Background(), "dir/sub/", fs.DurationOff, false)
 	assert.Equal(t, fs.ErrorCantShareDirectories, err)
+}
+
+// TestUnitDownloadRequestSpace pins the GetDownloadUrlV2 parameter shape. Personal
+// space must send neither spaceType nor familyId - an empty familyId is answered
+// RSP_CODE 9999 - so that body has to stay byte-identical to the captured request,
+// while the family space carries the same space parameters as every other wohome call.
+func TestUnitDownloadRequestSpace(t *testing.T) {
+	pc := &Fs{opt: Options{}, spaceType: spacePersonal}
+	got, err := json.Marshal(pc.downloadRequest("FID"))
+	require.NoError(t, err)
+	assert.Equal(t, `{"type":"1","fidList":["FID"],"clientId":"`+clientID+`"}`, string(got),
+		"the personal-space body changed")
+
+	fam := &Fs{opt: Options{FamilyID: "577026"}, spaceType: spaceFamily}
+	got, err = json.Marshal(fam.downloadRequest("FID"))
+	require.NoError(t, err)
+	assert.Contains(t, string(got), `"spaceType":"1"`)
+	assert.Contains(t, string(got), `"familyId":"577026"`)
 }
