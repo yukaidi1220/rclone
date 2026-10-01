@@ -177,7 +177,11 @@ const (
 	// still being settled; it is transient and safe to retry.
 	codeFileOccupied = "500010006"
 	// codeNameOccupied is returned by RenameFileOrDirectory when the target name
-	// is already taken; it is not transient and must not be retried.
+	// is already taken. A genuine collision never resolves, but the name index
+	// is released asynchronously after a delete, so a rename onto a just-freed
+	// name can transiently answer it: renameWithBackoff retries it by id until
+	// its deadline, which only delays the terminal error for a real conflict.
+	// It must not be handed to rclone's --retries as a retryable error.
 	codeNameOccupied = "130012"
 )
 
