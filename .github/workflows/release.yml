@@ -157,7 +157,20 @@ jobs:
               exit 1
             fi
           done
-          gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | .name' | sort
+          # Only a real release version may claim releases/latest. GitHub hands
+          # "latest" to the most recently published release, not the highest
+          # semantic version, so a smoke-test tag would otherwise take over the
+          # URL the migration runners download from.
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*-cdn.[0-9]*)
+              gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+              ;;
+            *)
+              echo "not a vX.Y.Z-cdn.N release - publishing as a prerelease so releases/latest stays put"
+              gh release edit "$TAG" --draft=false --prerelease --repo "$GITHUB_REPOSITORY"
+              ;;
+          esac
 
   # A half-finished attempt must not leave an empty draft behind.
   cleanup:
