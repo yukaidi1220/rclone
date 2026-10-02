@@ -31,9 +31,6 @@ on:
 permissions:
   contents: write
 
-env:
-  CGO_ENABLED: "0"
-
 jobs:
   # Backend unit tests, off the release path but gating it.
   # Includes the download_host/head-via-CDN presigned-path tests.
@@ -74,6 +71,10 @@ jobs:
     if: always() && needs.prepare.result != 'failure'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Static binaries; scoped here rather than workflow-wide because the race
+    # detector in the test job needs CGO.
+    env:
+      CGO_ENABLED: "0"
     strategy:
       fail-fast: false
       matrix:
