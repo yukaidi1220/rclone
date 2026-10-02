@@ -2,8 +2,23 @@
 #
 # Tag push (e.g. v1.75.0-cdn.1) -> build linux/amd64 + linux/arm64 +
 # windows/amd64 + windows/arm64 and attach them to a release named after the
-# tag. Plain pushes to main run the same pipeline as a smoke test (unit tests
-# + artifacts only).
+# tag. Plain pushes to main run the same pipeline as a smoke test (unit tests +
+# artifacts only, never a release).
+#
+# Layout, and why it is this shape:
+#
+#   - The four cross-compilations run as a matrix, one target per runner. They
+#     are CPU-bound and independent, so spreading them multiplies total cores;
+#     building them sequentially in one job dominated the old wall clock.
+#   - Unit tests are a sibling job, not a predecessor. A failed test blocks the
+#     release (publish needs it) without delaying the binaries by its own
+#     runtime.
+#   - Publishing is two-phase: prepare opens a DRAFT, each leg uploads its
+#     asset, and publish flips it to live only when every leg and the tests
+#     succeeded. Nothing downstream ever sees a partial release -
+#     `releases/latest/download/...` is fetched by migration runners, so an
+#     incomplete release is worse than no release. A run that fails leaves a
+#     draft that cleanup deletes.
 
 name: Build & Release
 
@@ -16,19 +31,21 @@ on:
 permissions:
   contents: write
 
+env:
+  CGO_ENABLED: "0"
+
 jobs:
-  build:
+  # Backend unit tests, off the release path but gating it.
+  # Includes the download_host/head-via-CDN presigned-path tests.
+  test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
-      # Backend unit tests first - fail fast before burning build time.
-      # Includes the download_host/head-via-CDN presigned-path tests.
       - name: Test backend/s3
         run: go test ./backend/s3/
 
@@ -38,51 +55,131 @@ jobs:
       - name: Test backend/wopan with race detector
         run: go test -race -count=2 ./backend/wopan/
 
-      - name: Build linux/amd64
+  prepare:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create draft release
         env:
-          VERSION: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -trimpath -ldflags "-s -w -X github.com/rclone/rclone/fs.Version=${VERSION}" \
-            -o dist/rclone-cdn-linux-amd64
+          gh release create "$TAG" --draft --title "$TAG" --generate-notes \
+            --repo "$GITHUB_REPOSITORY"
 
-      - name: Build linux/arm64
-        env:
-          VERSION: ${{ github.ref_name }}
-        run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-            go build -trimpath -ldflags "-s -w -X github.com/rclone/rclone/fs.Version=${VERSION}" \
-            -o dist/rclone-cdn-linux-arm64
+  build:
+    needs: [prepare]
+    # A skipped prepare is a branch or manual run; a failed one must stop here.
+    if: always() && needs.prepare.result != 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            asset: rclone-cdn-linux-amd64
+          - goos: linux
+            goarch: arm64
+            asset: rclone-cdn-linux-arm64
+          - goos: windows
+            goarch: amd64
+            asset: rclone-cdn-windows-amd64.exe
+          - goos: windows
+            goarch: arm64
+            asset: rclone-cdn-windows-arm64.exe
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Build windows/amd64
-        env:
-          VERSION: ${{ github.ref_name }}
-        run: |
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
-            go build -trimpath -ldflags "-s -w -X github.com/rclone/rclone/fs.Version=${VERSION}" \
-            -o dist/rclone-cdn-windows-amd64.exe
-
-      - name: Build windows/arm64
-        env:
-          VERSION: ${{ github.ref_name }}
-        run: |
-          CGO_ENABLED=0 GOOS=windows GOARCH=arm64 \
-            go build -trimpath -ldflags "-s -w -X github.com/rclone/rclone/fs.Version=${VERSION}" \
-            -o dist/rclone-cdn-windows-arm64.exe
-
-      - uses: actions/upload-artifact@v4
+      # Cached by target: the build cache holds per-GOOS/GOARCH entries, so a
+      # shared key would make each leg thrash the others' output.
+      - name: Cache the Go module and build caches
+        uses: actions/cache@v4
         with:
-          name: rclone-cdn-binaries
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-${{ hashFiles('go.sum') }}-
+            ${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          VERSION: ${{ github.ref_name }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build -trimpath -buildvcs=false \
+            -ldflags "-s -w -X github.com/rclone/rclone/fs.Version=${VERSION}" \
+            -o "dist/${{ matrix.asset }}"
+
+      # The release is the transport for tag runs, so there is no separate
+      # artifact download step to aggregate four binaries afterwards.
+      - name: Upload asset to the draft release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release upload "$TAG" "dist/${{ matrix.asset }}" --clobber \
+            --repo "$GITHUB_REPOSITORY"
+
+      - name: Keep the binary as a workflow artifact (branch runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
           path: dist/
           if-no-files-found: error
 
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/rclone-cdn-linux-amd64
-            dist/rclone-cdn-linux-arm64
-            dist/rclone-cdn-windows-amd64.exe
-            dist/rclone-cdn-windows-arm64.exe
-          generate_release_notes: true
+  # Live only when the release is whole: four assets uploaded and tests green.
+  publish:
+    needs: [test, prepare, build]
+    if: always() && needs.test.result == 'success' && needs.prepare.result == 'success' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify all four assets then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          count=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')
+          if [ "$count" -ne 4 ]; then
+            echo "::error::refusing to publish: expected 4 assets, release $TAG has $count"
+            exit 1
+          fi
+          for f in rclone-cdn-linux-amd64 rclone-cdn-linux-arm64 rclone-cdn-windows-amd64.exe rclone-cdn-windows-arm64.exe; do
+            size=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq ".assets[] | select(.name==\"$f\") | .size")
+            echo "$f: $size bytes"
+            if [ -z "$size" ] || [ "$size" -lt 10000000 ]; then
+              echo "::error::refusing to publish: $f missing or implausibly small ($size bytes)"
+              exit 1
+            fi
+          done
+          gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+
+  # A half-finished attempt must not leave an empty draft behind.
+  cleanup:
+    needs: [test, prepare, build, publish]
+    if: always() && needs.prepare.result == 'success' && needs.publish.result != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Delete the unpublished draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' | grep -q true; then
+            echo "release $TAG is still a draft after a failed run - deleting"
+            gh release delete "$TAG" --yes --cleanup-tag=false --repo "$GITHUB_REPOSITORY"
+          fi
