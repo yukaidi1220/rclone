@@ -316,6 +316,14 @@ const (
 // RSP_CODE 04010319 权益不足 (measured 2026-09-20, silver tier 8G limit).
 const memberQuotaErrorCode = "04010319"
 
+// spaceQuotaErrorCode is the server rejection when the account has no storage
+// left: /hcy/file/create and complete answer 04000012 资源配额不足 (measured
+// 2026-10-02 as a full personal space filled mid-sync). It is a capacity
+// rejection, not a request-rate one: the code appeared only after the last free
+// bytes were consumed, and was absent from the preceding 70 minutes of far
+// heavier API traffic.
+const spaceQuotaErrorCode = "04000012"
+
 // memberLevelInfo is a detected member tier and its single-file upload limit.
 type memberLevelInfo struct {
 	maxFileSize int64  // 0 = unknown/no limit (fail-open)
@@ -471,17 +479,42 @@ func errTooLarge(leaf string, size, limit int64, level string) error {
 		leaf, size, level, limit))
 }
 
-// noRetryOnMemberQuota wraps a server 04010319 (权益不足) rejection in a
-// NoRetryError so the low-level/upper retries do not resend the whole large
-// file (each retry redoes every part PUT). Other errors pass through unchanged.
-func noRetryOnMemberQuota(err error) error {
-	if err == nil {
-		return nil
+// noSpaceError wraps the server 04000012 (资源配额不足) rejection - the account
+// has no storage left - in a NoRetryError. Freeing space is a manual action
+// taken outside the run, so neither the low-level retry ladder nor --retries
+// can make the request succeed; retrying only turns a full account into a storm
+// of identical failures. Unlike the member single-file limit, exhaustion can be
+// reported by any call, so this applies to the control plane too.
+func noSpaceError(err error) error {
+	if err == nil || fserrors.IsNoRetryError(err) {
+		return err
+	}
+	var ae *apiError
+	if errors.As(err, &ae) && ae.Code == spaceQuotaErrorCode {
+		fs.Errorf(nil, "yun139: the account has no space left (%s 资源配额不足): %v", ae.Code, err)
+		return fserrors.NoRetryError(fmt.Errorf("yun139: the account has no space left (%s 资源配额不足): %w", ae.Code, err))
+	}
+	return err
+}
+
+// noRetryOnQuotaRejection wraps a server quota rejection in a NoRetryError so
+// the low-level/upper retries do not resend the whole large file (each retry
+// redoes every part PUT). Other errors pass through unchanged.
+//
+// 04010319 权益不足: the file exceeds the account's member single-file upload
+// limit - only meaningful for an upload, so it is classified here and not on the
+// control plane. 04000012 资源配额不足 is delegated to noSpaceError.
+func noRetryOnQuotaRejection(err error) error {
+	if err == nil || fserrors.IsNoRetryError(err) {
+		return err
+	}
+	if e := noSpaceError(err); e != err {
+		return e
 	}
 	var ae *apiError
 	if errors.As(err, &ae) && ae.Code == memberQuotaErrorCode {
-		fs.Errorf(nil, "yun139: upload rejected by member quota (%s 权益不足): %v", memberQuotaErrorCode, err)
-		return fserrors.NoRetryError(fmt.Errorf("yun139: upload rejected by member quota (%s 权益不足): %w", memberQuotaErrorCode, err))
+		fs.Errorf(nil, "yun139: upload rejected by member quota (%s 权益不足): %v", ae.Code, err)
+		return fserrors.NoRetryError(fmt.Errorf("yun139: upload rejected by member quota (%s 权益不足): %w", ae.Code, err))
 	}
 	return err
 }
@@ -1113,13 +1146,13 @@ func (f *Fs) call(ctx context.Context, url string, body any, out any) error {
 	}
 	_ = json.Unmarshal(raw, &famEnv)
 	if famEnv.Result.ResultCode != "" && famEnv.Result.ResultCode != "0" {
-		return &apiError{Code: famEnv.Result.ResultCode, Message: famEnv.Result.ResultDesc}
+		return noSpaceError(&apiError{Code: famEnv.Result.ResultCode, Message: famEnv.Result.ResultDesc})
 	}
 	if env.Code != "" && !env.Success {
 		// Some endpoints reply success=false but carry a nested
 		// resultCode=0 payload that actually succeeded (family move);
 		// surface the message but keep it non-retryable.
-		return &apiError{Code: env.Code, Message: env.Message}
+		return noSpaceError(&apiError{Code: env.Code, Message: env.Message})
 	}
 	if out != nil {
 		if err := json.Unmarshal(raw, out); err != nil {
@@ -2624,11 +2657,11 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	}
 	if f.space == spaceFamily {
 		if err := f.familyCall(ctx, callPath, callBody, &resp); err != nil {
-			return nil, noRetryOnMemberQuota(fmt.Errorf("create: %w", err))
+			return nil, noRetryOnQuotaRejection(fmt.Errorf("create: %w", err))
 		}
 	} else {
 		if err := f.personalCall(ctx, callPath, callBody, &resp); err != nil {
-			return nil, noRetryOnMemberQuota(fmt.Errorf("create: %w", err))
+			return nil, noRetryOnQuotaRejection(fmt.Errorf("create: %w", err))
 		}
 	}
 	fs.Debugf(f, "yun139: create returned %d part URLs, rapid=%v exists=%v", len(resp.Data.PartInfos), resp.Data.RapidUpload, resp.Data.Exists)
@@ -2640,7 +2673,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName, hashHex: hashHex}, nil
 	}
 	if !resp.Success {
-		return nil, noRetryOnMemberQuota(&apiError{Code: resp.Code, Message: resp.Message})
+		return nil, noRetryOnQuotaRejection(&apiError{Code: resp.Code, Message: resp.Message})
 	}
 	if len(resp.Data.PartInfos) == 0 {
 		return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, errors.New("create returned no upload URL")
@@ -2702,7 +2735,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 			return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, fmt.Errorf("getUploadUrl: %w", err)
 		}
 		if !urlResp.Success {
-			return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, noRetryOnMemberQuota(&apiError{Code: urlResp.Code, Message: urlResp.Message})
+			return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, noRetryOnQuotaRejection(&apiError{Code: urlResp.Code, Message: urlResp.Message})
 		}
 		allParts = append(allParts, urlResp.Data.PartInfos...)
 	}
@@ -2765,10 +2798,10 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		}
 	}
 	if err := f.call(ctx, cmplHost+cmplPath, cmpl, &cmplResp); err != nil {
-		return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, noRetryOnMemberQuota(fmt.Errorf("complete: %w", err))
+		return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, noRetryOnQuotaRejection(fmt.Errorf("complete: %w", err))
 	}
 	if !cmplResp.Success {
-		return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, noRetryOnMemberQuota(&apiError{Code: cmplResp.Code, Message: cmplResp.Message})
+		return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, noRetryOnQuotaRejection(&apiError{Code: cmplResp.Code, Message: cmplResp.Message})
 	}
 	return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName, hashHex: hashHex}, nil
 }
