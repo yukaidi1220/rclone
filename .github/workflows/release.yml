@@ -94,19 +94,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Cached by target: the build cache holds per-GOOS/GOARCH entries, so a
-      # shared key would make each leg thrash the others' output.
-      - name: Cache the Go module and build caches
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-${{ hashFiles('go.sum') }}-
-            ${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-
-
+      # No actions/cache here on purpose. A cache written by a tag run is scoped
+      # to that tag ref, so the next tag's legs miss it entirely - measured:
+      # restore took 1s with no hit, while the save cost 9s per leg on every
+      # run. Warming it from the default branch is the only way this pays.
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
