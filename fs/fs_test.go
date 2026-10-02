@@ -2,9 +2,11 @@ package fs
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -77,4 +79,19 @@ func TestFeaturesDisableList(t *testing.T) {
 	assert.Nil(t, ft.Purge)
 	assert.False(t, ft.CaseInsensitive)
 	assert.False(t, ft.DuplicateFiles)
+}
+
+// TestErrorCantUploadEmptyFilesIsNoRetry pins the two properties the empty file
+// sentinel must keep: it carries NoRetry, so sync does not spend a full
+// --retries ladder and an extra round per zero byte file, and it stays directly
+// comparable with ==, which is how fstests matches it.
+func TestErrorCantUploadEmptyFilesIsNoRetry(t *testing.T) {
+	assert.True(t, fserrors.IsNoRetryError(ErrorCantUploadEmptyFiles))
+
+	err := ErrorCantUploadEmptyFiles
+	assert.True(t, err == ErrorCantUploadEmptyFiles, "== must keep matching the bare sentinel")
+
+	wrapped := fmt.Errorf("put: %w", ErrorCantUploadEmptyFiles)
+	assert.True(t, fserrors.IsNoRetryError(wrapped), "a wrapped copy must still classify as no-retry")
+	assert.ErrorIs(t, wrapped, ErrorCantUploadEmptyFiles)
 }

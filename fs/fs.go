@@ -8,6 +8,8 @@ import (
 	"io"
 	"math"
 	"time"
+
+	"github.com/rclone/rclone/fs/fserrors"
 )
 
 // Constants
@@ -29,7 +31,12 @@ var (
 	ErrorCantCopy                    = errors.New("can't copy object - incompatible remotes")
 	ErrorCantMove                    = errors.New("can't move object - incompatible remotes")
 	ErrorCantDirMove                 = errors.New("can't move directory - incompatible remotes")
-	ErrorCantUploadEmptyFiles        = errors.New("can't upload empty files to this remote")
+	// A remote that refuses zero byte files rejects them deterministically, so
+	// this carries NoRetry: without it every empty source file burns the full
+	// --retries ladder and a whole extra sync round per file. Backends still
+	// return this value bare (fstests compares it with ==), which the wrapper
+	// allows since it only embeds the error.
+	ErrorCantUploadEmptyFiles        = fserrors.NoRetryError(errors.New("can't upload empty files to this remote"))
 	ErrorDirExists                   = errors.New("can't copy directory - destination already exists")
 	ErrorCantSetModTime              = errors.New("can't set modified time")
 	ErrorCantSetModTimeWithoutDelete = errors.New("can't set modified time without deleting existing object")
