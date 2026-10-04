@@ -3,6 +3,7 @@ package yun139
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -194,22 +195,46 @@ func TestUploadTooLarge_NoRetry(t *testing.T) {
 	}
 }
 
-// TestNoRetryOnMemberQuota_04010319: the server quota error is wrapped in a
+// TestNoRetryOnQuotaRejection: the server quota errors are wrapped in a
 // NoRetryError (even when the create path wraps it once more with %w); other
-// codes pass through unchanged.
-func TestNoRetryOnMemberQuota_04010319(t *testing.T) {
+// codes pass through unchanged. 04010319 权益不足 is the member single-file
+// limit; 04000012 资源配额不足 is the account having no storage left (measured
+// 2026-10-02 on create and complete once the last free bytes were used).
+// 04000014 系统服务调用错误, seen in the same window, must stay retryable -
+// classifying a transient fault as final would silently drop files from a sync.
+func TestNoRetryOnQuotaRejection(t *testing.T) {
 	quota := fmt.Errorf("create: %w", &apiError{Code: "04010319", Message: "权益不足"})
-	if got := noRetryOnMemberQuota(quota); !fserrors.IsNoRetryError(got) {
+	if got := noRetryOnQuotaRejection(quota); !fserrors.IsNoRetryError(got) {
 		t.Errorf("04010319 wrapped => want NoRetryError, got %v", got)
 	}
 	// bare apiError with matching code
-	if got := noRetryOnMemberQuota(&apiError{Code: "04010319", Message: "权益不足"}); !fserrors.IsNoRetryError(got) {
+	if got := noRetryOnQuotaRejection(&apiError{Code: "04010319", Message: "权益不足"}); !fserrors.IsNoRetryError(got) {
 		t.Errorf("04010319 bare => want NoRetryError, got %v", got)
 	}
 	// other code passes through as non-NoRetry
 	other := fmt.Errorf("create: %w", &apiError{Code: "04000002", Message: "文件类型不允许为空"})
-	if got := noRetryOnMemberQuota(other); fserrors.IsNoRetryError(got) {
+	if got := noRetryOnQuotaRejection(other); fserrors.IsNoRetryError(got) {
 		t.Errorf("non-quota error => should pass through non-NoRetry, got %v", got)
+	}
+	space := fmt.Errorf("complete: %w", &apiError{Code: spaceQuotaErrorCode, Message: "资源配额不足"})
+	got := noRetryOnQuotaRejection(space)
+	if !fserrors.IsNoRetryError(got) {
+		t.Errorf("04000012 wrapped => want NoRetryError, got %v", got)
+	}
+	if !strings.Contains(got.Error(), "资源配额不足") {
+		t.Errorf("space error should name the server text: %v", got)
+	}
+	// a *apiError must survive the wrap so shouldRetry still sees a business error
+	var ae *apiError
+	if !errors.As(got, &ae) {
+		t.Errorf("wrapped quota error should still unwrap to *apiError, got %v", got)
+	}
+	if retry, _ := shouldRetry(context.Background(), got); retry {
+		t.Errorf("quota errors must not be retried by the pacer")
+	}
+	sysErr := fmt.Errorf("create: %w", &apiError{Code: "04000014", Message: "系统服务调用错误"})
+	if got := noRetryOnQuotaRejection(sysErr); fserrors.IsNoRetryError(got) {
+		t.Errorf("04000014 (transient) => want retryable, got NoRetry %v", got)
 	}
 }
 

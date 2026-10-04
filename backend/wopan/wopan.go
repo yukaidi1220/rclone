@@ -84,9 +84,11 @@ const (
 	maxSleep      = 2 * time.Second
 	decayConstant = 2 // bigger for slower decay, exponential
 
-	// downloadURLTTL is how long a fetched download URL is reused. The link is
-	// measured to expire after ~20 minutes, so the cache must be well below that.
-	downloadURLTTL = 15 * time.Minute
+	// downloadURLTTL is how long a fetched download URL is reused. The link lives
+	// exactly 120 minutes from being issued (measured 2026-09-30; it does not slide
+	// with access), so this is a quarter of the real lifetime. Raising it further
+	// needs Open to treat the expiry status code like a revoked link first.
+	downloadURLTTL = 30 * time.Minute
 
 	// hashGracePeriod is how long after an upload Hash() swallows transient
 	// errors: within the ~15s listing-visibility window the download link may
@@ -109,13 +111,18 @@ const (
 	dirFindAttempts = 4
 	dirFindDelay    = 2 * time.Second
 
-	// renameDeadline bounds the rename retry loop after Update's delete step:
-	// the name index is released asynchronously, and the pacer's default budget
-	// (~4.5s) is too short.
+	// renameDeadline bounds the rename retry loop in Update and the copy/move
+	// paths: the name index is released asynchronously after a delete, and the
+	// pacer's default budget (~4.5s) is too short.
 	renameDeadline = 60 * time.Second
 
 	// tempSuffix is the suffix appended to Update's temporary upload name.
 	tempSuffix = ".rclone-tmp-"
+
+	// backupSuffix is the suffix appended to the OLD object's name while an
+	// Update swaps in new content, so the old bytes stay reachable (and
+	// restorable) until the new object has taken over the real name.
+	backupSuffix = ".rclone-old-"
 
 	// recyclePageSize is the page size for QueryRecycleData. Whether the
 	// server honours pageNum is unknown (early probing was inconclusive
@@ -156,6 +163,13 @@ const (
 	// server's sensitive-word filter (RSP_DESC "您输入的文件夹名称含有敏感词！").
 	// Like codeIllegalName, it is deterministic for the given name.
 	codeSensitiveWord = "4444"
+	// codeSpaceFull is returned when the account's quota is exhausted
+	// (RSP_DESC "空间已满"). Freeing space is a manual action taken outside the
+	// run, so no retry inside it can ever succeed and it must carry
+	// NoRetryError. Left retryable it turned one full account into a retry
+	// storm - 7348 attempts in a single stage 2 run - that the logs made look
+	// like a transport fault.
+	codeSpaceFull = "2001"
 	// codeDirExists is returned by CreateDirectory when the name is taken;
 	// Mkdir must treat it as success.
 	codeDirExists = "130007"
@@ -163,7 +177,11 @@ const (
 	// still being settled; it is transient and safe to retry.
 	codeFileOccupied = "500010006"
 	// codeNameOccupied is returned by RenameFileOrDirectory when the target name
-	// is already taken; it is not transient and must not be retried.
+	// is already taken. A genuine collision never resolves, but the name index
+	// is released asynchronously after a delete, so a rename onto a just-freed
+	// name can transiently answer it: renameWithBackoff retries it by id until
+	// its deadline, which only delays the terminal error for a real conflict.
+	// It must not be handed to rclone's --retries as a retryable error.
 	codeNameOccupied = "130012"
 )
 
@@ -417,6 +435,9 @@ func call(ctx context.Context, c client, rootURL, accessToken, channel, method s
 		if env.Rsp.RspCode == codeIllegalName || env.Rsp.RspCode == codeSensitiveWord {
 			return nil, fserrors.NoRetryError(fmt.Errorf("wopan: file or directory name is rejected by the server: %w", err))
 		}
+		if env.Rsp.RspCode == codeSpaceFull {
+			return nil, noSpaceError(err)
+		}
 		return nil, err
 	}
 	return decodeData(env.Rsp.Data, channel, accessToken)
@@ -427,6 +448,14 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// noSpaceError marks the exhausted-quota code (2001) as a no-retry error.
+// Freeing space is a manual cleanup outside the run, so neither the low level
+// retry ladder nor --retries can make the request succeed; retrying only turns
+// a full account into a storm of identical failures.
+func noSpaceError(err error) error {
+	return fserrors.NoRetryError(fmt.Errorf("wopan: the account has no space left: %w", err))
 }
 
 // ------------------------------------------------------------ helpers -----
@@ -574,7 +603,11 @@ func isWopanBMPEmoji(r rune) bool {
 func validateName(leaf string) error {
 	n := utf8.RuneCountInString(leaf)
 	if n > 100 {
-		return fserrors.NoRetryError(fs.ErrorFileNameTooLong)
+		// Keep the sentinel wrapped so callers can still test for it, but say
+		// which limit fired: the multithread path prefixes this error with
+		// "failed to open chunk writer", which otherwise reads like a local
+		// ENAMETOOLONG rather than a server-side name rejection.
+		return fserrors.NoRetryError(fmt.Errorf("%w (wopan limit is 100 runes, got %d; the server would silently truncate it)", fs.ErrorFileNameTooLong, n))
 	}
 	for _, r := range leaf {
 		if isWopanBMPEmoji(r) {
@@ -617,8 +650,9 @@ func init() {
 			Help:      "Refresh token. Obtain from an existing OpenList wopan storage config, or by capturing the app login flow.",
 			Sensitive: true,
 		}, {
-			Name:      "access_token",
-			Help:      "Access token - refreshed automatically, do not set manually.",
+			Name: "access_token",
+			Help: "Access token - refreshed automatically, do not set manually.\n\n" +
+				"Only set this if you want a fully static token that rclone never refreshes.",
 			Advanced:  true,
 			Sensitive: true,
 		}, {
@@ -631,13 +665,21 @@ func init() {
 			Advanced:  true,
 			Sensitive: true,
 		}, {
-			Name:     "no_refresh",
-			Help:     "Never refresh the token. Use when the same account is shared with another program.",
+			Name: "no_refresh",
+			Help: "Never refresh the token. Use when the same account is shared with another program.\n\n" +
+				"Set this when the same account is also in use by another program such as " +
+				"OpenList - see [Sharing an account with OpenList](#sharing-an-account-with-openlist) below.",
 			Default:  false,
 			Advanced: true,
 		}, {
-			Name:     "hard_delete",
-			Help:     "Delete permanently instead of putting files into the recycle bin.",
+			Name: "hard_delete",
+			Help: "Delete permanently instead of putting files into the recycle bin.\n\n" +
+				"Deleting files from the recycle bin still works, so quota is only released " +
+				"immediately with this flag. Note that permanent deletion works by purging the " +
+				"file from the recycle bin: when the bin holds more entries than the server is " +
+				"willing to page out, files beyond that page can only be moved into the bin " +
+				"(rclone logs a warning) - empty the recycle bin from the app to restore full " +
+				"hard delete.",
 			Default:  false,
 			Advanced: true,
 		}, {
@@ -659,11 +701,11 @@ func init() {
 			Advanced: true,
 		}, {
 			Name: "upload_cutoff",
-			Help: "Cutoff for switching to chunked upload.\n\n" +
+			Help: "Cutoff for switching to chunked upload. Defaults to 64Mi.\n\n" +
 				"Any files larger than this will be uploaded in chunks of chunk_size. " +
 				"Smaller files are sent as a single request, where the server's ETag is " +
 				"the content MD5 immediately at upload time, while chunked files never " +
-				"carry a content MD5.",
+				"carry a content MD5 - see [Chunked uploads](#chunked-uploads) below.",
 			Default:  fs.SizeSuffix(64 * 1024 * 1024),
 			Advanced: true,
 		}, {
@@ -685,7 +727,8 @@ func init() {
 				"This is the number of chunks of the same file that are uploaded " +
 				"concurrently. The server accepts out-of-order parts within one " +
 				"upload session and assembles them by part index. Increasing this " +
-				"may speed up transfers of large files, at the cost of more memory.",
+				"may speed up transfers of large files, at the cost of more memory - " +
+				"see [Chunked uploads](#chunked-uploads) below.",
 			Default:  4,
 			Advanced: true,
 		}, {
@@ -696,12 +739,20 @@ func init() {
 			// before being encrypted, and Go would silently replace invalid
 			// UTF-8 bytes with U+FFFD, making the name irreversible.
 			//
-			// No Left*/Right*/Percent flags: List returns the stored name
-			// verbatim without a ToStandardName pass, so any extra wire-side
-			// escaping could never be undone on read. fstests FsEncoding
-			// round-trips all cases with this setting, i.e. the server stores
-			// trailing spaces, dots, HT/VT and percent signs verbatim.
-			Default: encoder.Standard | encoder.EncodeInvalidUtf8,
+			// EncodeQuestion|EncodeAsterisk|EncodeLtGt is required: the
+			// server refuses ? * < > in a name with
+			// '1009 名称中含有非法字符', and the upload path reports that
+			// rejection as a bare HTTP 500. The encoder's fullwidth
+			// substitutes for exactly those characters are stored verbatim,
+			// so escaping them is what makes such names work at all. The
+			// other characters EncodeWin would escape (: " |) are stored
+			// verbatim by the server and are left alone.
+			//
+			// No Left*/Right*/Percent flags: List decodes through
+			// ToStandardName, so the wire-side spelling of a name is what
+			// comes back; fstests FsEncoding round-trips all cases with this
+			// setting.
+			Default: encoder.Standard | encoder.EncodeQuestion | encoder.EncodeAsterisk | encoder.EncodeLtGt | encoder.EncodeInvalidUtf8,
 		}},
 	})
 }
@@ -726,6 +777,15 @@ type Fs struct {
 	zoneMu     *sync.Mutex // protects zoneURL / zoneLoaded (a pointer so the NewFs tempF copy is safe)
 	zoneURL    string      // upload endpoint from GetZoneInfo, lazily discovered
 	zoneLoaded bool        // whether zoneURL has been fetched successfully
+
+	// renameDeadlineOverride shortens renameWithBackoff's deadline; tests set
+	// it so a persistently failing rename does not sleep for the full budget.
+	renameDeadlineOverride time.Duration
+
+	// listBudgetOverride shortens the eventual-consistency listing budget
+	// (copyVisibilityBudget); tests set it so a missing entry does not stall
+	// for the full budget.
+	listBudgetOverride time.Duration
 }
 
 // Object describes a wopan object
@@ -1668,6 +1728,11 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 // Open opens the file for read. Call Close() on the returned io.ReadCloser.
 //
 // A cached link that has been revoked (403) is refetched once before giving up.
+//
+// FIXME: a link that has merely aged out replies 519, not 403, so it is not
+// refetched here - and headETag treats any status >=300 as a hard failure too.
+// This is unreachable while downloadURLTTL stays well under the 120 minute server
+// lifetime of a link; raising that TTL must first cover 519 here.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	fs.FixRangeOption(options, o.size)
 	headers := fs.OpenOptionHeaders(options)
@@ -1702,9 +1767,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 // Update in to the object with the modTime given of the given size.
 //
 // Direct overwrite cannot change the mtime, so the new content is uploaded
-// under a temporary name, the old object is deleted, and the temp is renamed
-// into place. The receiver is then refreshed in place so that verify (which
-// reuses it) compares against the new object.
+// under a temporary name, the old object is parked under a backup name, and the
+// temp is renamed into place; the backup is dropped once the new content owns
+// the name. The old object is never deleted before its replacement is complete,
+// so a failed or interrupted update leaves the file readable. The receiver is
+// then refreshed in place so that verify (which reuses it) compares against the
+// new object.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	size := src.Size()
 	if size < 0 {
@@ -1717,10 +1785,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if err != nil {
 		return err
 	}
-	// Step 3 renames the temp into the existing name. A name the server would
-	// silently truncate (>100 runes, e.g. created from the app) must fail
-	// before anything is uploaded or deleted - otherwise the old object is
-	// gone and the content reappears under a truncated name.
+	// The install rename (step 3) puts the new object under this exact name. A
+	// name the server would silently truncate (>100 runes, e.g. created from
+	// the app) must fail before anything is uploaded or renamed - otherwise the
+	// update cannot ever complete under the name the user asked for.
 	if err := validateName(leaf); err != nil {
 		return err
 	}
@@ -1730,32 +1798,101 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if err := validateName(leaf); err != nil {
 		return err
 	}
-	tempLeaf := tempName(leaf)
 
-	// Step 1: upload the new content under a temporary name. A failure here
-	// is reported as-is and may be retried whole: a mid-stream failure leaves
-	// nothing behind, and the rare lost-response case leaves a tmp orphan that
-	// sync cleans up (§4.8.3).
+	// Lossless Update, in four steps:
+	//
+	//	1. upload the new content under a temporary name
+	//	2. park the old object under a backup name
+	//	3. rename the temporary object onto the real name
+	//	4. drop the backup
+	//
+	// The old content is untouched until the new content is completely on the
+	// server, so a failed or interrupted upload leaves the file readable the
+	// whole time, and the window in which the real name is absent spans two
+	// renames rather than the whole upload.
+	tempLeaf := tempName(o.fs.opt.Enc, leaf)
+
+	// Step 1. A failure here is reported as-is and may be retried whole: the
+	// old object is untouched. A multipart failure leaves only orphaned parts,
+	// which are not visible as a file; a single-part upload whose response was
+	// lost can leave a temp file behind, which costs quota and is removable
+	// with --include "*rclone-tmp-*".
 	tmpData, err := o.fs.uploadSingle(ctx, in, dirID, tempLeaf, size, src)
 	if err != nil {
 		return err
 	}
 
-	// Steps 2 and 3 happen after the temp object exists. Any failure from here
-	// on must not trigger copy.go's whole-file retry (which would upload yet
-	// another temp each round), and must never delete the temp - once the rename
-	// result is unknown, the temp id IS the new file's id.
-	//
-	// Step 2: delete the old object. The server is idempotent here.
-	if err := o.fs.deleteFile(ctx, o.id); err != nil {
-		return fserrors.NoLowLevelRetryError(fmt.Errorf("wopan: delete old object: %w", err))
+	// From here on the temp object exists, so a whole-file retry could never
+	// repair the state it left: it would upload yet another temp every round.
+	// Every error below is marked NoLowLevelRetry to suppress that retry, and
+	// renameWithBackoff strips the pacer's RetryError marker at the source so
+	// the marking actually holds for transport-level failures too. Nothing is
+	// deleted on a path whose outcome is unknown: once a rename result is
+	// unknown, the id it was issued for IS the file's id.
+	oldID := o.id
+	backupLeaf := backupName(o.fs.opt.Enc, leaf)
+
+	// Step 2: park the old object. Only its name moves - the id and the bytes
+	// are unchanged - so this is reversible until step 3 succeeds.
+	if err := o.fs.renameWithBackoff(ctx, oldID, backupLeaf); err != nil {
+		// Nothing is deleted here: the park's outcome is uncertain (the request
+		// may have landed), so the old content is either still under the real
+		// name or under backupLeaf - both recoverable. Deleting the temp would
+		// not help either: if the park landed, the temp is the only copy of
+		// the new content, and a stray temp only costs quota anyway
+		// (removable with --include "*rclone-tmp-*").
+		return noLowLevelRetry(fmt.Errorf("wopan: rename old object to the backup name %q: %w", backupLeaf, err))
 	}
-	// Step 3: rename the temp into place, with a time-deadline backoff.
+
+	// Step 3: move the new content onto the real name.
 	if err := o.fs.renameWithBackoff(ctx, tmpData.WcFileID, leaf); err != nil {
-		return fserrors.NoLowLevelRetryError(fmt.Errorf("wopan: rename temp object: %w", err))
+		// A failed rename does not mean the move did not happen: if the
+		// response was lost, the install may well have landed. The server
+		// never overwrites on rename, so a listing settles it - and the two
+		// answers need opposite handling.
+		//
+		//   - the name holds the NEW id: the install landed. The update has
+		//     succeeded; report that, and let step 4 drop the backup.
+		//   - the name does not hold it: the install did not land. Put the old
+		//     object back under its own name.
+		//
+		// The listing is best-effort: if it fails, the safe reading is "did not
+		// land" (the restore is harmless when it did land - it simply fails
+		// with the name taken - whereas treating a non-landed install as
+		// success would leave the real name empty).
+		landed, lerr := o.fs.leafHolds(ctx, dirID, leaf, tmpData.WcFileID)
+		if lerr != nil {
+			fs.Debugf(o, "wopan: install rename failed (%v) and the confirming listing failed too (%v), assuming it did not land", err, lerr)
+		}
+		if landed {
+			fs.Debugf(o, "wopan: install rename reported %v but %q holds the new object, so the update succeeded", err, leaf)
+		} else {
+			// Put the old object back under its own name. If even that fails,
+			// the old content is still intact under backupLeaf, which the
+			// error names so the file can be recovered by hand.
+			//
+			// The temp object is deliberately NOT deleted here: the listing
+			// may have been wrong (or raced a concurrent writer), in which
+			// case the temp id holds the only copy of the new content.
+			if rerr := o.fs.renameWithBackoff(ctx, oldID, leaf); rerr != nil {
+				return noLowLevelRetry(fmt.Errorf(
+					"wopan: rename new object to %q: %w (the previous content is still intact under the backup name %q, but renaming it back to %q also failed: %v)",
+					leaf, err, backupLeaf, leaf, rerr))
+			}
+			return noLowLevelRetry(fmt.Errorf("wopan: rename new object to %q: %w", leaf, err))
+		}
 	}
-	// Step 4: refresh the receiver in place, in pure memory.
+
+	// The new content owns the name now, so the update has succeeded. Refresh
+	// the receiver before step 4 so that a failure to drop the backup cannot
+	// turn a completed update into a reported error.
 	o.refreshFromUpload(ctx, src, tmpData, size)
+
+	// Step 4: drop the backup. The file is already correct, so a failure here
+	// only leaks quota - never fail the update over it.
+	if err := o.fs.deleteFile(ctx, oldID); err != nil {
+		fs.Errorf(o, "wopan: update succeeded but removing the backup %q failed, it still consumes quota: %v", backupLeaf, err)
+	}
 	return nil
 }
 
@@ -1768,9 +1905,10 @@ func (o *Object) Remove(ctx context.Context) error {
 // recycle-bin entries the delete created.
 //
 // This is the single collection point for file deletion: Remove and Update's
-// step 2 both go through here, so the snapshot-before-delete ordering lives in
-// one place. The snapshot is taken BEFORE the delete (red line) - entries
-// already in it belong to the user and must never be destroyed.
+// step 4 (dropping the parked backup) both go through here, so the
+// snapshot-before-delete ordering lives in one place. The snapshot is taken
+// BEFORE the delete (red line) - entries already in it belong to the user and
+// must never be destroyed.
 func (f *Fs) deleteFile(ctx context.Context, id string) error {
 	var snap map[string][]string
 	if f.opt.HardDelete {
@@ -1839,17 +1977,40 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 // tempName builds Update's temporary upload name, keeping the result within the
 // 100-rune name limit.
-func tempName(leaf string) string {
-	return truncateName(leaf, tempSuffix+random.String(8))
+func tempName(enc encoder.MultiEncoder, leaf string) string {
+	return truncateName(enc, leaf, tempSuffix+random.String(8))
+}
+
+// backupName builds the name the OLD object is parked under while Update swaps
+// in new content. Like tempName it stays within the 100-rune limit.
+func backupName(enc encoder.MultiEncoder, leaf string) string {
+	return truncateName(enc, leaf, backupSuffix+random.String(8))
 }
 
 // truncateName appends suffix to leaf, truncating leaf first so the total stays
 // within the 100-rune name limit.
-func truncateName(leaf, suffix string) string {
+//
+// Truncating an ENCODED name is not just a matter of cutting at a rune
+// boundary: the encoder represents a reserved character as an escape group
+// (QuoteRune plus one rune, or QuoteRune plus two hex digits for an invalid
+// byte), so a cut inside a group leaves a name that decodes to something else
+// entirely - a stray QuoteRune, or hex digits read back as ordinary characters.
+// The encoder is therefore used as its own oracle: a well-formed encoded name
+// survives a decode/re-encode round trip unchanged, so trailing runes are
+// dropped until that holds. Only a handful of runes are ever affected, because
+// malformedness is confined to the tail.
+func truncateName(enc encoder.MultiEncoder, leaf, suffix string) string {
 	max := 100 - utf8.RuneCountInString(suffix)
 	runes := []rune(leaf)
 	if len(runes) > max {
 		runes = runes[:max]
+		for len(runes) > 0 {
+			s := string(runes)
+			if enc.FromStandardName(enc.ToStandardName(s)) == s {
+				break
+			}
+			runes = runes[:len(runes)-1]
+		}
 	}
 	return string(runes) + suffix
 }
@@ -2220,9 +2381,16 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, zoneURL, dirID, name 
 		return api.UploadData{}, fmt.Errorf("wopan: decode upload response (part %d/%d session %s): %w", plan.Index, total, uniqueID, err)
 	}
 	if ur.Code != successCode {
+		ae := &apiError{Code: ur.Code, Desc: ur.Msg}
+		var err error = ae
+		// An exhausted account is freed by hand outside the run, so the
+		// whole-file retry --retries offers cannot succeed either.
+		if ur.Code == codeSpaceFull {
+			err = noSpaceError(ae)
+		}
 		// Wrapped with %w so asAPIError can still unwrap the *apiError for
 		// isAuthInvalid while the message carries the part/session context.
-		return api.UploadData{}, fmt.Errorf("wopan: upload part %d/%d session %s: %w", plan.Index, total, uniqueID, &apiError{Code: ur.Code, Desc: ur.Msg})
+		return api.UploadData{}, fmt.Errorf("wopan: upload part %d/%d session %s: %w", plan.Index, total, uniqueID, err)
 	}
 	elapsed := time.Since(t0)
 	fs.Debugf(f, "wopan: uploaded part %d/%d (%v) in session %s via %s -> %s (reused=%v) in %v (%s)",
@@ -2379,6 +2547,111 @@ func (f *Fs) renameObject(ctx context.Context, id, name string) error {
 	})
 }
 
+// noLowLevelRetry marks err as not worthy of copy.go's whole-file retry.
+//
+// fserrors.NoLowLevelRetryError alone is not enough for an error that came back
+// from f.pacer.Call: the pacer wraps an exhausted-retry transport failure in
+// fserrors.RetryError (fs/pacer.go pacerInvoker), and copy.go tests
+// IsRetryError BEFORE ShouldRetry - and ShouldRetry is the only place the
+// NoLowLevelRetry marker is honoured. Without stripping the pacer's marker
+// first, the whole-file retry fires anyway and re-uploads the file, which is
+// precisely what the marker exists to prevent. Business errors are unaffected:
+// the pacer does not wrap those, so this is a no-op for them.
+func noLowLevelRetry(err error) error {
+	return fserrors.NoLowLevelRetryError(stripPacerRetry(err))
+}
+
+// stripPacerRetry removes the fserrors.RetryError marker that f.pacer.Call adds
+// to an exhausted-retry transport failure.
+//
+// fserrors.IsRetryError walks the WHOLE error chain, so a marker anywhere in it
+// counts. That is why callers must strip at the source, before any fmt.Errorf
+// adds context on top: once a marker is buried, removing it would mean throwing
+// away the surrounding message. Here the marker is the outermost wrapper, which
+// is the shape pacerInvoker produces.
+func stripPacerRetry(err error) error {
+	for {
+		if _, ok := err.(fserrors.Retrier); !ok {
+			return err
+		}
+		u, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return err
+		}
+		inner := u.Unwrap()
+		if inner == nil {
+			return err
+		}
+		err = inner
+	}
+}
+
+// renameTimeout returns the rename retry deadline. It is a method so tests can
+// shorten the 60s production budget; without that a test driving a persistently
+// failing rename would sleep through the whole backoff.
+func (f *Fs) renameTimeout() time.Duration {
+	if f.renameDeadlineOverride > 0 {
+		return f.renameDeadlineOverride
+	}
+	return renameDeadline
+}
+
+// listBudget returns the budget for waiting out the listing's visibility delay.
+// It is a method so tests can shorten it.
+func (f *Fs) listBudget() time.Duration {
+	if f.listBudgetOverride > 0 {
+		return f.listBudgetOverride
+	}
+	return copyVisibilityBudget
+}
+
+// leafHolds reports whether the file named leaf currently has the given id,
+// waiting out the listing's visibility delay.
+//
+// leaf must be in the SAME encoded form the rename was issued with; the
+// conversion to the standard form that listings use happens here, so a caller
+// cannot accidentally compare an encoded name against standard ones.
+//
+// It is the oracle for a rename whose outcome is unknown. The server never
+// overwrites on rename, so if the name is held by the very object that was being
+// moved there, the move landed; a different id means somebody else owns the name
+// now. An entry that is absent at the end of the budget reports false.
+func (f *Fs) leafHolds(ctx context.Context, dirID, leaf, id string) (bool, error) {
+	// listDirEntries returns standard names.
+	standard := f.opt.Enc.ToStandardName(leaf)
+	deadline := time.Now().Add(f.listBudget())
+	backoff := time.Second
+	for {
+		entries, err := f.listDirEntries(ctx, dirID)
+		if err != nil {
+			return false, err
+		}
+		for _, item := range entries {
+			if item.Type == fileTypeFile && strings.EqualFold(item.Name, standard) {
+				return item.ID == id, nil
+			}
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false, nil
+		}
+		// Never oversleep past the deadline: the backoff starts at a second,
+		// which would otherwise dwarf a short budget.
+		wait := backoff
+		if wait > remaining {
+			wait = remaining
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(wait):
+		}
+		if backoff < 8*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
 // renameWithBackoff renames a file, retrying transiently until a time deadline.
 //
 // The name index is released asynchronously after a delete, so a rename to a
@@ -2389,7 +2662,7 @@ func (f *Fs) renameObject(ctx context.Context, id, name string) error {
 // delays the terminal error for a genuine concurrent-update conflict. The
 // pacer's default budget (~4.5s) is too short, so the deadline is tracked here.
 func (f *Fs) renameWithBackoff(ctx context.Context, id, name string) error {
-	deadline := time.Now().Add(renameDeadline)
+	deadline := time.Now().Add(f.renameTimeout())
 	start := time.Now()
 	backoff := time.Second
 	for {
@@ -2399,6 +2672,13 @@ func (f *Fs) renameWithBackoff(ctx context.Context, id, name string) error {
 		if err == nil {
 			return nil
 		}
+		// Drop the pacer's RetryError marker here, at the source: this function
+		// has already spent its own retry budget, so telling a caller to retry
+		// again is misleading, and every caller wraps the error with context -
+		// once the marker is buried under a fmt.Errorf it can no longer be
+		// removed, and copy.go's IsRetryError (which walks the whole chain)
+		// would trigger a whole-file retry that this marker exists to prevent.
+		err = stripPacerRetry(err)
 		code := ""
 		var ae *apiError
 		if asAPIError(err, &ae) {
@@ -2432,9 +2712,28 @@ func (f *Fs) renameWithBackoff(ctx context.Context, id, name string) error {
 
 // ------------------------------------------------------------ download -----
 
+// downloadRequest builds the GetDownloadUrlV2 parameter for one fid.
+//
+// The family space is addressed the same way as in every other wohome call, with
+// spaceType and familyId; personal space sends neither. That asymmetry is not
+// cosmetic: an empty familyId is answered RSP_CODE 9999, so "always include the key"
+// would break the path that works today.
+//
+// The family branch follows that convention rather than a capture: the recorded
+// personal-space request in the protocol notes carries no space fields, and no
+// family-space download has been sampled yet.
+func (f *Fs) downloadRequest(fid string) api.DownloadURLRequest {
+	p := api.DownloadURLRequest{Type: "1", FidList: []string{fid}, ClientID: clientID}
+	if f.spaceType == spaceFamily {
+		p.SpaceType = f.spaceType
+		p.FamilyID = f.opt.FamilyID
+	}
+	return p
+}
+
 // fetchDownloadURL requests a fresh download URL for a fid.
 func (f *Fs) fetchDownloadURL(ctx context.Context, fid string) (string, error) {
-	p := api.DownloadURLRequest{Type: "1", FidList: []string{fid}, ClientID: clientID}
+	p := f.downloadRequest(fid)
 	var resp api.DownloadURLResponse
 	err := f.pacer.Call(func() (bool, error) {
 		data, err := f.call(ctx, chanWoHome, "GetDownloadUrlV2", p, map[string]any{"secret": true})
@@ -2453,6 +2752,34 @@ func (f *Fs) fetchDownloadURL(ctx context.Context, fid string) (string, error) {
 		return "", fmt.Errorf("wopan: no download URL returned for fid %q", fid)
 	}
 	return resp.List[0].DownloadURL, nil
+}
+
+// PublicLink returns a direct download link for the given file.
+//
+// The link comes from GetDownloadUrlV2 and points straight at the file's
+// download endpoint, so anyone holding it can fetch the file until it expires.
+// wopan fixes that lifetime on the server (120 minutes, measured and not extended
+// by access) and the API
+// takes no expiry parameter, so a requested expire is ignored with a warning.
+// unlink is meaningless too - there is no stored share to revoke. Directories
+// cannot be linked and return fs.ErrorCantShareDirectories.
+//
+// FIXME: 120 minutes is measured in the personal space only. A family-space request
+// now carries the same spaceType/familyId pair as every other wohome call, but neither
+// that parameter shape nor the granted lifetime has been sampled for a family file, so
+// downloadURLTTL's 30 minutes is applied to both spaces on personal-space evidence.
+func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
+	if strings.HasSuffix(remote, "/") {
+		return "", fs.ErrorCantShareDirectories
+	}
+	if expire.IsSet() {
+		fs.Logf(f, "Public Link: wopan links expire 2 hours after being issued, ignoring the requested expiry of %v", expire)
+	}
+	obj, err := f.NewObject(ctx, remote)
+	if err != nil {
+		return "", err
+	}
+	return obj.(*Object).downloadURL(ctx)
 }
 
 // headETag returns the ETag header of a download URL.

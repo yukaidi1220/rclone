@@ -8,17 +8,23 @@
 # 每个 remote 一节, [remote名] 后跟 key = value。两个 remote 可共存:
 # 同一个账号可以同时添加个人云和家庭云 (space 不同即可)。
 #
-# 所有参数一览 (共 9 个):
+# 所有参数一览 (共 14 个):
 #   authorization       (必填, 敏感) 授权 token
-#   space               (必填) 空间类型: personal | family
+#   space               (可选, 默认 personal) 空间类型: personal | family
 #   family_id           (family 必填) 家庭云 ID
 #   root_folder_id      (可选) 根文件夹 ID
 #   user_domain_id      (可选) 用户域 ID
 #   hard_delete         (可选, 默认 false) 永久删除
+#   no_refresh          (可选, 默认 false) 不自动续期 token
 #   part_size           (可选, 默认 5Mi) 分片大小
 #   upload_concurrency  (可选, 默认 4) 分片并发数
-#   encoding            (可选, 默认 Standard|InvalidUtf8|LeftSpace|LeftTilde|...)
-#                       文件名编码
+#   region_code         (可选) 上传调度节点码 province:city
+#   disable_http2       (可选, 默认 false) 关闭 HTTP/2
+#   max_file_size       (可选, 默认 0=自动) 单文件上传上限
+#   no_member_check     (可选, 默认 false) 跳过会员等级探测
+#   encoding            (可选, 默认 Slash,Del,Ctl,LeftSpace,LeftPeriod,LeftTilde,
+#                        LeftCrLfHtVt,RightSpace,RightPeriod,RightCrLfHtVt,
+#                        InvalidUtf8,Dot) 文件名编码
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -55,7 +61,7 @@ family_id = <家庭云 ID, 数字; 多家庭时必填, 见下方说明>
 #   - 该字段是敏感的: 请勿提交到 git / 分享 conf 文件。
 #   - 个人云与家庭云同账号可复用同一个 authorization。
 
-# --- space (必填) ------------------------------------------------------------
+# --- space (可选, 默认 personal) ----------------------------------------------
 # 使用哪个存储空间。
 #   personal = 新个人云 (默认, 不写即个人云)
 #   family   = 新家庭云
@@ -88,6 +94,14 @@ family_id = <家庭云 ID, 数字; 多家庭时必填, 见下方说明>
 # 仅对个人云生效; 家庭云删除总是直接删除。
 # 注意: 139 的 API 不支持列出回收站或恢复文件, 误删后无法通过 rclone 找回。
 
+# --- no_refresh (可选, 高级, 默认 false) -------------------------------------
+# true  = 从不调用 token 续期接口;
+# false = token 临近过期时自动续期 (默认)。
+# 何时使用: 同一账号同时被另一个程序使用 (如 OpenList/alist 也配了 139),
+#           两个程序各自续期会互相把对方的 token 顶掉。此时给其中一方
+#           (通常给 rclone) 设 no_refresh = true, 由另一方负责续期。
+# 注意: 设了之后 rclone 不再续期, 若无人续期则 token 过期即报错。
+
 # --- part_size (可选, 高级, 默认 5Mi) ---------------------------------------
 # 大于此大小的文件按分片上传, 每片此大小。
 # 约束:
@@ -102,10 +116,41 @@ family_id = <家庭云 ID, 数字; 多家庭时必填, 见下方说明>
 # 增大可提高大文件上传速度 (但受带宽/服务端限制);
 # 减小可在弱网下更稳。
 
+# --- region_code (可选, 高级) ------------------------------------------------
+# userRegion 上传调度节点码, 格式 province:city, 例如 531:543 (江苏无锡)。
+# 官方 PC 客户端在 /file/create 时会带这个字段; 设置后个人云上传也会带
+# userRegion, 让服务端就近调度上传 CDN, 对节点选择和上传速度有明显影响。
+# 留空 = 不发送。默认空。
+# 例: region_code = 531:543
+
+# --- disable_http2 (可选, 高级, 默认 false) ----------------------------------
+# true  = 对所有 yun139 流量关闭 HTTP/2, 改用 HTTP/1.1 keep-alive;
+# false = 允许 HTTP/2 (默认)。
+# 为什么需要: HTTP/2 会把所有并发分片上传多路复用到同一条 TCP 连接上,
+#             总上传吞吐被限制在单条连接的带宽内; 关掉后并发分片会分散到
+#             多条并行 TCP 连接, 通常能显著提高大文件上传速度。
+# 代价: 连接数变多, 弱网/高延迟下未必更好, 建议实测对比。
+
+# --- max_file_size (可选, 高级, 默认 0 = 自动) -------------------------------
+# 覆盖单文件上传大小上限。0 (默认) 表示自动探测账号会员等级并使用对应上限:
+#   vip userIdentity  无会员 5G / 白银 8G / 黄金 20G / 钻石 500G
+# 超过上限的文件会在客户端直接被跳过 (NoRetryError), 而不是白跑一次
+# 多分片上传再被服务端以 04010319 (权益不足) 拒绝。
+# 设一个非 0 值可强制指定上限, 忽略探测结果。
+# 注意: 设置 no_member_check = true 时本项被忽略。
+# 例: max_file_size = 8G
+
+# --- no_member_check (可选, 高级, 默认 false) --------------------------------
+# true  = 跳过会员等级探测, 也不再做客户端单文件大小检查, 任意大小直接上传,
+#         由服务端在超限时以 04010319 (权益不足) 拒绝;
+# false = NewFs 时探测会员等级并据此拦截超限文件 (默认)。
+# 何时使用: 探测接口异常/账号等级特殊时, 避免 fail-open 行为影响判断。
+# 注意: 开启后本项覆盖 max_file_size。
+
 # --- encoding (可选, 高级, 默认见下) ----------------------------------------
 # 文件名编码规则 (rclone encoder 位掩码, 逗号分隔)。
 # 默认值已覆盖 139 服务端拒绝的字符 (首尾空格/波浪线/控制字符/非法 UTF-8):
-#   encoding = Standard,InvalidUtf8,LeftSpace,LeftTilde,LeftCrLfHtVt,RightSpace
+#   encoding = Slash,Del,Ctl,LeftSpace,LeftPeriod,LeftTilde,LeftCrLfHtVt,RightSpace,RightPeriod,RightCrLfHtVt,InvalidUtf8,Dot
 # 一般无需修改; 只有在与其它工具互通遇到文件名转义问题时才调整。
 
 # =============================================================================
