@@ -603,7 +603,11 @@ func isWopanBMPEmoji(r rune) bool {
 func validateName(leaf string) error {
 	n := utf8.RuneCountInString(leaf)
 	if n > 100 {
-		return fserrors.NoRetryError(fs.ErrorFileNameTooLong)
+		// Keep the sentinel wrapped so callers can still test for it, but say
+		// which limit fired: the multithread path prefixes this error with
+		// "failed to open chunk writer", which otherwise reads like a local
+		// ENAMETOOLONG rather than a server-side name rejection.
+		return fserrors.NoRetryError(fmt.Errorf("%w (wopan limit is 100 runes, got %d; the server would silently truncate it)", fs.ErrorFileNameTooLong, n))
 	}
 	for _, r := range leaf {
 		if isWopanBMPEmoji(r) {
