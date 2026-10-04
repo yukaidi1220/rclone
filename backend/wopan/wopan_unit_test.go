@@ -205,6 +205,9 @@ func TestUnitValidateName(t *testing.T) {
 		require.Error(t, err)
 		assert.ErrorIs(t, err, fs.ErrorFileNameTooLong)
 		assert.True(t, fserrors.IsNoRetryError(err), "must be wrapped in NoRetryError")
+		// the multithread path wraps this as "failed to open chunk writer", so
+		// the message has to name the limit itself
+		assert.Contains(t, err.Error(), "wopan limit is 100 runes, got 101")
 	})
 
 	t.Run("emoji non-BMP", func(t *testing.T) {
