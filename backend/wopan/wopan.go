@@ -352,15 +352,29 @@ type client interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
+// paramFunc 在发送时才给出请求体，而不是提前捕获一份。
+// AppQueryUser 把 access_token 放在 param 里面，所以换票之后那次重试必须重建 param：
+// 沿用换票前捕获的值，等于让服务端去校验一个刚被这次换票作废的令牌。
+type paramFunc func() any
+
+func resolveParam(p any) any {
+	if pf, ok := p.(paramFunc); ok {
+		return pf()
+	}
+	return p
+}
+
 // call issues one dispatcher request and returns the decoded DATA payload.
 //
 // rootURL is the dispatcher base (normally baseURL); method is the method
-// name (== header.key); param, when non-nil, is encrypted into body.param;
-// extra is merged into body as plaintext fields.
+// name (== header.key); param, when non-nil, is encrypted into body.param, and
+// may be a paramFunc to build it at send time; extra is merged into body as
+// plaintext fields.
 func call(ctx context.Context, c client, rootURL, accessToken, channel, method string, param any, extra map[string]any) (json.RawMessage, error) {
 	if rootURL == "" {
 		rootURL = baseURL
 	}
+	param = resolveParam(param)
 	resTime := time.Now().UnixMilli()
 	reqSeq := 100000 + rand.Intn(8999)
 	signature := sign(method, resTime, reqSeq, channel)
@@ -1085,6 +1099,11 @@ func shouldRetryCall(ctx context.Context, err error) (bool, error) {
 	if ctx.Err() != nil {
 		return false, err
 	}
+	// asAPIError 只走单路 Unwrap() error，穿不进带两个 %w 的错误，所以终态判定要在
+	// 这里显式认 NoRetryError，否则 pacer 会把它当成可重试一直打到底。
+	if fserrors.IsNoRetryError(err) {
+		return false, err
+	}
 	var ae *apiError
 	if asAPIError(err, &ae) {
 		return false, err
@@ -1115,7 +1134,9 @@ func (f *Fs) call(ctx context.Context, channel, method string, param any, extra 
 	}
 	fs.Logf(f, "wopan: token rejected with RSP_CODE=%s, refreshing the access token", code)
 	if rerr := f.refreshToken(ctx, ts, token); rerr != nil {
-		return nil, fmt.Errorf("wopan: token invalid and refresh failed: %w (original error: %w)", rerr, err)
+		// 换票失败是终态：被拒的 refresh_token 不会因为重试变成有效，而每次重试都是一次
+		// 失败登录，都打在这个共用账号上。包成 NoRetryError 让 pacer 立刻收手。
+		return nil, fserrors.NoRetryError(fmt.Errorf("wopan: token invalid and refresh failed: %w (original error: %w)", rerr, err))
 	}
 	return call(ctx, f.httpClient, "", ts.accessTokenNow(), channel, method, param, extra)
 }
@@ -1128,9 +1149,12 @@ func (f *Fs) call(ctx context.Context, channel, method string, param any, extra 
 // instead of killing the entire Preflight / rclone lsd wopan: on the first
 // connect attempt. was directly calling f.call before (TODO at line 888-894).
 func (f *Fs) queryUserID(ctx context.Context) (string, error) {
-	param := api.QueryUserRequest{AccessToken: f.tok.accessTokenNow()}
 	var u api.QueryUserResponse
 	err := f.pacer.Call(func() (bool, error) {
+		// access_token 走的是 param，所以递给 call 的是工厂：换票之后的重试必须带新令牌
+		param := paramFunc(func() any {
+			return api.QueryUserRequest{AccessToken: f.tok.accessTokenNow()}
+		})
 		data, err := f.call(ctx, chanAPIUser, "AppQueryUser", param,
 			map[string]any{"clientId": clientID, "secret": true})
 		if err != nil {
