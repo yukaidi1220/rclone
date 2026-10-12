@@ -86,9 +86,17 @@ const (
 
 	// downloadURLTTL is how long a fetched download URL is reused. The link lives
 	// exactly 120 minutes from being issued (measured 2026-09-30; it does not slide
-	// with access), so this is a quarter of the real lifetime. Raising it further
-	// needs Open to treat the expiry status code like a revoked link first.
+	// with access), so this is a quarter of the real lifetime. A link that ages out
+	// early is refetched rather than reported as a read failure (see staleLinkStatus),
+	// so this window is a minting-rate choice rather than a correctness ceiling.
 	downloadURLTTL = 30 * time.Minute
+
+	// statusLinkExpired is what the download CDN answers for a link that has aged
+	// out on its own. Measured 2026-09-30: 519 = expiry, 518 = a forged/tampered
+	// link, 403 = revoked or unauthorised. 518 is deliberately not in here: it is a
+	// statement about the URL we built, so refetching the same way would retry the
+	// bug rather than the expiry.
+	statusLinkExpired = 519
 
 	// hashGracePeriod is how long after an upload Hash() swallows transient
 	// errors: within the ~15s listing-visibility window the download link may
@@ -1738,6 +1746,15 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 		return "", err
 	}
 	etag, err := o.fs.headETag(ctx, url)
+	if errors.Is(err, errStaleLink) {
+		// The link aged out between being fetched and being used. One refetch,
+		// the same bounded self-heal Open does; a still-broken answer after
+		// that falls through to the error handling below.
+		o.invalidateURL()
+		if url, err = o.downloadURL(ctx); err == nil {
+			etag, err = o.fs.headETag(ctx, url)
+		}
+	}
 	if err != nil {
 		if time.Since(o.uploadedAt) < o.hashGrace() {
 			// The download link may not be settled yet; fall back to no-hash
@@ -1751,12 +1768,9 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 
 // Open opens the file for read. Call Close() on the returned io.ReadCloser.
 //
-// A cached link that has been revoked (403) is refetched once before giving up.
-//
-// FIXME: a link that has merely aged out replies 519, not 403, so it is not
-// refetched here - and headETag treats any status >=300 as a hard failure too.
-// This is unreachable while downloadURLTTL stays well under the 120 minute server
-// lifetime of a link; raising that TTL must first cover 519 here.
+// A cached link that the download CDN rejects as no longer usable - 403
+// (revoked/unauthorised) or the non-standard 519 (aged out) - is refetched once
+// before giving up.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	fs.FixRangeOption(options, o.size)
 	headers := fs.OpenOptionHeaders(options)
@@ -1768,7 +1782,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if err != nil {
 		return nil, err
 	}
-	if res.StatusCode == http.StatusForbidden {
+	if staleLinkStatus(res.StatusCode) {
 		// The cached link is stale - drop it and fetch a fresh one once.
 		_ = res.Body.Close()
 		o.invalidateURL()
@@ -2806,6 +2820,19 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	return obj.(*Object).downloadURL(ctx)
 }
 
+// errStaleLink marks "this download URL is no longer usable, a new one may
+// work". It is returned by headETag so a caller can tell "refetch" apart from
+// "the object is broken", and Hash uses it to retry exactly once.
+var errStaleLink = errors.New("download link no longer valid")
+
+// staleLinkStatus reports a download-CDN answer meaning the link, not the
+// request, is what failed: the server's own 403 (revoked/unauthorised) and the
+// non-standard 519 (aged out). Both are worth one refetch; neither is worth a
+// retry loop, so callers do this once per operation.
+func staleLinkStatus(code int) bool {
+	return code == http.StatusForbidden || code == statusLinkExpired
+}
+
 // headETag returns the ETag header of a download URL.
 //
 // A response with no ETag header yields ("", nil) rather than an error, so a
@@ -2822,6 +2849,9 @@ func (f *Fs) headETag(ctx context.Context, url string) (string, error) {
 		return "", err
 	}
 	defer func() { _ = res.Body.Close() }()
+	if staleLinkStatus(res.StatusCode) {
+		return "", fmt.Errorf("wopan: HEAD %s: %w: %s", url, errStaleLink, res.Status)
+	}
 	if res.StatusCode >= 300 {
 		return "", fmt.Errorf("wopan: HEAD %s: %s", url, res.Status)
 	}
