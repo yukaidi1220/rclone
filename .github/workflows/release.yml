@@ -126,7 +126,7 @@ jobs:
 
       - name: Keep the binary as a workflow artifact (branch runs)
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.asset }}
           path: dist/
