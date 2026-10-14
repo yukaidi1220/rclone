@@ -76,7 +76,9 @@ func usableName(name string) bool {
 		return false
 	}
 	return !strings.ContainsRune(name, '/')
-} // ListR lists the tree under dir, calling back with each batch
+}
+
+// ListR lists the tree under dir, calling back with each batch
 func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) error {
 	helper := list.NewHelper(callback)
 	if err := f.listR(ctx, dir, helper); err != nil {
@@ -202,7 +204,7 @@ func (f *Fs) createFolder(ctx context.Context, drivePath string) error {
 	// A folder is metadata only and inherits its policy from the drive or the
 	// pool, so no storage policy check applies to making one.
 	return f.call(ctx, "POST", "/file/create", nil, &api.CreateFolderRequest{
-		Uri:  f.uriForDrivePath(drivePath),
+		URI:  f.uriForDrivePath(drivePath),
 		Type: "folder",
 	}, nil)
 }
@@ -274,7 +276,7 @@ func (f *Fs) deleteBatch(ctx context.Context, uris []string) error {
 	return nil
 }
 
-// Move src to this remote using a server-side move
+// DirMove moves src, srcRemote to this remote at dstRemote using a server-side move
 //
 // Only a folder is moved here: a server-side move of a file stamps the entry with
 // the time of the move, and no API gives the modified time back, so a file is
@@ -339,7 +341,7 @@ func (f *Fs) moveEntry(ctx context.Context, srcPath, dstPath string) error {
 // rename gives the entry at a drive path a new leaf name
 func (f *Fs) rename(ctx context.Context, drivePath, newName string) error {
 	return f.call(ctx, "POST", "/file/rename", nil, &api.RenameRequest{
-		Uri:     f.uriForDrivePath(drivePath),
+		URI:     f.uriForDrivePath(drivePath),
 		NewName: f.opt.Enc.FromStandardName(newName),
 	}, nil)
 }
@@ -456,7 +458,7 @@ func (f *Fs) policyReportFor(ctx context.Context, remote string) (any, error) {
 // policy the policy command reported beforehand.
 func (f *Fs) setPolicy(ctx context.Context, policyID string) (any, error) {
 	if err := f.call(ctx, "PATCH", "/file/policy", nil, &api.BindPolicyRequest{
-		Uri:      f.uriFor(""),
+		URI:      f.uriFor(""),
 		PolicyID: policyID,
 	}, nil); err != nil {
 		return nil, err
