@@ -1,3 +1,5 @@
+// Package api holds the request and response shapes of Cloudreve's v4 HTTP API,
+// as the endpoints answer them rather than as rclone would like them to be.
 package api
 
 import "time"
@@ -200,7 +202,7 @@ type FileExtended struct {
 // EntityType must be "version" to write over an existing file; an empty
 // EntityType there is answered with CodeObjectExist.
 type CreateSessionRequest struct {
-	Uri          string            `json:"uri"`
+	URI          string            `json:"uri"`
 	Size         int64             `json:"size"`
 	LastModified int64             `json:"last_modified,omitempty"`
 	MimeType     string            `json:"mime_type,omitempty"`
@@ -233,7 +235,7 @@ type UploadSession struct {
 // DeleteSessionRequest is the body of DELETE /file/upload.
 type DeleteSessionRequest struct {
 	ID  string `json:"id"`
-	Uri string `json:"uri"`
+	URI string `json:"uri"`
 }
 
 // MetadataUploadSessionID is the entry metadata that marks a placeholder left by
@@ -282,19 +284,19 @@ type Capacity struct {
 // no value here meaning "inherit again", so undoing a binding means naming the
 // policy the folder reported beforehand.
 type BindPolicyRequest struct {
-	Uri      string `json:"uri"`
+	URI      string `json:"uri"`
 	PolicyID string `json:"policy_id"`
 }
 
 // CreateFolderRequest is the body of POST /file/create.
 type CreateFolderRequest struct {
-	Uri  string `json:"uri"`
+	URI  string `json:"uri"`
 	Type string `json:"type"`
 }
 
 // RenameRequest is the body of POST /file/rename.
 type RenameRequest struct {
-	Uri     string `json:"uri"`
+	URI     string `json:"uri"`
 	NewName string `json:"new_name"`
 }
 

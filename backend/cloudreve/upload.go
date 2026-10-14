@@ -99,7 +99,7 @@ func (f *Fs) createSession(ctx context.Context, remote string, src fs.ObjectInfo
 func (f *Fs) startSession(ctx context.Context, remote string, src fs.ObjectInfo, policyID, entityType string) (*api.UploadSession, error) {
 	session := new(api.UploadSession)
 	request := &api.CreateSessionRequest{
-		Uri:        f.uriFor(remote),
+		URI:        f.uriFor(remote),
 		Size:       src.Size(),
 		PolicyID:   policyID,
 		EntityType: entityType,
@@ -128,7 +128,7 @@ func (f *Fs) deleteSession(ctx context.Context, session *api.UploadSession) erro
 	defer cancel()
 	return f.call(ctx, "DELETE", "/file/upload", nil, &api.DeleteSessionRequest{
 		ID:  session.SessionID,
-		Uri: session.URI,
+		URI: session.URI,
 	}, nil)
 }
 

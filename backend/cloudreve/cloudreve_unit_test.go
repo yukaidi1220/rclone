@@ -104,7 +104,7 @@ func (s *site) made() []string {
 		if err := json.Unmarshal([]byte(r.body), request); err != nil {
 			continue
 		}
-		uris = append(uris, request.Uri)
+		uris = append(uris, request.URI)
 	}
 	return uris
 }
@@ -556,7 +556,7 @@ func TestUnitMissingRootIsTolerated(t *testing.T) {
 		case rec.method == "POST" && rec.path == "/api/v4/file/create":
 			request := new(api.CreateFolderRequest)
 			require.NoError(t, json.Unmarshal([]byte(rec.body), request))
-			created = append(created, request.Uri)
+			created = append(created, request.URI)
 			reply(w, api.CodeSuccess, nil)
 		default:
 			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
@@ -674,7 +674,7 @@ func TestUnitPoolUploadNamesAChild(t *testing.T) {
 			reply(w, api.CodeSuccess, &api.UploadSession{
 				SessionID: "SP1", ChunkSize: 0,
 				UploadURLs:     []string{s.link("/store/part?n=1")},
-				URI:            request.Uri,
+				URI:            request.URI,
 				CallbackSecret: "SECP",
 				StoragePolicy:  &api.Policy{ID: named, Type: PolicyTypeS3},
 			})
@@ -777,7 +777,7 @@ func TestUnitUploadUsesPresignedParts(t *testing.T) {
 		case rec.method == "PUT" && rec.path == "/api/v4/file/upload":
 			request := new(api.CreateSessionRequest)
 			require.NoError(t, json.Unmarshal([]byte(rec.body), request))
-			assert.Equal(t, "cloudreve://my/dir/f.txt", request.Uri)
+			assert.Equal(t, "cloudreve://my/dir/f.txt", request.URI)
 			assert.Equal(t, int64(10), request.Size)
 			assert.Equal(t, modTime.UnixMilli(), request.LastModified, "the server reads last_modified as milliseconds")
 			assert.Equal(t, "POL-S3", request.PolicyID, "the policy the bytes land on is named")
@@ -787,7 +787,7 @@ func TestUnitUploadUsesPresignedParts(t *testing.T) {
 				ChunkSize:   4,
 				UploadURLs:  []string{s.link("/store/part?n=1"), s.link("/store/part?n=2"), s.link("/store/part?n=3")},
 				CompleteURL: s.link("/store/complete"),
-				URI:         request.Uri, CallbackSecret: "SEC",
+				URI:         request.URI, CallbackSecret: "SEC",
 			})
 		case rec.path == "/store/part":
 			// Parts arrive on the concurrency the backend chooses, so what the
@@ -881,7 +881,7 @@ func TestUnitUploadOverwriteAsVersion(t *testing.T) {
 			reply(w, api.CodeSuccess, &api.UploadSession{
 				SessionID: "S2", ChunkSize: 0,
 				UploadURLs: []string{s.link("/store/part?n=1")},
-				URI:        request.Uri, CallbackSecret: "SEC2",
+				URI:        request.URI, CallbackSecret: "SEC2",
 			})
 		case rec.path == "/store/part":
 			assert.Equal(t, 7, len(rec.body), "chunk_size 0 means the whole file in one part")
@@ -956,13 +956,13 @@ func TestUnitEmptyFileGoesThroughTheSession(t *testing.T) {
 		case rec.method == "PUT" && rec.path == "/api/v4/file/upload":
 			request := new(api.CreateSessionRequest)
 			require.NoError(t, json.Unmarshal([]byte(rec.body), request))
-			asked = request.Uri
+			asked = request.URI
 			assert.Equal(t, int64(0), request.Size)
 			assert.Equal(t, modTime.UnixMilli(), request.LastModified, "the empty file keeps its modified time")
 			reply(w, api.CodeSuccess, &api.UploadSession{
 				SessionID: "SZ", ChunkSize: 157286400,
 				UploadURLs: []string{s.link("/store/part?n=1")},
-				URI:        request.Uri, CallbackSecret: "SECZ",
+				URI:        request.URI, CallbackSecret: "SECZ",
 			})
 		case rec.path == "/store/part":
 			assert.Equal(t, 0, len(rec.body), "one empty part")
@@ -1237,7 +1237,7 @@ func TestUnitDirMoveUsesTheFolderEndpoint(t *testing.T) {
 			require.Len(t, renamed, 1, "the destination name is applied")
 			patch := new(api.RenameRequest)
 			require.NoError(t, json.Unmarshal([]byte(renamed[0]), patch))
-			assert.Equal(t, "cloudreve://my/other/src", patch.Uri, "the entry the server kept under its own name")
+			assert.Equal(t, "cloudreve://my/other/src", patch.URI, "the entry the server kept under its own name")
 			assert.Equal(t, tc.wantName, patch.NewName)
 		})
 	}
@@ -1272,7 +1272,7 @@ func TestUnitDirMoveSameFolderAndTaken(t *testing.T) {
 		require.Len(t, renamed, 1)
 		patch := new(api.RenameRequest)
 		require.NoError(t, json.Unmarshal([]byte(renamed[0]), patch))
-		assert.Equal(t, "cloudreve://my/src", patch.Uri)
+		assert.Equal(t, "cloudreve://my/src", patch.URI)
 		assert.Equal(t, "src2", patch.NewName)
 	})
 	for _, tc := range []struct {
@@ -1576,7 +1576,7 @@ func TestUnitSetPolicyCommandBindsAndRefetches(t *testing.T) {
 		case rec.method == "PATCH" && rec.path == "/api/v4/file/policy":
 			request := new(api.BindPolicyRequest)
 			require.NoError(t, json.Unmarshal([]byte(rec.body), request))
-			bound = append(bound, request.Uri+" "+request.PolicyID)
+			bound = append(bound, request.URI+" "+request.PolicyID)
 			reply(w, api.CodeSuccess, nil)
 		default:
 			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
@@ -1733,13 +1733,13 @@ func uploadSite() siteHandler {
 			if err := json.Unmarshal([]byte(rec.body), request); err != nil {
 				s.t.Fatalf("bad folder request: %v", err)
 			}
-			if rest, found := strings.CutPrefix(request.Uri, driveRoot); found {
+			if rest, found := strings.CutPrefix(request.URI, driveRoot); found {
 				if parent := path.Dir(rest); parent != "." && s.lacks(driveRoot+parent) {
 					reply(w, api.CodeParentNotExist, nil)
 					return
 				}
 			}
-			s.have(request.Uri)
+			s.have(request.URI)
 			reply(w, api.CodeSuccess, nil)
 		case rec.method == "PUT" && rec.path == "/api/v4/file/upload":
 			request := new(api.CreateSessionRequest)
@@ -1749,7 +1749,7 @@ func uploadSite() siteHandler {
 			reply(w, api.CodeSuccess, &api.UploadSession{
 				SessionID: "S7", ChunkSize: 0,
 				UploadURLs: []string{s.link("/store/part?n=1")},
-				URI:        request.Uri, CallbackSecret: "SEC7",
+				URI:        request.URI, CallbackSecret: "SEC7",
 			})
 		case rec.path == "/store/part":
 			w.Header().Set("ETag", `"e"`)
@@ -1924,7 +1924,7 @@ func TestUnitMoveToTheDriveRootStaysWellFormed(t *testing.T) {
 	assert.NotContains(t, renamed, "my//", "no empty segment in the addressed path")
 	patch := new(api.RenameRequest)
 	require.NoError(t, json.Unmarshal([]byte(renamed), patch))
-	assert.Equal(t, "cloudreve://my/old", patch.Uri, "the server kept the folder under its own name at the top")
+	assert.Equal(t, "cloudreve://my/old", patch.URI, "the server kept the folder under its own name at the top")
 	assert.Equal(t, "renamed", patch.NewName)
 }
 
