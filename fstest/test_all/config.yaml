@@ -693,6 +693,12 @@ backends:
    fastlist: false
    extratime: 2.0
    listretries: 5
+ - backend:  "cloudreve"
+   remote:   "TestCloudreve:"
+   # bisync compares and repairs modification times, which this backend can only
+   # set while uploading, and a server-side move or rename refreshes them
+   ignoretests:
+     - cmd/bisync
  - backend:  "wopan"
    remote:   "TestWopan:"
    # bisync cannot work with write-only-modtime, case-insensitive names and
