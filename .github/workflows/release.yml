@@ -61,11 +61,14 @@ jobs:
       - name: Test backend/cloudreve with race detector
         run: go test -race -count=2 ./backend/cloudreve/
 
-      # golangci-lint v2, matching .golangci.yml, installed at the version the
-      # repo's own `make lint` would fetch (latest). Scoped to the backends this
-      # fork carries: the rest of the tree predates the v2 config and was never
-      # linted here, so widening would report findings nobody introduced in this
-      # branch. wopan's three pre-existing findings are now fixed.
+      # golangci-lint v2, matching .golangci.yml, at the release `make build_dep`
+      # would fetch (latest), which is also the version upstream's own lint step
+      # used. This is all the linting that happens in this fork, so it covers the
+      # backends written or patched here rather than the whole tree; yun139 is not
+      # in the list because it has never been linted and would need its own
+      # fix-up first. A finding here fails the test job, and the test job gates
+      # publish: the tag survives, and releases/latest keeps serving the previous
+      # binaries.
       - name: Install golangci-lint
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
       - name: Lint
