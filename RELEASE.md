@@ -139,7 +139,9 @@ the Go ecosystem.
 
 These files will need editing:
 
-- `.github/workflows/build.yml` - change current and previous Go versions
+- `.github/workflows/release.yml` carries no Go version matrix: the runners
+  take their Go from `go.mod` (`go-version-file`), so the `go.mod` bump below
+  is what moves the toolchain CI builds with
 - `docs/content/install.md` - change minimum Go version required
 - `fs/versioncheck.go` - update minimum Go version required
 - `go.mod` - update minimum Go version required
@@ -222,8 +224,11 @@ Now
 - git pull
 - cat VERSION # check this is ${NEW_TAG} - if not run make startdev
 - `git cherry-pick -x` any fixes, including the GUI update if there was one
-  - for security releases consider updating the Go patch version in
-    `.github/workflows/build.yml` and dependencies with CVE fixes
+  - for security releases consider updating the Go patch version and
+    dependencies with CVE fixes. This fork has no `build.yml` for CI to read
+    a toolchain out of - `go.mod`'s `go` line is what the runners install,
+    so raising it (say `1.26.0` to `1.26.9`) is what pulls stdlib CVE fixes
+    into the published binaries
   - fixes may depend on commits which weren't picked so push to CI
     and check it is green before tagging
 - Do the steps in "Making a release" above, except
