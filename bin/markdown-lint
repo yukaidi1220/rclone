@@ -3,15 +3,18 @@
 # Run markdown linting locally
 set -e
 
-# Workflow
-build=.github/workflows/build.yml
-
-# Globs read from from $build
-globs=$(awk '/- name: Check Markdown format/{f=1;next} f && /globs:/{f=2;next} f==2 && NF{if($1=="-"){exit} print $0}' $build)
-
-if [ -z "$globs" ]; then
-    echo "Error: No globs found in Check Markdown step in $build" >&2
-    exit 1
-fi
+# The files markdownlint-cli2 is pointed at. This fork has no markdown job in
+# CI (upstream drives the same list from .github/workflows/build.yml, which this
+# fork does not have), so this list is the only copy here.
+globs="
+CONTRIBUTING.md
+MAINTAINERS.md
+README.md
+RELEASE.md
+CODE_OF_CONDUCT.md
+librclone/README.md
+backend/s3/README.md
+docs/content/{_index,authors,bugs,changelog,docs,downloads,faq,filtering,gui,install,licence,overview,privacy}.md
+"
 
 docker run --rm -v $PWD:/workdir --user $(id -u):$(id -g) davidanson/markdownlint-cli2 $globs
