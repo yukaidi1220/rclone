@@ -2,6 +2,37 @@
 
 This file describes how to make the various kinds of releases
 
+## This fork does not follow this document
+
+Everything below is upstream rclone's procedure - `make tag`, signed tags,
+`make upload_github`, beta.rclone.org, the website, docker images, winget.
+None of it runs here. Releasing this fork is:
+
+- `git tag vX.Y.Z-cdn.N && git push myfork vX.Y.Z-cdn.N` - a lightweight tag on
+  main's tip. The `vX.Y.Z` part has to match what `VERSION` and
+  `fs/versiontag.go` say, so it changes when upstream is merged; `.cdn.N` just
+  counts up.
+- `.github/workflows/release.yml` takes it from there: `prepare` opens a draft,
+  four cross-compilation legs each upload one asset, `test` runs in parallel
+  with them, and `publish` flips the release live only if every leg and the
+  tests passed.
+- The assets are exactly `rclone-cdn-{linux,windows}-{amd64,arm64}` - there is
+  no checksums file, no docker image, no winget package, no website upload.
+- `releases/latest` is ordered by publication time, not by version, and both
+  the migration runners and the gateway image download from it, so publishing a
+  tag changes what production pulls.
+  `direct-link-gateway/.github/workflows/build.yml` pins `RCLONE_TAG`
+  separately, so moving the gateway to a new build is its own commit.
+- A failing `test` job - including a single lint finding - stops `publish`, but
+  `cleanup` deletes the draft with `--cleanup-tag=false`: the tag stays, and
+  `releases/latest` keeps serving the previous binaries.
+
+Two instructions below are therefore not executable here: `make check` needs
+docker and lints the whole tree, which this fork has only ever linted for three
+backends; and "check the GitHub actions build is green" assumes upstream's
+`build.yml`, which this fork deleted - `release.yml` triggers on main and on
+tags only, so a pushed branch gets no CI unless it is dispatched deliberately.
+
 ## Extra required software for making a release
 
 - [gh the github cli](https://github.com/cli/cli) for uploading packages
