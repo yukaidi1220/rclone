@@ -16,7 +16,6 @@ import (
 	"github.com/rclone/rclone/backend/yun139/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
-	"github.com/rclone/rclone/lib/encoder"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -201,7 +200,7 @@ func TestValidateName(t *testing.T) {
 	if err := validateName(""); err != nil {
 		t.Errorf("validateName(\"\") rejected: %v", err)
 	}
-	enc := encoder.MultiEncoder(yun139DefaultEncoding)
+	enc := yun139DefaultEncoding
 	f := &Fs{opt: Options{Enc: enc}}
 	// (f *Fs).validateName encodes before checking, so a reserved character in
 	// the leaf is escaped and accepted, while a reserved character in an
