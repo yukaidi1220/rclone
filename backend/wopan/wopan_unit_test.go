@@ -1621,7 +1621,7 @@ func TestUnitDisableHTTP2Negotiation(t *testing.T) {
 	c := newHTTPClient(context.Background(), &Options{DisableHTTP2: true})
 	res, err := c.Get(srv.URL)
 	require.NoError(t, err)
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	assert.Equal(t, 1, res.ProtoMajor, "disable_http2 must negotiate HTTP/1.1")
 }
 

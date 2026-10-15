@@ -2156,7 +2156,7 @@ func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string,
 	}
 	total := int64(len(plans))
 	fs.Debugf(src, "wopan: upload session %s: %d part(s) of up to %v",
-		uniqueID, total, fs.SizeSuffix(f.opt.ChunkSize))
+		uniqueID, total, f.opt.ChunkSize)
 
 	var data api.UploadData
 	// The upload channel never goes through the dispatcher, so an expired
@@ -2187,7 +2187,7 @@ func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string,
 			// The fresh session gets a new uniqueId: without logging it, the
 			// retried POSTs cannot be correlated in server-side logs.
 			fs.Debugf(src, "wopan: upload session %s: %d part(s) of up to %v",
-				uniqueID, total, fs.SizeSuffix(f.opt.ChunkSize))
+				uniqueID, total, f.opt.ChunkSize)
 		}
 		if total == 1 {
 			err = f.pacer.CallNoRetry(func() (bool, error) {
