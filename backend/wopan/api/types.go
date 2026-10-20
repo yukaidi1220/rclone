@@ -272,6 +272,73 @@ type UsageResponse struct {
 	VipLevel  string    `json:"vipLevel"`
 }
 
+// MembershipBenefitMeta is the meta block of displayMembershipBenefit.
+//
+// This endpoint is the wocloud PC client's own BFF, not the dispatcher: the
+// envelope is meta/result rather than STATUS/RSP, and nothing in it is
+// encrypted.
+type MembershipBenefitMeta struct {
+	Code    string `json:"code"`    // "200" on success
+	Message string `json:"message"` // e.g. "成功"
+}
+
+// MembershipBenefit is the benefit block of displayMembershipBenefit, holding
+// only the fields rclone reads.
+//
+// The wire quotes numeric values inconsistently across this vendor's APIs, so
+// the two values parsed as numbers decode through FlexString. `UploadFileSize`
+// is the account's single-file upload limit **in MiB**, and the same block's
+// `capacity` is in MiB too: measured 2026-10-19 on one account,
+// `capacity":"61440"` x 1 MiB = `64424509440`, which is exactly the
+// `byteTotalSize` that wohome/QueryCloudUsageInfo reports for that account.
+type MembershipBenefit struct {
+	VipLevel       FlexString `json:"vipLevel"`       // tier code, "0" for a non-member
+	VipDesc        string     `json:"vipDesc"`        // tier name, e.g. "非会员"
+	UploadFileSize FlexString `json:"uploadFileSize"` // single-file upload limit, MiB
+}
+
+// MembershipBenefitResponse is the plaintext envelope of
+// displayMembershipBenefit.
+//
+// `Result` stays raw: the block carries a dozen other benefit fields whose types
+// are not all strings (`memberStackOpenStatus` is numeric), and rclone acts on
+// only three of them. Keeping the rest unparsed means a type switch in a field
+// nobody reads cannot fail the probe.
+type MembershipBenefitResponse struct {
+	Meta   MembershipBenefitMeta `json:"meta"`
+	Result json.RawMessage       `json:"result"`
+}
+
+// QuickTransferResponse is the plaintext envelope of
+// openapi/transfer/quickTransfer, the instant-upload ("秒传") probe.
+//
+// The host is not panservice: it is the same openapi operator the web client's
+// own bundle names for uploads (du.smartont.net / b.smartont.net, one IP). The
+// envelope is meta/result like the BFF endpoints, with meta.code "0000" on
+// success, and `hasFile` is numeric while the benefit block quotes its numbers -
+// hence FlexString. `fileId` arrives null on a miss.
+//
+// Every field is FlexString on purpose. The captured responses do quote the ids
+// as strings, but a plain `string` field turns one unexpected quote into a decode
+// failure for the whole envelope - and the caller's answer to "I could not read
+// this" is to upload normally, which after the service registered the content
+// would store a second copy of it.
+type QuickTransferResponse struct {
+	Meta struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"meta"`
+	Result struct {
+		HasFile     FlexString `json:"hasFile"`  // "1" = the content was already stored
+		Fid         FlexString `json:"fid"`      // direct-download fid of the created entry
+		FileID      FlexString `json:"fileId"`   // same value as Fid, seen on both codes
+		WcFileID    FlexString `json:"wcFileId"` // id used by DeleteFile/Rename
+		FileName    FlexString `json:"fileName"`
+		SHA256      FlexString `json:"sha256"`
+		FileVersion FlexString `json:"fileVersion"`
+	} `json:"result"`
+}
+
 // GetZoneInfoRequest is the param for wohome/GetZoneInfo.
 type GetZoneInfoRequest struct {
 	AppID string `json:"appId"`

@@ -97,6 +97,15 @@ The advanced options are:
   concurrently. Defaults to `4` (the minimum is `1`). The server accepts
   out-of-order parts within one upload session and assembles them by part
   index - see [Chunked uploads](#chunked-uploads) below.
+- `--wopan-no_member_check`: skip the membership probe, and with it the notice that
+  probe makes possible. rclone never blocks a file on the reported size anyway -
+  see [Membership and the single-file upload
+  size](#membership-and-the-single-file-upload-size) below - so this only removes
+  the request and those log lines. Defaults to `false`.
+- `--wopan-quick_transfer`: ask whether the server already stores content with the
+  same SHA-256 before uploading, and if it does, create the new directory entry
+  without sending any bytes. Off by default because the answer costs a full hash
+  of each source - see [Quick transfer](#quick-transfer) below.
 - `--wopan-encoding`: the encoding for the backend. The default is `Standard`
   plus `EncodeQuestion`, `EncodeAsterisk`, `EncodeLtGt` and `EncodeInvalidUtf8`
   and should normally be left alone. The server rejects `?`, `*`, `<` and `>`
@@ -111,10 +120,19 @@ Wopan stores the modification time of files with a precision of 1 second.
 The modification time is set at upload time and preserved by server side
 copies and moves.
 
-Wopan reports an MD5 hash, taken from the ETag of the object. Fetching the
-hash requires a HEAD request per file, so rclone marks it as slow: it is only
-used when you ask for it explicitly with `--checksum`. **Using `--checksum`
-is the recommended way to run sync and copy against wopan**; without it,
+Wopan reports an MD5 hash, taken from the ETag of the object. It is not free and it
+is not everywhere: reading one costs a request to sign the download URL plus a HEAD
+of that URL, and **objects above `--wopan-upload_cutoff` have no content MD5 at all**
+(their ETag is the multipart kind), where `Object.Hash` reports "no hash". rclone
+therefore marks the hash as slow and fetches it only when a comparison needs it.
+
+That last point changes what `--checksum` means here: when the destination has no
+hash, rclone gives up on the hash and reports the two objects as equal, so for files
+above `upload_cutoff` `--checksum` is *weaker* than the default size-plus-mtime
+check, and no content verification is available at all through rclone's hash path -
+the only way to verify such a file is to read its bytes back. **Using `--checksum`
+is the recommended way to run sync and copy against wopan for files below
+`upload_cutoff`**; without it,
 rclone compares sizes and modification times.
 
 Files of 8 MiB or more are stored in server-side shards, however they were
@@ -144,10 +162,13 @@ request. Larger files go through the service's chunked upload protocol:
    leftover bytes and can reach roughly twice `chunk_size`. No upload plan
    is fetched from the server.
 2. All parts travel through one upload session (a single `uniqueId`), posted
-   by `--wopan-upload_concurrency` workers. The source is read sequentially
-   and parts are posted concurrently, so arrival order is shuffled; the
-   server reassembles the file by part index, and out-of-order arrival has
-   been verified against the live service.
+   by `--wopan-upload_concurrency` workers. Each part is read from its own range of
+   the source and buffered before it is posted; parts are posted concurrently, so
+   arrival order is shuffled; the server reassembles the file by part index, and
+   out-of-order arrival has been verified against the live service. A failed part
+   is not re-sent inside the session - the whole transfer is retried with a fresh
+   session - but the buffering stays, because it also protects a source whose
+   `Open` does not honour the requested byte range.
 3. When the final part is accepted the server assembles the file and returns
    the finished file ID.
 
@@ -205,6 +226,142 @@ fails the chunk with `fs.ErrorRangeIgnored`), rclone logs
 file through the normal single-stream path, so a misbehaving source or CDN
 degrades to the slower transfer instead of corrupting data.
 
+## Membership and the single-file upload size
+
+wopan reports how large a single uploaded file may be for the account. rclone asks
+for that number once per run through the desktop client's own benefit endpoint
+(`displayMembershipBenefit`) and reads `uploadFileSize` from the answer - `1024`,
+in MiB, i.e. 1 GiB for a non-member account at the time of writing. The value
+belongs to the account rather than to a space, so the family space shares it, and
+a second remote of the same account does not ask again.
+
+A successful probe logs one line per account, and `-vv` adds the whole benefit
+block as it arrived:
+
+```console
+NOTICE: wopan top: wopan: membership "非会员" (vipLevel=0): reported single-file upload size 1Gi - files over it are warned about, not skipped
+```
+
+The probe asks with the desktop client's own header set, measured from the traffic.
+One part of that cannot be honoured by default: rclone's transport rewrites
+`User-Agent` on every request, so what actually goes out is `rclone/<version>`.
+That does not change the answer - the captured user agent, `rclone/<version>` and
+no user agent at all returned byte-identical bodies when measured - but to send the
+client's string anyway set `--wopan-user_agent` to it.
+
+**This is a number to read, not a limit rclone enforces.** Measured 2026-10-20 on
+that same non-member account, files of 1 GiB + 1 byte and of 1.2 GiB were uploaded
+through rclone's chunked path and read back at full size. Anything past
+`upload_cutoff` (64 MiB by default) goes through that path, so blocking on the
+reported number would skip files the server accepts - a silently smaller sync.
+rclone therefore names each such file in the log and uploads it anyway:
+
+```console
+NOTICE: wopan top: wopan: big.bin is 1288490188 bytes, over the single-file upload size the account reports (1073741824 bytes, membership "非会员"); uploading anyway - the chunked upload path is not held to that number
+```
+
+The notice appears at each of the three upload entry points (`Put`, `Update`,
+`OpenChunkWriter`) before any request is spent, so a file the official app would
+refuse is still visible here rather than surfacing later as a server rejection. A
+server-side `Copy` moves no bytes and says nothing.
+
+Two things to know about that number. `-vv` prints the benefit block as the service
+returned it, and that block carries account identifiers - do not paste it into a
+public issue. And the block reports the *service's* view: the official client raises
+the figure to 51200 MiB locally for some tiers, so a member account's display value
+need not be what the endpoint said.
+
+The probe itself can never block a transfer. If the endpoint is unreachable,
+answers a shape rclone cannot read, or reports no usable `uploadFileSize`, rclone
+logs the reason at `-vv` and says nothing about sizes. An expired or missing token
+is one of those shapes: the endpoint answers `HTTP 200` with
+`meta.code 10002404 用户未登录` rather than an authentication error, and rclone does
+not rotate the token pair to learn a display value. `--wopan-no_member_check` skips
+that request, and the notice with it.
+
+## Quick transfer
+
+`--wopan-quick_transfer` asks the drive whether it already stores content with the
+same SHA-256 before uploading a file, and if it does, the file appears in the
+destination without a single byte being transferred. This is the official client's
+"秒传": rclone sends the hash to the openapi service the client itself uploads to
+(`POST https://b.smartont.net/openapi/transfer/quickTransfer`, one `access-token`
+header, the same token the dispatcher uses) and the server registers a new entry
+pointing at content it already holds.
+
+Measured 2026-10-20 on the personal space of a test account, both directions:
+
+```console
+DEBUG : older-than-time.bin: wopan: rapid upload miss (sha256 00e2a676fd4f36c7a83d73baf617e6cd2fb2e5968e4cb91f221a7eacd8509b47 not stored), uploading normally
+NOTICE: qt-conv-Y.bin: wopan: rapid upload hit - 3Mi already stored under this SHA-256, no bytes uploaded; the service stamps the entry with the current time and wopan cannot set a modification time afterwards, so a later copy or sync re-registers it unless --size-only is used
+```
+
+The hit is a real file: `Transferred: 0 B`, the listing shows the full size, the
+MD5 read back equals the normally-uploaded copy's, and downloading it gives bytes
+whose SHA-256 matches the source. A miss costs one request and transfers normally.
+
+**The one thing to know before turning it on is the modification time.** The entry
+is stamped with the moment it was registered; the timestamp sent in the request is
+ignored by the service, and wopan has no way to set a modification time afterwards
+at all (`SetModTime` is not supported). rclone's default comparison is size plus
+modtime, so a second `copy` or `sync` of the same content sees a mismatch and
+registers the file again - no bytes move, and the run reports
+`Copied (replaced existing)`. Use `--size-only`: in five measured runs it skipped
+the second copy every time, and it asks no hash of either side. `--checksum` works
+differently by size. Files above `--wopan-upload_cutoff` have no stored content MD5
+at all, so rclone gives up on the hash comparison and falls back to comparing sizes
+(`Dst hash empty - aborting Src hash check`) - it converges, but not because of the
+hash. Smaller files do have one, and reading it costs a `GetDownloadUrlV2` plus a HEAD
+per file; in six measured runs of such a file that pair failed twice with
+`wsarecv: An existing connection was forcibly closed`, and when the destination hash
+cannot be read rclone transfers rather than skips. Whether the replacement
+changes the stored object id and where the old entry goes is not measured. The
+object rclone returns from the transfer itself reports the source's timestamp, while
+the drive reports the registration time, so any later listing of that file
+disagrees with it.
+
+The other cost is the hash. rclone needs SHA-256 of the source to ask the question,
+which for a local file means a second full read and for a remote source can mean
+downloading it - so the option is off by default, and the probe is skipped for files
+under 3 MiB, where a request is not worth it. (That floor is what the official
+client is reported to use; it is not measured here.)
+
+Nothing about this feature can lose data. A miss, a timeout, an HTTP error, an
+unreadable response, an unexpected `meta.code`, a source whose SHA-256 rclone cannot
+obtain, a source with no modification time and every family-space transfer all fall
+through to the ordinary upload. If the first answer never arrives at all - the
+connection drops, a `500`, a body rclone cannot parse - rclone asks once more
+before giving up, because that is the one case in which the service may already have
+registered the content, and re-asking is cheap: three offers of the same
+`(directoryId, fileName, SHA-256)` measured on 2026-10-20 leave exactly one entry,
+with no renamed copy and no second one. A clean miss is never re-asked; a miss is
+the normal answer for new content. The one case that stops the transfer is a hit
+that comes back without a usable object id: the service has registered content
+rclone cannot name, and uploading would store a second copy of it.
+
+What a hit costs on the source side depends on where the source is. A local file is
+not re-read: the writer rclone hands the multi-thread engine for a hit reads
+nothing, and for a local source the engine streams rather than buffers. For a remote
+source the engine still walks the file once after the hit, in `--wopan-chunk_size`
+pieces - buffered, because buffering is also what protects a source whose `Open`
+ignores a byte range. So the transfer is cheap on the network to wopan, not
+necessarily cheap on the source.
+
+Family spaces are not offered at all. The listing side of that space is known - the
+client asks `QueryAllFiles` with `spaceType "1"` and a `familyId`, exactly as rclone
+does, and its entries have no `sha256` field at all (the schema also carries
+`familyId`, `campusId` and `loadInfo` instead). What `quickTransfer` wants for a
+family directory has never been captured: a recording of an upload there only
+contains panservice traffic, because the offer goes to the openapi host. TODO:
+capture one with `*.pan.wo.cn` and `*.smartont.net` unfiltered, during an upload to a
+family folder, then teach the probe the family shape.
+
+The offer carries the access token in an `access-token` header, to
+`b.smartont.net` - the same openapi operator the official client uploads bytes to
+(`du.smartont.net` answers on the same address), not a third-party service. With
+`--wopan-quick_transfer` on, `--dump headers` prints it: treat those logs as
+credential material.
+
 ## Public links
 
 `rclone link` returns a direct download URL for a single file:
@@ -228,6 +385,11 @@ For longer-lived or revocable sharing, use the wopan app or web client.
 - **Empty files are not supported.** The service rejects 0-byte files, so
   rclone returns `fs.ErrorCantUploadEmptyFiles` when asked to upload one.
   This affects `rclone touch` on a non-existent file too.
+- **The account reports a single-file upload size; rclone does not enforce it.**
+  rclone logs it once per run and names any file above it, but the chunked upload
+  path is not held to that number (measured: 1.2 GiB uploaded on an account
+  reporting 1 GiB) - see [Membership and the single-file upload
+  size](#membership-and-the-single-file-upload-size).
 - **File names are limited to 100 characters (runes).** Longer names return
   `fs.ErrorFileNameTooLong` rather than being silently truncated. Note that
   the app and web clients themselves truncate long names.
@@ -353,3 +515,11 @@ The upload endpoint takes the `access_token` as a URL query parameter (a
 protocol constraint of the wopan upload channel), so `--dump requests`
 writes it into the log. Avoid `--dump requests` on shared terminals, and
 treat captured logs as credential material.
+
+`--dump headers` is not clean either, measured 2026-10-20: rclone redacts
+`Authorization` and `X-Auth-Token`, and wopan sends its token under names
+neither of those - the membership probe repeats it in `accesstoken`,
+`Access-Token` and `X-YP-Access-Token`, so one `rclone lsf --dump headers`
+against a wopan remote printed the token three times in plaintext. Instant
+upload sends the same value in `access-token`, which the redaction does not
+cover either.
