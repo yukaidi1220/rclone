@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -854,6 +855,9 @@ func newUnitTestFs(transport http.RoundTripper) *Fs {
 		zoneMu:     new(sync.Mutex),
 	}
 	f.dirCache = dircache.New("", "root-id", f)
+	// Same feature set as a real remote, taken from the one function that builds
+	// it, so a test can assert what the transfer engine will see.
+	f.features = wopanFeatures(context.Background(), f)
 	return f
 }
 
@@ -2444,6 +2448,10 @@ func (t *publicLinkTransport) RoundTrip(r *http.Request) (*http.Response, error)
 		if pageNum == 0 {
 			files = append(files, map[string]any{
 				"id": "wc-1", "fid": "fid-1", "name": "a.bin", "type": fileTypeFile, "size": 42,
+			}, map[string]any{
+				// A sibling directory, so a lookup that does not end in "/" can
+				// come back fs.ErrorIsDir the way the real listing does.
+				"id": "wc-dir", "fid": "fid-dir", "name": "sub", "type": fileTypeDir,
 			})
 		}
 		payload, _ := json.Marshal(map[string]any{"files": files})
@@ -2490,6 +2498,22 @@ func TestUnitPublicLink(t *testing.T) {
 	fDir := newUnitTestFs(okRespTransport{})
 	_, err = fDir.PublicLink(context.Background(), "dir/sub/", fs.DurationOff, false)
 	assert.Equal(t, fs.ErrorCantShareDirectories, err)
+
+	// The same path without the trailing slash has to say the same thing. fstests
+	// hands over `dir` rather than `dir/`, and before 2026-10-20 this returned the
+	// raw fs.ErrorIsDir - "is a directory not a file" - which reads as a broken
+	// path and is not in the set the harness accepts as "not supported".
+	t.Run("directory without a trailing slash", func(t *testing.T) {
+		tr := &publicLinkTransport{downloadURL: want}
+		f := newUnitTestFs(tr)
+		require.NoError(t, f.dirCache.FindRoot(context.Background(), false))
+		f.dirCache.Put("dir", "dir-id")
+		link, err := f.PublicLink(context.Background(), "dir/sub", fs.DurationOff, false)
+		assert.Equal(t, fs.ErrorCantShareDirectories, err,
+			"a directory must be reported as unsharable, not as a lookup failure")
+		assert.Empty(t, link)
+		assert.NotErrorIs(t, err, fs.ErrorIsDir)
+	})
 }
 
 // TestUnitDownloadRequestSpace pins the GetDownloadUrlV2 parameter shape. Personal
@@ -2508,4 +2532,668 @@ func TestUnitDownloadRequestSpace(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(got), `"spaceType":"1"`)
 	assert.Contains(t, string(got), `"familyId":"577026"`)
+}
+
+// ---------------------------------------------------- membership benefit -----
+
+// benefitCapturedBody is the displayMembershipBenefit response captured from a
+// non-member account. It is kept as the wire shape, including
+// memberStackOpenStatus being the only numeric field, so a type change in a
+// field rclone deliberately does not parse cannot pass silently.
+const benefitCapturedBody = `{"meta":{"code":"200","message":"成功"},"result":{"memberStackOpenStatus":0,"applyTime":"2026.10.19","expireTime":"","vipLevel":"0","vipDesc":"非会员","familyCount":"10","recycleBin":"7","batchUploadCount":"100","capacity":"61440","uploadFileSize":"1024","memberCount":"20","transientCount":"50","vipWeight":"0"}}`
+
+// benefitTransport answers with a fixed status/body and keeps the request it
+// was given, so the captured header set can be asserted verbatim.
+type benefitTransport struct {
+	status   int // 0 means 200
+	body     string
+	err      error
+	hits     int
+	req      *http.Request
+	sentBody []byte
+}
+
+// rawHeader reads a header by the exact spelling it was stored under. Reading the
+// map is the point: Header.Get and http.CanonicalHeaderKey both normalise the name,
+// so either would silently pass a request whose headers had been renamed.
+func rawHeader(h http.Header, name string) []string {
+	return h[name]
+}
+
+func (t *benefitTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	t.hits++
+	t.req = r
+	if r.Body != nil {
+		t.sentBody, _ = io.ReadAll(r.Body)
+	}
+	if t.err != nil {
+		return nil, t.err
+	}
+	code := t.status
+	if code == 0 {
+		code = http.StatusOK
+	}
+	return &http.Response{
+		StatusCode:    code,
+		Status:        fmt.Sprintf("%d %s", code, http.StatusText(code)),
+		Body:          io.NopCloser(strings.NewReader(t.body)),
+		ContentLength: int64(len(t.body)),
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+	}, nil
+}
+
+// resetBenefitCache isolates a case from the process-wide benefit cache and
+// puts the map back afterwards.
+func resetBenefitCache(t *testing.T) {
+	benefitCache.mu.Lock()
+	saved := benefitCache.byUserID
+	benefitCache.byUserID = map[string]benefitInfo{}
+	benefitCache.mu.Unlock()
+	t.Cleanup(func() {
+		benefitCache.mu.Lock()
+		benefitCache.byUserID = saved
+		benefitCache.mu.Unlock()
+	})
+}
+
+// newBenefitFs builds an Fs whose probe is driven by tr. The userId must be
+// unique per case: it is the cache key, so two cases sharing one would make the
+// second case silently skip the request it claims to test.
+func newBenefitFs(tr http.RoundTripper, userID string) *Fs {
+	f := newUnitTestFs(tr)
+	f.userID = userID
+	return f
+}
+
+func TestUnitMembershipBenefitProbe(t *testing.T) {
+	resetBenefitCache(t)
+	tr := &benefitTransport{body: benefitCapturedBody}
+	f := newBenefitFs(tr, "u-probe")
+
+	f.probeAndCacheMembershipBenefit(context.Background())
+
+	require.Equal(t, 1, tr.hits, "the probe must run exactly once")
+	assert.Equal(t, int64(1024)*uploadFileSizeUnit, f.memberMaxFileSize,
+		"uploadFileSize is MiB, so 1024 must be read as 1 GiB")
+	assert.Equal(t, "非会员", f.memberLevelName)
+	assert.Equal(t, "0", f.memberLevelCode)
+	assert.Contains(t, f.memberLevelName, "会员")
+
+	require.NotNil(t, tr.req)
+	assert.Equal(t, http.MethodPost, tr.req.Method)
+	assert.Equal(t, baseURL+membershipBenefitPath, tr.req.URL.String())
+	// The body is a fixed 15-byte capture: no extra field, no whitespace.
+	assert.Equal(t, `{"qryType":"1"}`, string(tr.sentBody))
+	assert.Equal(t, int64(15), tr.req.ContentLength)
+
+	// The token goes out three times under the client's own spellings. Reading
+	// the map directly is the assertion: Header.Get would canonicalise the key
+	// and quietly pass a request that renamed the headers.
+	assert.Equal(t, []string{"accesstoken", "Access-Token", "X-YP-Access-Token"}, benefitTokenHeaders,
+		"the token header spellings are part of the measured request")
+	for _, name := range benefitTokenHeaders {
+		assert.Equal(t, []string{testAccessToken}, tr.req.Header[name],
+			"token header %q must reach the wire verbatim", name)
+	}
+	assert.Equal(t, []string{benefitClientID}, rawHeader(tr.req.Header, "Client-Id"))
+	assert.Equal(t, []string{benefitPCVersion}, rawHeader(tr.req.Header, "pc-version"))
+	assert.Equal(t, []string{"win"}, rawHeader(tr.req.Header, "pc-os"))
+	assert.Equal(t, []string{"cross-site"}, rawHeader(tr.req.Header, "Sec-Fetch-Site"))
+	assert.Equal(t, []string{"cors"}, rawHeader(tr.req.Header, "Sec-Fetch-Mode"))
+	assert.Equal(t, []string{"empty"}, rawHeader(tr.req.Header, "Sec-Fetch-Dest"))
+	assert.Equal(t, []string{`"Not?A_Brand";v="8", "Chromium";v="108"`}, rawHeader(tr.req.Header, "sec-ch-ua"))
+	assert.Equal(t, []string{"?0"}, rawHeader(tr.req.Header, "sec-ch-ua-mobile"))
+	assert.Equal(t, []string{`"Windows"`}, rawHeader(tr.req.Header, "sec-ch-ua-platform"))
+	assert.Equal(t, []string{"zh-CN"}, rawHeader(tr.req.Header, "Accept-Language"))
+	assert.Equal(t, "application/json", tr.req.Header.Get("Content-Type"))
+	assert.Equal(t, "application/json, text/plain, */*", tr.req.Header.Get("Accept"))
+
+	// This is the desktop client asking, not the web page: no Origin, no
+	// Referer, and not the dispatcher's Edge UA.
+	//
+	// What these lines can see is what queryMembershipBenefit puts on the request.
+	// They cannot see the wire: rclone's own transport rewrites User-Agent on every
+	// request (fs/fshttp sets it from --user-agent), so unless the operator pins
+	// --wopan-user_agent the string that leaves the machine is rclone/<version>.
+	// Measured, the endpoint does not care. See the note on benefitStaticHeaders.
+	assert.NotContains(t, tr.req.Header, "Origin")
+	assert.NotContains(t, tr.req.Header, "Referer")
+	assert.Contains(t, tr.req.Header.Get("User-Agent"), "wocloud/"+benefitPCVersion)
+	assert.Contains(t, tr.req.Header.Get("User-Agent"), "Electron/")
+	assert.NotEqual(t, defaultUserAgent, tr.req.Header.Get("User-Agent"),
+		"the benefit probe must not answer as the web client")
+
+	// Accept-Encoding is left to the Go transport: advertising the capture's
+	// brotli would ask for a body rclone cannot decode.
+	assert.NotContains(t, tr.req.Header.Get("Accept-Encoding"), "br")
+}
+
+func TestUnitBenefitClientIDIsNotTheDispatcherOne(t *testing.T) {
+	// The two ids belong to two vendor clients and must stay distinct in the
+	// code, because only the captured pair is what was measured end to end.
+	// Measured 2026-10-19: displayMembershipBenefit answers identically for both,
+	// so this is not a claim that the benefit depends on the client id.
+	require.NotEqual(t, clientID, benefitClientID)
+}
+
+func TestUnitMembershipBenefitValueTypes(t *testing.T) {
+	resetBenefitCache(t)
+	cases := []struct {
+		name      string
+		body      string
+		wantLimit int64
+		wantCode  string
+		wantHits  int
+	}{
+		{"quoted uploadFileSize", `{"meta":{"code":"200"},"result":{"vipLevel":"0","vipDesc":"非会员","uploadFileSize":"1024"}}`, int64(1024) * uploadFileSizeUnit, "0", 1},
+		{"unquoted uploadFileSize", `{"meta":{"code":"200"},"result":{"vipLevel":"0","vipDesc":"非会员","uploadFileSize":1024}}`, int64(1024) * uploadFileSizeUnit, "0", 1},
+		{"numeric vipLevel", `{"meta":{"code":"200"},"result":{"vipLevel":0,"vipDesc":"非会员","uploadFileSize":"2048"}}`, int64(2048) * uploadFileSizeUnit, "0", 1},
+		{"memberStackOpenStatus as a string", `{"meta":{"code":"200"},"result":{"memberStackOpenStatus":"0","uploadFileSize":"1024"}}`, int64(1024) * uploadFileSizeUnit, "", 1},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := &benefitTransport{body: tc.body}
+			f := newBenefitFs(tr, fmt.Sprintf("u-types-%d", i))
+			f.probeAndCacheMembershipBenefit(context.Background())
+			assert.Equal(t, tc.wantHits, tr.hits)
+			assert.Equal(t, tc.wantLimit, f.memberMaxFileSize)
+			assert.Equal(t, tc.wantCode, f.memberLevelCode)
+		})
+	}
+}
+
+// TestUnitMembershipBenefitFailOpen pins the property the whole probe rests on:
+// every way the endpoint can be wrong leaves the limit at 0, which uploads
+// anything rather than skipping files that would in fact have gone through.
+func TestUnitMembershipBenefitFailOpen(t *testing.T) {
+	resetBenefitCache(t)
+	cases := []struct {
+		name   string
+		body   string
+		status int
+		err    error
+	}{
+		{"transport error", "", 0, errors.New("dial tcp: no route to host")},
+		{"http 500", `<html>gateway timeout</html>`, http.StatusInternalServerError, nil},
+		{"http 401", `{"meta":{"code":"401"}}`, http.StatusUnauthorized, nil},
+		{"not json", `<html><body>nginx</body></html>`, 0, nil},
+		{"empty body", ``, 0, nil},
+		{"meta code not 200", `{"meta":{"code":"9999","message":"系统繁忙"},"result":{"uploadFileSize":"1024"}}`, 0, nil},
+		{"no result", `{"meta":{"code":"200"}}`, 0, nil},
+		{"result not an object", `{"meta":{"code":"200"},"result":"0"}`, 0, nil},
+		{"missing uploadFileSize", `{"meta":{"code":"200"},"result":{"vipDesc":"非会员"}}`, 0, nil},
+		{"empty uploadFileSize", `{"meta":{"code":"200"},"result":{"uploadFileSize":""}}`, 0, nil},
+		{"zero uploadFileSize", `{"meta":{"code":"200"},"result":{"uploadFileSize":"0"}}`, 0, nil},
+		{"negative uploadFileSize", `{"meta":{"code":"200"},"result":{"uploadFileSize":"-1"}}`, 0, nil},
+		{"non numeric uploadFileSize", `{"meta":{"code":"200"},"result":{"uploadFileSize":"unlimited"}}`, 0, nil},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := &benefitTransport{body: tc.body, status: tc.status, err: tc.err}
+			f := newBenefitFs(tr, fmt.Sprintf("u-fail-%d", i))
+			f.probeAndCacheMembershipBenefit(context.Background())
+			assert.Equal(t, int64(0), f.memberMaxFileSize, "a probe that cannot be read must report nothing")
+			assert.Equal(t, int64(0), f.singleFileLimit())
+			assert.Equal(t, "", f.oversizeNotice("anything.bin", 1<<40), "fail-open must never name a file")
+		})
+	}
+}
+
+func TestUnitBenefitProbeIsCachedPerAccount(t *testing.T) {
+	resetBenefitCache(t)
+
+	tr := &benefitTransport{body: benefitCapturedBody}
+	a := newBenefitFs(tr, "shared-user")
+	b := newBenefitFs(tr, "shared-user")
+	a.probeAndCacheMembershipBenefit(context.Background())
+	b.probeAndCacheMembershipBenefit(context.Background())
+	assert.Equal(t, 1, tr.hits, "remotes of one account must probe once per process")
+	assert.Equal(t, a.memberMaxFileSize, b.memberMaxFileSize, "the cached limit must reach the second remote")
+
+	c := newBenefitFs(tr, "other-user")
+	c.probeAndCacheMembershipBenefit(context.Background())
+	assert.Equal(t, 2, tr.hits, "a different account is a different cache entry")
+
+	// A failed probe is cached too: an endpoint that cannot be read must not be
+	// re-asked by every remote of the shared account.
+	bad := &benefitTransport{body: `not json`}
+	d := newBenefitFs(bad, "bad-user")
+	e := newBenefitFs(bad, "bad-user")
+	d.probeAndCacheMembershipBenefit(context.Background())
+	e.probeAndCacheMembershipBenefit(context.Background())
+	assert.Equal(t, 1, bad.hits, "a failed probe must not be retried by the next remote")
+	assert.Equal(t, int64(0), e.memberMaxFileSize)
+}
+
+func TestUnitBenefitOptionsShortCircuit(t *testing.T) {
+	resetBenefitCache(t)
+
+	tr := &benefitTransport{body: benefitCapturedBody}
+	f := newBenefitFs(tr, "u-no-check")
+	f.opt.NoMemberCheck = true
+	f.probeAndCacheMembershipBenefit(context.Background())
+	assert.Equal(t, 0, tr.hits, "no_member_check must not even ask the endpoint")
+	assert.Equal(t, int64(0), f.memberMaxFileSize)
+
+	// singleFileLimit() precedence, without any transport.
+	off := &Fs{opt: Options{NoMemberCheck: true}, memberMaxFileSize: 1024 * uploadFileSizeUnit}
+	assert.Equal(t, int64(0), off.singleFileLimit(), "no_member_check silences the notice as well as the probe")
+	detected := &Fs{memberMaxFileSize: 1024 * uploadFileSizeUnit}
+	assert.Equal(t, int64(1024)*uploadFileSizeUnit, detected.singleFileLimit())
+}
+
+func TestUnitOversizeNotice(t *testing.T) {
+	limit := int64(1024) * uploadFileSizeUnit
+	f := &Fs{memberMaxFileSize: limit, memberLevelName: "非会员"}
+
+	assert.Equal(t, "", f.oversizeNotice("fits.bin", limit), "a file exactly at the reported size is not named")
+	assert.Equal(t, "", f.oversizeNotice("fits.bin", limit-1))
+
+	msg := f.oversizeNotice("big.bin", limit+1)
+	require.NotEmpty(t, msg)
+	for _, want := range []string{"big.bin", "1073741825", "1073741824", "非会员", "uploading anyway"} {
+		assert.Contains(t, msg, want)
+	}
+	// The line must not read like a refusal: the blocking wording was removed
+	// because the server does not hold the chunked path to this number.
+	for _, mustNot := range []string{"SKIP", "skipping", "exceeding the account's"} {
+		assert.NotContains(t, msg, mustNot)
+	}
+
+	// Nothing reported: nothing ever named.
+	assert.Equal(t, "", (&Fs{}).oversizeNotice("huge.bin", 1<<50))
+}
+
+// TestUnitOversizeNoticeAtAllEntryPoints is the assertion that replaced the gate:
+// every upload entry point names an over-reported-size file in the log and then
+// carries on. The notice must neither refuse the transfer nor make it cheaper in
+// requests than an ordinary file - that difference is what "只提醒不阻塞" means.
+func TestUnitOversizeNoticeAtAllEntryPoints(t *testing.T) {
+	resetBenefitCache(t)
+	var buf bytes.Buffer
+	fs.SetLogger(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	defer fs.SetLogger(slog.Default().Handler())
+
+	tr := &benefitTransport{body: benefitCapturedBody}
+	f := newBenefitFs(tr, "u-gate")
+	f.probeAndCacheMembershipBenefit(context.Background())
+	require.Equal(t, 1, tr.hits, "one probe")
+	require.Equal(t, int64(1024)*uploadFileSizeUnit, f.memberMaxFileSize, "the notice below must use the detected 1 GiB")
+
+	// The probe's own line must promise a warning, not a skip.
+	logged := buf.String()
+	assert.Contains(t, logged, "reported single-file upload size")
+	assert.NotContains(t, logged, "are skipped before uploading")
+	buf.Reset()
+
+	// One byte over the reported size.
+	src := fsobject.NewStaticObjectInfo("big.bin", time.Now(), int64(1024)*uploadFileSizeUnit+1, true, nil, nil)
+	ctx := context.Background()
+
+	_, err := f.Put(ctx, strings.NewReader("unused"), src)
+	require.Error(t, err, "the fake transport cannot serve the upload, but the call must get that far")
+	assert.False(t, fserrors.IsNoRetryError(err), "Put must not turn the notice into a refusal: %v", err)
+
+	_, _, err = f.OpenChunkWriter(ctx, "big.bin", src)
+	require.Error(t, err)
+	assert.False(t, fserrors.IsNoRetryError(err), "OpenChunkWriter must not refuse either: %v", err)
+
+	o := &Object{fs: f, remote: "big.bin", id: "obj-1", fid: "fid-1", size: 1}
+	err = o.Update(ctx, strings.NewReader("unused"), src)
+	require.Error(t, err)
+	assert.False(t, fserrors.IsNoRetryError(err), "Update must not refuse either: %v", err)
+
+	got := buf.String()
+	assert.Equal(t, 3, strings.Count(got, "over the single-file upload size the account reports"),
+		"each of the three entry points must name the file, got:\n%s", got)
+	// What carries "the notice does not block" is the pair above: each call has to
+	// return an error (so it walked past the notice into the transfer) and that
+	// error must not be a NoRetryError (which is exactly how the removed gate
+	// refused). An earlier third assertion here counted transport hits > 1 and
+	// claimed it proved a request was spent on the upload; it proved nothing,
+	// because the same transport also serves the directory lookups FindPath does,
+	// so a gate inserted after FindPath would have kept it green. It is gone rather
+	// than strengthened because the property already has two carriers.
+
+	// Exactly at the reported size: no name in the log, still proceeding.
+	buf.Reset()
+	ok := fsobject.NewStaticObjectInfo("ok.bin", time.Now(), int64(1024)*uploadFileSizeUnit, true, nil, nil)
+	_, _ = f.Put(ctx, strings.NewReader("unused"), ok)
+	assert.NotContains(t, buf.String(), "over the single-file upload size")
+}
+
+// --------------------------------------------------------- instant upload ----
+
+// The two fixtures are the live responses captured from a real account on
+// 2026-10-20: hasFile 0 with fileId null for content the service had never seen,
+// and hasFile 1 with fid/wcFileId/fileId for content it had. The shapes are not
+// hand-written approximations - hasFile is numeric and fileVersion is numeric, so
+// a "helpful" string fixture would hide a decode bug.
+const (
+	quickTransferMissBody = `{"result":{"hasFile":0,"fileName":"zz-qtransfer-absent.bin","sha256":"c8b5fe251fe7822a7cc4f5e3fd423512e3a403ddb5e405668b5ac59b13764271","fileId":null},"meta":{"code":"0000","message":"success"}}`
+	quickTransferHitBody  = `{"result":{"fid":"EaJEt_1uasHOIMuUkPcl6jZ3gK5uL6WL47NsXUqNHJEaS5KRVGtNxbSEeE0IPKV98fJX2H","wcFileId":"4ccf786ac96a43bc8946dcb8c61b67aa","hasFile":1,"fileName":"zz-qtransfer-hit.bin","sha256":"81e1e0d8a56be998660226de6eab83cd0be3ddb100025e572efa91da699bb390","woCloudId":"4ccf786ac96a43bc8946dcb8c61b67aa","thumbUrl":"https://du.smartont.net:8442/openapi/thumbnails?fid=EaJEt_1uasHOIMuUkPcl6jZ3gK5uL6WL47NsXUqNHJEaS5KRVGtNxbSEeE0IPKV98fJX2H","fileVersion":1,"fileId":"EaJEt_1uasHOIMuUkPcl6jZ3gK5uL6WL47NsXUqNHJEaS5KRVGtNxbSEeE0IPKV98fJX2H"},"meta":{"code":"0000","message":"success"}}`
+	quickTestSHA          = "81e1e0d8a56be998660226de6eab83cd0be3ddb100025e572efa91da699bb390"
+	quickTestSize         = int64(4) << 20
+)
+
+// quickTestModTime is deliberately far from time.Now so that a request built with
+// the transfer instant cannot pass an assertion written against it. The service
+// ignores the field - measured twice on 2026-10-20, an entry made from a 2019/2020
+// source came back stamped with the registration time - but sending the source's
+// time is what the field means, and a probe that sent "now" would silently promise
+// a timestamp it could not keep.
+var quickTestModTime = time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC)
+
+// newQuickFs builds an Fs with the probe enabled and one candidate response.
+func newQuickFs(tr http.RoundTripper) *Fs {
+	f := newUnitTestFs(tr)
+	f.opt.QuickTransfer = true
+	return f
+}
+
+func quickSrc(size int64, sha string) *fsobject.StaticObjectInfo {
+	return quickSrcAt(size, sha, quickTestModTime)
+}
+
+func quickSrcAt(size int64, sha string, modTime time.Time) *fsobject.StaticObjectInfo {
+	hashes := map[hash.Type]string{}
+	if sha != "" {
+		hashes[hash.SHA256] = sha
+	}
+	return fsobject.NewStaticObjectInfo("big.bin", modTime, size, true, hashes, nil)
+}
+
+func TestUnitQuickTransferHit(t *testing.T) {
+	tr := &benefitTransport{body: quickTransferHitBody}
+	f := newQuickFs(tr)
+
+	data, hit, err := f.quickTransfer(context.Background(), "dir-1", "big.bin", quickTestSize, quickSrc(quickTestSize, quickTestSHA))
+	require.NoError(t, err)
+	require.True(t, hit, "the captured response is a hit")
+	assert.Equal(t, "EaJEt_1uasHOIMuUkPcl6jZ3gK5uL6WL47NsXUqNHJEaS5KRVGtNxbSEeE0IPKV98fJX2H", data.Fid)
+	assert.Equal(t, "4ccf786ac96a43bc8946dcb8c61b67aa", data.WcFileID)
+	assert.Equal(t, "1", string(data.FileVersion), "fileVersion arrives numeric and must survive")
+
+	require.Equal(t, 1, tr.hits)
+	require.NotNil(t, tr.req)
+	assert.Equal(t, quickTransferURL, tr.req.URL.String())
+	assert.Equal(t, testAccessToken, tr.req.Header.Get("access-token"))
+	assert.Equal(t, "application/json", tr.req.Header.Get("Content-Type"))
+
+	var sent map[string]any
+	require.NoError(t, json.Unmarshal(tr.sentBody, &sent))
+	assert.Equal(t, quickTestSHA, sent["sha256"])
+	assert.Equal(t, float64(quickTestSize), sent["fileSize"])
+	assert.Equal(t, "big.bin", sent["fileName"])
+	assert.Equal(t, "5", sent["fileType"], "upload2C uses the same fileType")
+	assert.Equal(t, "dir-1", sent["directoryId"])
+	assert.Equal(t, "0", sent["spaceType"])
+	assert.Len(t, sent["batchNo"], 14, "batchNo is the Beijing 14-digit timestamp")
+	// The timestamp sent here is the source's, not the moment the probe was sent
+	// (the service ignores it and stamps the entry itself, but the request must
+	// not claim a time rclone did not have). quickTestModTime is in 2001, so a
+	// transfer-instant timestamp cannot satisfy this.
+	assert.Equal(t, float64(quickTestModTime.UnixMilli()), sent["fileModificationTime"],
+		"fileModificationTime must be the source modtime in milliseconds")
+	assert.Len(t, sent, 8, "the captured request has exactly these 8 fields, got %v", sent)
+}
+
+// TestUnitQuickTransferMissAndFailures: every outcome that must fall through to a
+// normal upload, with no error - a probe that cannot be understood may only ever
+// cost a request, never a file.
+func TestUnitQuickTransferMissAndFailures(t *testing.T) {
+	sha := quickTestSHA
+	cases := []struct {
+		name     string
+		tr       *benefitTransport
+		wantErr  bool // the one shape that must stop the transfer
+		wantReqs int  // definitive answers cost one request; unreadable ones cost two
+	}{
+		{"miss", &benefitTransport{body: quickTransferMissBody}, false, 1},
+		{"http 500", &benefitTransport{status: http.StatusInternalServerError, body: "Internal Server Error"}, false, 2},
+		{"http 404", &benefitTransport{status: http.StatusNotFound, body: "not found"}, false, 1},
+		{"not json", &benefitTransport{body: "<html></html>"}, false, 2},
+		{"empty body", &benefitTransport{body: ""}, false, 2},
+		{"meta code 2001", &benefitTransport{body: `{"meta":{"code":"2001","message":"容量不足"},"result":{}}`}, false, 1},
+		{"no meta", &benefitTransport{body: `{"result":{"hasFile":1,"fid":"F","wcFileId":"W"}}`}, false, 1},
+		{"hit without ids", &benefitTransport{body: `{"meta":{"code":"0000"},"result":{"hasFile":1}}`}, true, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newQuickFs(tc.tr)
+			data, hit, err := f.quickTransfer(context.Background(), "dir-1", "big.bin", quickTestSize, quickSrc(quickTestSize, sha))
+			if tc.wantErr {
+				// The one case that must NOT fall through: uploading after the
+				// service registered the content would store a second copy.
+				require.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.False(t, hit)
+			assert.Equal(t, api.UploadData{}, data)
+			assert.Equal(t, tc.wantReqs, f.httpClient.Transport.(*benefitTransport).hits,
+				"the request count for this outcome changed")
+		})
+	}
+}
+
+// TestUnitQuickTransferSkipped: the conditions under which no request is made at
+// all. Each must be silent and harmless - a skipped probe is just a normal upload.
+func TestUnitQuickTransferSkipped(t *testing.T) {
+	newF := func(mut func(*Fs)) *Fs {
+		f := newQuickFs(&benefitTransport{body: quickTransferHitBody})
+		mut(f)
+		return f
+	}
+	cases := []struct {
+		name string
+		f    *Fs
+		src  *fsobject.StaticObjectInfo
+	}{
+		{"below the floor", newF(func(f *Fs) {}), quickSrc(3<<20-1, quickTestSHA)},
+		{"family space", newF(func(f *Fs) { f.spaceType = spaceFamily }), quickSrc(quickTestSize, quickTestSHA)},
+		{"no sha256 on the source", newF(func(f *Fs) {}), quickSrc(quickTestSize, "")},
+		{"no modtime on the source", newF(func(f *Fs) {}), quickSrcAt(quickTestSize, quickTestSHA, time.Time{})},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := tc.f.httpClient.Transport.(*benefitTransport)
+			_, hit, err := tc.f.quickTransfer(context.Background(), "dir-1", "big.bin", tc.src.Size(), tc.src)
+			assert.NoError(t, err)
+			assert.False(t, hit)
+			assert.Equal(t, 0, tr.hits, "the probe must not even be sent")
+		})
+	}
+
+	t.Run("feature disabled", func(t *testing.T) {
+		tr := &benefitTransport{body: quickTransferHitBody}
+		f := newUnitTestFs(tr)
+		f.opt.QuickTransfer = false
+		_, hit, err := f.quickTransfer(context.Background(), "dir-1", "big.bin", quickTestSize, quickSrc(quickTestSize, quickTestSHA))
+		assert.NoError(t, err)
+		assert.False(t, hit)
+		assert.Equal(t, 0, tr.hits)
+	})
+
+	// The floor is inclusive: a file of exactly 3 MiB is worth a probe. Without
+	// this case an off-by-one that also skips 3 MiB would go unnoticed.
+	t.Run("at the floor is probed", func(t *testing.T) {
+		tr := &benefitTransport{body: quickTransferHitBody}
+		f := newQuickFs(tr)
+		_, hit, err := f.quickTransfer(context.Background(), "dir-1", "big.bin", quickTransferMinSize, quickSrc(quickTransferMinSize, quickTestSHA))
+		require.NoError(t, err)
+		assert.True(t, hit)
+		assert.Equal(t, 1, tr.hits)
+	})
+}
+
+// TestUnitUploadOrQuickTransferHitUploadsNothing is the point of the whole
+// feature: on a hit no upload request - not even GetZoneInfo - is made, and the
+// object ids come straight from the probe.
+func TestUnitUploadOrQuickTransferHitUploadsNothing(t *testing.T) {
+	tr := &benefitTransport{body: quickTransferHitBody}
+	f := newQuickFs(tr)
+	src := quickSrc(quickTestSize, quickTestSHA)
+
+	data, err := f.uploadOrQuickTransfer(context.Background(), strings.NewReader("never read"), "dir-1", "big.bin", quickTestSize, src)
+	require.NoError(t, err)
+	assert.Equal(t, "4ccf786ac96a43bc8946dcb8c61b67aa", data.WcFileID)
+	assert.Equal(t, 1, tr.hits, "one request only: the probe; nothing was uploaded")
+	assert.Equal(t, quickTransferURL, tr.req.URL.String())
+}
+
+// TestUnitOpenChunkWriterHit returns a writer that acknowledges without reading,
+// because the object already exists by the time the engine asks for it.
+func TestUnitOpenChunkWriterHit(t *testing.T) {
+	tr := &benefitTransport{body: quickTransferHitBody}
+	f := newQuickFs(tr)
+	src := quickSrc(quickTestSize, quickTestSHA)
+
+	info, w, err := f.OpenChunkWriter(context.Background(), "big.bin", src)
+	require.NoError(t, err)
+	require.NotNil(t, w)
+	assert.Equal(t, quickTestSize, info.ChunkSize)
+	assert.Equal(t, 1, info.Concurrency)
+	assert.IsType(t, transferredChunkWriter{}, w)
+
+	// A file bigger than the configured chunk must still advertise the configured
+	// chunk. Whole-file is what the engine then reserves in ONE pooled buffer, and
+	// lib/pool waits for memory without ever timing out, so under
+	// --max-buffer-memory below the size a transfer of no bytes would hang forever.
+	// Its own Fs, so the probe count at the end stays about this file alone.
+	fBig := newQuickFs(&benefitTransport{body: quickTransferHitBody})
+	big := quickSrc(40<<20, quickTestSHA)
+	info, w, err = fBig.OpenChunkWriter(context.Background(), "big.bin", big)
+	require.NoError(t, err)
+	assert.Equal(t, int64(8)<<20, info.ChunkSize, "the hit chunk must stay at the configured chunk size")
+	assert.Equal(t, 1, info.Concurrency)
+	assert.IsType(t, transferredChunkWriter{}, w)
+	assert.False(t, fBig.Features().ChunkWriterDoesntSeek,
+		"buffering stays on: it is what protects a source whose Open ignores the byte range (fstests runs 3 and 4, 2026-10-20)")
+
+	// The reader must be left alone: consuming it would download the source for
+	// a transfer the server has already completed.
+	rs := strings.NewReader("payload")
+	n, err := w.WriteChunk(context.Background(), 0, rs)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), n)
+	assert.Equal(t, int64(0), mustSeek(rs), "the chunk reader must not be read")
+	assert.NoError(t, w.Close(context.Background()))
+	assert.NoError(t, w.Abort(context.Background()))
+
+	assert.Equal(t, 1, tr.hits, "no upload session was opened")
+}
+
+func mustSeek(rs *strings.Reader) int64 {
+	pos, err := rs.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return -1
+	}
+	return pos
+}
+
+// qtStep is one scripted answer of the instant-upload service.
+type qtStep struct {
+	status int // 0 means 200
+	body   string
+	err    error // a transport failure: no answer at all
+}
+
+// scriptedTransport answers each call from the script and repeats the last step,
+// so a probe that asks more often than the rule allows is caught by the request
+// count rather than by a panic.
+type scriptedTransport struct {
+	steps []qtStep
+	hits  int
+	req   *http.Request
+}
+
+func (t *scriptedTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	t.req = r
+	i := t.hits
+	t.hits++
+	if i >= len(t.steps) {
+		i = len(t.steps) - 1
+	}
+	st := t.steps[i]
+	if st.err != nil {
+		return nil, st.err
+	}
+	code := st.status
+	if code == 0 {
+		code = http.StatusOK
+	}
+	return &http.Response{
+		StatusCode:    code,
+		Status:        fmt.Sprintf("%d %s", code, http.StatusText(code)),
+		Body:          io.NopCloser(strings.NewReader(st.body)),
+		ContentLength: int64(len(st.body)),
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+	}, nil
+}
+
+// TestUnitQuickTransferReAsksOnlyWhenUnreadable pins the shape of the single
+// allowed retry: an answer that never arrived may hide a registration, so ask
+// again; an answer that said "no" is final, so do not.
+func TestUnitQuickTransferReAsksOnlyWhenUnreadable(t *testing.T) {
+	cases := []struct {
+		name     string
+		steps    []qtStep
+		wantHit  bool
+		wantReqs int
+	}{
+		{"transport error then hit", []qtStep{{err: io.ErrUnexpectedEOF}, {body: quickTransferHitBody}}, true, 2},
+		{"http 500 then hit", []qtStep{{status: http.StatusInternalServerError, body: "Server Error"}, {body: quickTransferHitBody}}, true, 2},
+		{"gateway timeout then hit", []qtStep{{status: http.StatusGatewayTimeout, body: "timeout"}, {body: quickTransferHitBody}}, true, 2},
+		{"undecodable then hit", []qtStep{{body: "<html>sorry</html>"}, {body: quickTransferHitBody}}, true, 2},
+		{"clean miss is asked once", []qtStep{{body: quickTransferMissBody}}, false, 1},
+		{"business refusal is asked once", []qtStep{{body: `{"meta":{"code":"2001","message":"容量不足"},"result":{}}`}}, false, 1},
+		{"http 404 is asked once", []qtStep{{status: http.StatusNotFound, body: "not found"}}, false, 1},
+		{"still unreadable stops at two", []qtStep{{err: io.ErrUnexpectedEOF}, {err: io.ErrUnexpectedEOF}}, false, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := &scriptedTransport{steps: tc.steps}
+			f := newQuickFs(tr)
+			_, hit, err := f.quickTransfer(context.Background(), "dir-1", "big.bin", quickTestSize, quickSrc(quickTestSize, quickTestSHA))
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantHit, hit)
+			assert.Equal(t, tc.wantReqs, tr.hits,
+				"a definitive answer must cost one request, an unreadable one exactly two")
+		})
+	}
+}
+
+// TestUnitQuickTransferTolerantDecode: the ids and the flag have to survive the
+// shapes this service is known to switch between unannounced. A plain `string`
+// field would make a numeric id a decode failure, and the caller's answer to an
+// unreadable probe is to upload - which after a registration stores a second copy.
+func TestUnitQuickTransferTolerantDecode(t *testing.T) {
+	numeric := `{"result":{"hasFile":1,"fid":123456,"wcFileId":789,"fileVersion":2,"fileId":123456},"meta":{"code":"0000","message":"success"}}`
+	tr := &scriptedTransport{steps: []qtStep{{body: numeric}}}
+	f := newQuickFs(tr)
+	data, hit, err := f.quickTransfer(context.Background(), "dir-1", "big.bin", quickTestSize, quickSrc(quickTestSize, quickTestSHA))
+	require.NoError(t, err)
+	require.True(t, hit, "a numeric id is still a hit")
+	assert.Equal(t, "123456", data.Fid)
+	assert.Equal(t, "789", data.WcFileID)
+
+	// A boolean hasFile must not be read as a miss: the service would have
+	// registered the content while rclone uploads a second copy of it.
+	tr2 := &scriptedTransport{steps: []qtStep{{body: `{"result":{"hasFile":true,"fid":"F","wcFileId":"W"},"meta":{"code":"0000","message":"success"}}`}}}
+	f2 := newQuickFs(tr2)
+	_, hit, err = f2.quickTransfer(context.Background(), "dir-1", "big.bin", quickTestSize, quickSrc(quickTestSize, quickTestSHA))
+	require.NoError(t, err)
+	assert.True(t, hit, `hasFile:true is a hit`)
+	assert.Equal(t, 1, tr2.hits, "a hit is never asked twice")
+}
+
+// TestUnitChunkWriterFeaturesExist: the unit Fs must see the same feature set a
+// real remote gets, or the feature assertions in this file would be about a struct
+// production never builds. Which flag is on, and which one is deliberately absent,
+// is asserted where it costs something - TestUnitOpenChunkWriterHit.
+func TestUnitChunkWriterFeaturesExist(t *testing.T) {
+	f := newQuickFs(&benefitTransport{body: quickTransferHitBody})
+	require.NotNil(t, f.Features())
+	assert.True(t, f.Features().CaseInsensitive, "the unit Fs must carry the production feature set")
 }
