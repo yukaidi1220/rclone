@@ -29,7 +29,11 @@ import (
 
 func probeSkip(t *testing.T) {
 	t.Helper()
-	if os.Getenv("YUN139_PROBE") == "" {
+	switch os.Getenv("YUN139_PROBE") {
+	case "1", "true", "yes":
+	default:
+		// Any other value, including "0", skips: these probes write to a live
+		// account, so opting in has to be explicit.
 		t.Skip("set YUN139_PROBE=1 (and RCLONE_CONFIG with [TestYun139]) for live probes")
 	}
 }
