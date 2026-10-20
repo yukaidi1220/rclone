@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -83,6 +84,11 @@ type groupTransport struct {
 	renameIsNoOp bool
 
 	renameFails bool
+
+	// taskRefusal answers the move task with a business error instead of a
+	// task id, and moves nothing - which is the point: only a transport that
+	// leaves the entries where they were can prove a decline is a decline.
+	taskRefusal string
 }
 
 func (tr *groupTransport) record(path string, body map[string]any) {
@@ -160,6 +166,11 @@ func (tr *groupTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		})), nil
 
 	case strings.HasSuffix(reqPath, "createBatchOprTask"):
+		if tr.taskRefusal != "" {
+			return w.done(map[string]any{"result": map[string]any{
+				"resultCode": tr.taskRefusal, "resultDesc": "目录不存在",
+			}}), nil
+		}
 		catalogs := stringList(body["catalogList"])
 		contents := stringList(body["contentList"])
 		tr.taskCatalogs, tr.taskContents = catalogs, contents
@@ -1041,3 +1052,51 @@ func TestUnitGroupTaskRunningEntryWithoutReason(t *testing.T) {
 }
 
 func ptrInt(v int) *int { return &v }
+
+// TestUnitGroupMoveStaleDestPathDeclines covers the one case the caches cannot
+// cover: a remote whose cached destination path predates a move issued
+// elsewhere. The task answers 1909011551 目录不存在 (measured 2026-10-20), which
+// is a reason to let the engine do a bandwidth move, not a failed transfer.
+func TestUnitGroupMoveStaleDestPathDeclines(t *testing.T) {
+	tr := &groupTransport{dirs: gtestDirs(), pollReport: true, taskRefusal: groupStalePathErrorCode}
+	f := newGroupTestFs(tr)
+	_, err := f.List(context.Background(), "dst")
+	require.NoError(t, err)
+	_, ok := f.srvPathOf.get("D2")
+	require.True(t, ok, "the listing must have cached the destination path, or the test proves nothing")
+
+	o := newTestObject(f, "a.txt", "F1", 4)
+	_, err = f.Move(context.Background(), o, "dst/a.txt")
+	assert.True(t, errors.Is(err, fs.ErrorCantMove), "a stale destination path must decline, not fail: %v", err)
+
+	_, ok = f.srvPathOf.get("D2")
+	assert.False(t, ok, "the path the server just refused must not be sent again")
+	assert.Len(t, tr.dirs["D2"].contents, 0, "a refused task moves nothing")
+	assert.Len(t, tr.dirs[gtestRootCat].contents, 1, "the entry must still be where it was")
+	for _, c := range tr.calls {
+		assert.NotContains(t, c, "modifyGroupContent", "a move that declined must not rename: %s", c)
+		assert.NotContains(t, c, "queryBatchOprTaskDetailV3", "a task that was refused was never started")
+	}
+}
+
+// TestUnitGroupDirMoveStaleDestPathDeclines is the same refusal on the
+// directory path, which has to decline as ErrorCantDirMove so the engine copies
+// the subtree instead of reporting a failed move.
+func TestUnitGroupDirMoveStaleDestPathDeclines(t *testing.T) {
+	tr := &groupTransport{dirs: gtestDirs(), pollReport: true, taskRefusal: groupStalePathErrorCode}
+	f := newGroupTestFs(tr)
+	_, err := f.List(context.Background(), "sub")
+	require.NoError(t, err)
+	_, err = f.List(context.Background(), "dst")
+	require.NoError(t, err)
+
+	err = f.DirMove(context.Background(), f, "sub", "dst/moved")
+	assert.True(t, errors.Is(err, fs.ErrorCantDirMove), "must decline so the subtree is copied: %v", err)
+
+	_, ok := f.srvPathOf.get("D2")
+	assert.False(t, ok, "the refused destination path must be dropped")
+	assert.Len(t, tr.dirs["D2"].catalogs, 0, "a refused task moves nothing")
+	for _, c := range tr.calls {
+		assert.NotContains(t, c, "modifyGroupContent", "a declined directory move must not rename: %s", c)
+	}
+}
