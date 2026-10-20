@@ -5,13 +5,14 @@
 #           %APPDATA%\rclone\rclone.conf (Windows)
 # 或通过 --config 指定任意路径的 conf 文件。
 #
-# 每个 remote 一节, [remote名] 后跟 key = value。两个 remote 可共存:
-# 同一个账号可以同时添加个人云和家庭云 (space 不同即可)。
+# 每个 remote 一节, [remote名] 后跟 key = value。多个 remote 可共存:
+# 同一个账号可以同时添加个人云、家庭云和共享群 (space 不同即可)。
 #
-# 所有参数一览 (共 14 个):
+# 所有参数一览 (共 15 个):
 #   authorization       (必填, 敏感) 授权 token
-#   space               (可选, 默认 personal) 空间类型: personal | family
+#   space               (可选, 默认 personal) 空间类型: personal | family | group
 #   family_id           (family 必填) 家庭云 ID
+#   group_id            (group 必填) 共享群 ID
 #   root_folder_id      (可选) 根文件夹 ID
 #   user_domain_id      (可选) 用户域 ID
 #   hard_delete         (可选, 默认 false) 永久删除
@@ -44,6 +45,15 @@ authorization = <同上, 同账号可复用同一 token>
 space = family
 family_id = <家庭云 ID, 数字; 多家庭时必填, 见下方说明>
 
+# -----------------------------------------------------------------------------
+# 示例 3: 共享群 (group 必填 group_id; 与家庭云是两个独立空间, 不是同一种东西)
+# -----------------------------------------------------------------------------
+[yun139-group]
+type = yun139
+authorization = <同上, 同账号可复用同一 token>
+space = group
+group_id = <共享群 ID, 数字; 多个群时必填, 见下方说明>
+
 # =============================================================================
 # 参数详解
 # =============================================================================
@@ -65,7 +75,19 @@ family_id = <家庭云 ID, 数字; 多家庭时必填, 见下方说明>
 # 使用哪个存储空间。
 #   personal = 新个人云 (默认, 不写即个人云)
 #   family   = 新家庭云
-# 同账号两个空间可各自建 remote, 互不影响。
+#   group    = 共享群
+# 同账号多个空间可各自建 remote, 互不影响。
+# 注意: 家庭云和共享群是两套接口 (/hcy/family/adapter/* 与
+# /hcy/mutual/adapter/isbo/openApi/*), ID 不通用。把群 ID 填到
+# space = family 下, 服务端回 "1809112500: 系统内部错误", 不是"找不到"。
+
+# --- group_id (group 必填) ---------------------------------------------------
+# 共享群 ID (纯数字, 形如 1234567890123456789)。规则与 family_id 相同:
+#   - space = group 且只在一个群里, 可留空, 启动时自动发现 (queryGroupV2);
+#   - 在多个群里时必须显式指定, 否则启动报错并列出所有群的 ID 与名字;
+#   - 群名可重复, 只有 ID 唯一。
+# 群没有自己的容量接口: 它和个人盘共用同一个额度 (rclone about 报的是账号级
+# 数字), 要算群里实际占多少只能 rclone size 全量走一遍。
 
 # --- family_id (family 必填) -------------------------------------------------
 # 家庭云 ID (纯数字, 形如 1303251918616070593)。
@@ -164,11 +186,18 @@ family_id = <家庭云 ID, 数字; 多家庭时必填, 见下方说明>
 #   rclone copy yun139-personal:文件夹/ /path/to/local/
 #   # 家庭云
 #   rclone lsf yun139-family:
-#   # 校验 (个人云支持 SHA-256, rclone check 可用; 家庭云无 hash, 退化为大小+时间)
-#   rclone check /path/to/local yun139-personal:
+#   # 共享群 (列目录 / 取链 / 读写 / 建目录 / 删除都可用)
+#   rclone lsf yun139-group:
+#   # 校验 (个人云列表自带 SHA-256; 共享群靠"一字节 ranged GET"向存储端取哈希,
+#   #  代价是每对象一次签链+一个请求; 家庭云没有哈希来源, 只能 --size-only)
+#   rclone check /path/to/local yun139-personal: --checksum
+#   rclone check /path/to/local yun139-group: --checksum
 #
 # 已知限制 (详见 docs/content/yun139.md):
 #   - 上传后服务端强制使用服务器时间作为修改时间, 无法 SetModTime;
 #   - 家庭云无原生 move, move 退化为 copy+delete;
+#   - 共享群的服务端 move/copy/dirmove 尚未接入, Features 里直接不声明,
+#     rclone 会退到本地带宽传输 (群有原生 move 接口, 待实现);
+#   - 共享群删除是进回收站 (客户端可还原), 但 rclone 没有该接口 ⇒ 不可列不可恢复;
 #   - 服务器文件名大小写不敏感;
 #   - part_size 必须 >= 5Mi 且为 64 的倍数。
