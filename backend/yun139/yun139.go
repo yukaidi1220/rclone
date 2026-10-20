@@ -364,6 +364,20 @@ const memberQuotaErrorCode = "04010319"
 // heavier API traffic.
 const spaceQuotaErrorCode = "04000012"
 
+// groupStalePathErrorCode is what the shared group's move task answers when the
+// destination path it is handed does not exist: 1909011551 目录不存在
+// (measured 2026-10-20). The task is the only group endpoint that reads the
+// path field - the download link and the rename both resolve by content id and
+// ignore it - so this arrives when a remote's cached path for the destination
+// predates a move issued elsewhere. The move cannot be trusted to have
+// happened, and a bandwidth move resolves the path from scratch.
+const groupStalePathErrorCode = "1909011551"
+
+func isGroupStalePathError(err error) bool {
+	var ae *apiError
+	return errors.As(err, &ae) && ae.Code == groupStalePathErrorCode
+}
+
 // memberLevelInfo is a detected member tier and its single-file upload limit.
 type memberLevelInfo struct {
 	maxFileSize int64  // 0 = unknown/no limit (fail-open)
@@ -1165,6 +1179,12 @@ func (c *srvPathCache) get(k string) (string, bool) {
 	v, ok := c.m[k]
 	c.mu.RUnlock()
 	return v, ok
+}
+
+func (c *srvPathCache) del(k string) {
+	c.mu.Lock()
+	delete(c.m, k)
+	c.mu.Unlock()
 }
 
 // delSubtree drops the cached path of a directory that moved and of everything
@@ -4563,6 +4583,10 @@ func (f *Fs) groupMove(ctx context.Context, src fs.Object, remote string) (fs.Ob
 		return f.groupMoveLanded(ctx, remote, srcObj.id, dstLeaf)
 	}
 	if err := f.groupMoveTask(ctx, []string{srcObj.id}, dstDirID, false); err != nil {
+		if isGroupStalePathError(err) {
+			f.srvPathOf.del(dstDirID)
+			return nil, fs.ErrorCantMove
+		}
 		return nil, err
 	}
 	// No path cache is touched here: only directories are cached, and an entry's
@@ -4667,15 +4691,22 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		// the cached path of the moved subtree is exactly what must not be used.
 		oldPath := srcFs.groupSrvPath(srcID)
 		if err := f.groupMoveTask(ctx, []string{srcID}, dstDirID, true); err != nil {
+			if isGroupStalePathError(err) {
+				srcFs.srvPathOf.del(dstDirID)
+				f.srvPathOf.del(dstDirID)
+				return fs.ErrorCantDirMove
+			}
 			return err
 		}
 		srcFs.srvPathOf.delSubtree(oldPath, srcID)
 		f.srvPathOf.delSubtree(oldPath, srcID)
-		// FIXME: only the caches reachable from these two Fs are corrected. An
-		// Object built earlier still carries the server path of the directory it
-		// was listed under, and the download-link request sends that path with
-		// the id; whether the server checks it is not measured. A third remote on
-		// the same group keeps its own stale cache until it re-lists.
+		// Measured 2026-10-20: the batch task is the only group endpoint that
+		// reads the path field. getGroupFileDownLoadURLV2 and modifyGroupContent
+		// resolve the entry by contentID and answered identically when sent a
+		// path that never existed, so an Object - or a third remote on the same
+		// group - that still holds a pre-move path stays readable and renameable.
+		// What cannot survive a stale path is a move out of it, and that arrives
+		// as groupStalePathErrorCode, handled above.
 		// The paths both Fs held for the moved subtree are gone now, so drop the
 		// directory cache before the rename: a rename that fails must not leave
 		// either side pointing at a location the subtree no longer lives at.
