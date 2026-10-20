@@ -21,10 +21,9 @@ import (
 // The suite covers listing, upload, download, update, rename, move, delete,
 // partial-read, and chunked-copy paths.
 //
-// Against space=group the server-side Move/Copy/DirMove subtests are skipped,
-// not failed: newFs clears those features for the group space because the
-// group's native move task is not wired up yet. Everything else in the suite
-// runs the same as it does against a family cloud.
+// Against space=group the server-side Move/Copy/DirMove subtests run: the group
+// has a native move task, renames a directory whose parent does not change, and
+// copies by offering the content hash as a rapid upload.
 //
 // RCLONE_TEST_YUN139_ROOT is required and names an existing sub-directory to
 // run inside (create it first: `rclone mkdir TestYun139:rc-fstest`). The suite
