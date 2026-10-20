@@ -1181,12 +1181,6 @@ func (c *srvPathCache) get(k string) (string, bool) {
 	return v, ok
 }
 
-func (c *srvPathCache) del(k string) {
-	c.mu.Lock()
-	delete(c.m, k)
-	c.mu.Unlock()
-}
-
 // delSubtree drops the cached path of a directory that moved and of everything
 // under it: the paths are chains of ids, so every entry in the subtree has to be
 // relearned from its new parent listing.
@@ -4584,7 +4578,9 @@ func (f *Fs) groupMove(ctx context.Context, src fs.Object, remote string) (fs.Ob
 	}
 	if err := f.groupMoveTask(ctx, []string{srcObj.id}, dstDirID, false); err != nil {
 		if isGroupStalePathError(err) {
-			f.srvPathOf.del(dstDirID)
+			// Every path under the destination chains through the string the
+			// server just rejected, so the whole subtree goes stale together.
+			f.srvPathOf.delSubtree("", dstDirID)
 			return nil, fs.ErrorCantMove
 		}
 		return nil, err
@@ -4692,8 +4688,8 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		oldPath := srcFs.groupSrvPath(srcID)
 		if err := f.groupMoveTask(ctx, []string{srcID}, dstDirID, true); err != nil {
 			if isGroupStalePathError(err) {
-				srcFs.srvPathOf.del(dstDirID)
-				f.srvPathOf.del(dstDirID)
+				srcFs.srvPathOf.delSubtree("", dstDirID)
+				f.srvPathOf.delSubtree("", dstDirID)
 				return fs.ErrorCantDirMove
 			}
 			return err

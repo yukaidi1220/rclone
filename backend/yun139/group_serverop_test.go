@@ -349,6 +349,13 @@ func (w *jsonWriter) Write(b []byte) (int, error) {
 func (w *jsonWriter) WriteHeader(int) {}
 
 func (w *jsonWriter) done(obj map[string]any) *http.Response {
+	// Two responses in one body decode as trailing garbage, which turns a
+	// business refusal into a transport error and makes the branch under test
+	// untestable. That happened once already, so the second write fails loudly
+	// instead of quietly.
+	if w.wrote {
+		panic("groupTransport handler answered the same request twice")
+	}
 	if obj != nil {
 		b, err := json.Marshal(obj)
 		if err != nil {
@@ -1064,6 +1071,9 @@ func TestUnitGroupMoveStaleDestPathDeclines(t *testing.T) {
 	require.NoError(t, err)
 	_, ok := f.srvPathOf.get("D2")
 	require.True(t, ok, "the listing must have cached the destination path, or the test proves nothing")
+	// A child of the destination, cached exactly the way listGroup caches it: a
+	// path chain running through D2.
+	f.srvPathOf.put("D9", "root:/"+gtestRootCat+"/D2/D9")
 
 	o := newTestObject(f, "a.txt", "F1", 4)
 	_, err = f.Move(context.Background(), o, "dst/a.txt")
@@ -1071,6 +1081,10 @@ func TestUnitGroupMoveStaleDestPathDeclines(t *testing.T) {
 
 	_, ok = f.srvPathOf.get("D2")
 	assert.False(t, ok, "the path the server just refused must not be sent again")
+	// Every path below the destination chains through the rejected string, so a
+	// child of it has to go stale in the same shot - not one refused move each.
+	_, ok = f.srvPathOf.get("D9")
+	assert.False(t, ok, "the destination's child chained through the rejected path must be dropped too")
 	assert.Len(t, tr.dirs["D2"].contents, 0, "a refused task moves nothing")
 	assert.Len(t, tr.dirs[gtestRootCat].contents, 1, "the entry must still be where it was")
 	for _, c := range tr.calls {
