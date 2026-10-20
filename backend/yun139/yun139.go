@@ -1167,6 +1167,33 @@ func (c *srvPathCache) get(k string) (string, bool) {
 	return v, ok
 }
 
+// delSubtree drops the cached path of a directory that moved and of everything
+// under it: the paths are chains of ids, so every entry in the subtree has to be
+// relearned from its new parent listing.
+//
+// oldPath is the directory's path before the move. When it is not known - the
+// directory was never listed through this Fs - the moved id is matched as a path
+// segment instead, so the subtree is still found and an untouched sibling is
+// not: the match is on whole segments, never on a bare prefix, because catalog
+// ids are prefixes of each other.
+func (c *srvPathCache) delSubtree(oldPath, id string) {
+	inSubtree := func(v string) bool {
+		if oldPath != "" {
+			return v == oldPath || strings.HasPrefix(v, oldPath+"/")
+		}
+		// Every cached value is a "root:/..." chain, so the moved id can only
+		// appear as a trailing or interior segment - never as the whole value.
+		return strings.HasSuffix(v, "/"+id) || strings.Contains(v, "/"+id+"/")
+	}
+	c.mu.Lock()
+	for k, v := range c.m {
+		if inSubtree(v) {
+			delete(c.m, k)
+		}
+	}
+	c.mu.Unlock()
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -1942,6 +1969,14 @@ func (f *Fs) groupTrash(ctx context.Context, id string) error {
 // fileType is only ever observed as "file"; the value for a directory is
 // unverified.
 func (f *Fs) groupRename(ctx context.Context, id, newName, dirID string) error {
+	return f.groupRenameEntry(ctx, id, newName, dirID, "file")
+}
+
+// groupRenameEntry renames one group entry. fileType is "file" for an entry and
+// "catalog" for a directory: modifyGroupContent renames a directory when it is
+// given the catalog type, which the capture of a file rename does not show
+// (measured 2026-10-20 against a live group).
+func (f *Fs) groupRenameEntry(ctx context.Context, id, newName, dirID, fileType string) error {
 	rootID, err := f.groupRoot(ctx)
 	if err != nil {
 		return err
@@ -1960,7 +1995,7 @@ func (f *Fs) groupRename(ctx context.Context, id, newName, dirID string) error {
 	body := map[string]any{
 		"contentName":     newName,
 		"contentID":       id,
-		"fileType":        "file",
+		"fileType":        fileType,
 		"parentCatalogID": dirID,
 		"path":            own,
 		"groupID":         f.opt.GroupID,
@@ -1970,6 +2005,196 @@ func (f *Fs) groupRename(ctx context.Context, id, newName, dirID string) error {
 	return f.pacer.Call(func() (bool, error) {
 		return shouldRetry(ctx, f.groupCall(ctx, "/hcy/mutual/adapter/isbo/openApi/modifyGroupContent", body, nil))
 	})
+}
+
+// groupRenameCatalog renames a directory and then reads the name back from the
+// parent listing.
+//
+// modifyGroupContent answers a bare success envelope, and a rename onto a name
+// the directory already holds is parked under a suffixed name, so a caller that
+// trusts the reply would report a subtree at a path the server does not hold.
+func (f *Fs) groupRenameCatalog(ctx context.Context, id, wantStd, dirID string) error {
+	if err := f.groupRenameEntry(ctx, id, f.opt.Enc.FromStandardName(wantStd), dirID, "catalog"); err != nil {
+		return err
+	}
+	return f.confirmRename(ctx, dirID, id, wantStd, "")
+}
+
+// groupTaskAccountInfo returns the account block the group's batch-task
+// endpoints take. It is keyed on the 19-digit userDomainId, unlike the one
+// createGroupCatalog and the listing take (accountName = the phone number), so
+// the two are not interchangeable (captures 2026-10-19).
+func (f *Fs) groupTaskAccountInfo() map[string]any {
+	return map[string]any{"userDomainId": f.userDomainID, "accountType": "1"}
+}
+
+// groupMoveDest works out how createBatchOprTask addresses a destination
+// directory: its own server path plus its id.
+//
+// The group root is not named by a "root:/..." path: the listing and
+// createGroupCatalog both address it with the fixed mount prefix plus the
+// numeric group id, so a move into the root does the same. Any other directory
+// is addressed with the path a listing gave it, which is what the PC client
+// puts in destPath (capture 2026-10-19: moving a file into 新建文件夹 sent
+// destPath "root:/<root>/<that directory>", the string the listing reported).
+func (f *Fs) groupMoveDest(ctx context.Context, dirID string) (destPath, destDirectoryID string, err error) {
+	rootID, err := f.groupRoot(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	if dirID == rootID {
+		return api.GroupRootPathPrefix + "/" + f.opt.GroupID, f.opt.GroupID, nil
+	}
+	p := f.groupSrvPath(dirID)
+	if p == "" {
+		return "", "", fmt.Errorf("yun139: server path of group directory %s is not known; list its parent first", dirID)
+	}
+	return p, dirID, nil
+}
+
+// groupMoveTask moves entries inside a shared group using its native batch
+// move task and waits for the task to finish.
+//
+// Directories and files are separate fields: catalogList takes directory ids
+// and contentList takes file ids. Putting a directory id in contentList is not
+// a move of the directory.
+func (f *Fs) groupMoveTask(ctx context.Context, ids []string, dstDirID string, dirs bool) error {
+	if len(ids) == 0 {
+		return errors.New("yun139: group move called with no ids")
+	}
+	destPath, destDirectoryID, err := f.groupMoveDest(ctx, dstDirID)
+	if err != nil {
+		return err
+	}
+	catalogList, contentList := []string{}, []string{}
+	if dirs {
+		catalogList = ids
+	} else {
+		contentList = ids
+	}
+	body := map[string]any{
+		"accountInfo":     f.groupTaskAccountInfo(),
+		"catalogList":     catalogList,
+		"contentList":     contentList,
+		"destPath":        destPath,
+		"destType":        "2",
+		"srcGroupID":      f.opt.GroupID,
+		"srcType":         2,
+		"taskType":        3,
+		"destDirectoryId": destDirectoryID,
+		"businessType":    1,
+		"eventType":       "move",
+	}
+	var resp struct {
+		TaskID string `json:"taskID"`
+	}
+	err = f.pacer.Call(func() (bool, error) {
+		err := f.groupCall(ctx, "/hcy/mutual/adapter/isbo/openApi/createBatchOprTask", body, &resp)
+		return shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return err
+	}
+	if resp.TaskID == "" {
+		return errors.New("yun139: group move task returned no taskID")
+	}
+	return f.groupBatchTaskPoll(ctx, resp.TaskID, ids)
+}
+
+// groupTaskDeadline is how long a group batch task is waited for. It is a var so
+// the unit tests can sit through a timeout without waiting a minute.
+var groupTaskDeadline = 60 * time.Second
+
+// groupTaskReportGrace is how long a finished task may take to start listing the
+// entries it was given. Also a var for the tests.
+var groupTaskReportGrace = 10 * time.Second
+
+// groupBatchTaskPoll waits for a group batch task to leave the running state
+// and reports the per-entry outcome.
+//
+// The task record alone is not enough: it finishes with taskResultCode 1 while
+// individual entries carry a reason, so an entry that was refused is only
+// visible in contentList/catalogList (capture 2026-10-19 shows reason "0" for
+// the entries that moved).
+func (f *Fs) groupBatchTaskPoll(ctx context.Context, taskID string, want []string) error {
+	type entry struct {
+		SrcID  string `json:"srcId"`
+		Reason string `json:"reason"`
+	}
+	deadline := time.Now().Add(groupTaskDeadline)
+	var reportDeadline time.Time
+	for {
+		var out struct {
+			BatchOprTask struct {
+				TaskStatus     int  `json:"taskStatus"`
+				TaskResultCode *int `json:"taskResultCode"`
+			} `json:"batchOprTask"`
+			ContentList []entry `json:"contentList"`
+			CatalogList []entry `json:"catalogList"`
+		}
+		body := map[string]any{
+			"taskID":            taskID,
+			"taskId":            taskID,
+			"accountInfo":       f.groupTaskAccountInfo(),
+			"commonAccountInfo": f.groupTaskAccountInfo(),
+		}
+		err := f.pacer.Call(func() (bool, error) {
+			err := f.groupCall(ctx, "/hcy/mutual/adapter/isbo/openApi/queryBatchOprTaskDetailV3", body, &out)
+			return shouldRetry(ctx, err)
+		})
+		if err != nil {
+			return fmt.Errorf("yun139: poll group batch task: %w", err)
+		}
+		if out.BatchOprTask.TaskStatus >= 2 {
+			code := out.BatchOprTask.TaskResultCode
+			if code == nil || *code != 1 {
+				if code == nil {
+					return fmt.Errorf("yun139: group move task %s finished without a result code", taskID)
+				}
+				return fmt.Errorf("yun139: group move task %s finished with result code %d", taskID, *code)
+			}
+			reported := make(map[string]bool, len(out.ContentList)+len(out.CatalogList))
+			for _, list := range [][]entry{out.ContentList, out.CatalogList} {
+				for _, e := range list {
+					// A task that is still running can already list its entries,
+					// and until it finishes they carry no reason at all, so the
+					// reason is only read once the task has finished: an empty
+					// reason while running means "not indexed yet", not "refused".
+					if e.Reason != "0" {
+						return fmt.Errorf("yun139: group move task %s refused %s with reason %q", taskID, e.SrcID, e.Reason)
+					}
+					reported[e.SrcID] = true
+				}
+			}
+			// A task that says nothing about the entries it was given is not
+			// evidence that they moved. The entry list is indexed asynchronously,
+			// as the rest of 139 is, so it is waited for - but on its own clock,
+			// so a task that finishes late still gets its grace.
+			var missing []string
+			for _, id := range want {
+				if !reported[id] {
+					missing = append(missing, id)
+				}
+			}
+			if len(missing) == 0 {
+				return nil
+			}
+			if reportDeadline.IsZero() {
+				reportDeadline = time.Now().Add(groupTaskReportGrace)
+			}
+			if time.Now().After(reportDeadline) {
+				return fmt.Errorf("yun139: group move task %s finished without reporting %s", taskID, strings.Join(missing, ", "))
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("yun139: group move task %s did not finish in %v", taskID, groupTaskDeadline)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 // ------------------------------------------------------------ NewFs -------
@@ -2066,7 +2291,6 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		SlowHash:                true,
 		ServerSideAcrossConfigs: false,
 	}).Fill(ctx, f)
-	f.clearUnsupportedSharedFeatures()
 	return f, nil
 }
 
@@ -2181,7 +2405,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 				return nil, err2
 			}
 			f.features.Fill(ctx, &tempF)
-			f.clearUnsupportedSharedFeatures()
 			f.dirCache = tempF.dirCache
 			f.root = tempF.root
 			return f, fs.ErrorIsFile
@@ -2227,24 +2450,6 @@ func (f *Fs) dynamicGroupType() int {
 // this instead of familyCall or groupCall.
 func (f *Fs) spaceCall(ctx context.Context, pathname string, body any, out any) error {
 	return f.call(ctx, api.FamilyBaseURL+pathname, body, out)
-}
-
-// clearUnsupportedSharedFeatures drops the capabilities a shared group has no
-// server-side implementation for yet (native move exists in the API but is not
-// wired up, and there is no server-side copy at all).
-//
-// fs.Features.Fill discovers these by interface and the methods do exist on
-// *Fs, so every Fill must be followed by this call - including the one NewFs
-// does when a remote is pointed at a single file. Advertising a capability that
-// is then refused at run time turns what should be a skipped subtest into a
-// failure, and turns rclone's clean fallbacks into an error path.
-func (f *Fs) clearUnsupportedSharedFeatures() {
-	if f.space != spaceGroup || f.features == nil {
-		return
-	}
-	f.features.Move = nil
-	f.features.Copy = nil
-	f.features.DirMove = nil
 }
 
 // spaceSrvPath returns the server path ("root:/...") of a shared-space
@@ -3364,6 +3569,37 @@ func (f *Fs) uploadFile(ctx context.Context, in io.Reader, dirID, leaf string, s
 	return res, err
 }
 
+// sharedCreateBody maps the personal create payload onto the one
+// /hcy/group/dynamic/file/create takes, which is the same field set plus
+// {groupId, groupType, seqNo, expireSec} and no contentType (captured
+// 2026-09-03 and 2026-10-19).
+func (f *Fs) sharedCreateBody(body api.PersonalCreateReq, partInfos []api.PartInfo) map[string]any {
+	fb := map[string]any{
+		"contentHash":          body.ContentHash,
+		"contentHashAlgorithm": body.ContentHashAlgorithm,
+		"expireSec":            86400,
+		"fileRenameMode":       body.FileRenameMode,
+		"groupId":              f.spaceID(),
+		"groupType":            f.dynamicGroupType(),
+		"localCreatedAt":       body.LocalCreatedAt,
+		"localUpdatedAt":       body.LocalUpdatedAt,
+		"name":                 body.Name,
+		"parallelUpload":       body.ParallelUpload,
+		"parentFileId":         body.ParentID,
+		"partInfos":            partInfos,
+		"seqNo":                familySeqNo(),
+		"size":                 body.Size,
+		"type":                 body.Type,
+	}
+	if body.UserRegion != nil {
+		fb["userRegion"] = map[string]any{
+			"cityCode":     body.UserRegion.CityCode,
+			"provinceCode": body.UserRegion.ProvinceCode,
+		}
+	}
+	return fb
+}
+
 // buildCreateBody assembles the /hcy/file/create payload exactly as the
 // official PC client posts it (captured 2026-09-03, v8.8.6.20260829):
 // contentHash + contentHashAlgorithm:SHA256 + contentType + parallelUpload:true
@@ -3490,30 +3726,7 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	var callBody any = body
 	if f.sharedSpace() {
 		callPath = "/hcy/group/dynamic/file/create"
-		fb := map[string]any{
-			"contentHash":          body.ContentHash,
-			"contentHashAlgorithm": body.ContentHashAlgorithm,
-			"expireSec":            86400,
-			"fileRenameMode":       body.FileRenameMode,
-			"groupId":              f.spaceID(),
-			"groupType":            f.dynamicGroupType(),
-			"localCreatedAt":       body.LocalCreatedAt,
-			"localUpdatedAt":       body.LocalUpdatedAt,
-			"name":                 body.Name,
-			"parallelUpload":       body.ParallelUpload,
-			"parentFileId":         body.ParentID,
-			"partInfos":            partInfos,
-			"seqNo":                familySeqNo(),
-			"size":                 body.Size,
-			"type":                 body.Type,
-		}
-		if body.UserRegion != nil {
-			fb["userRegion"] = map[string]any{
-				"cityCode":     body.UserRegion.CityCode,
-				"provinceCode": body.UserRegion.ProvinceCode,
-			}
-		}
-		callBody = fb
+		callBody = f.sharedCreateBody(body, partInfos)
 	} else {
 		callPath = "/hcy/file/create"
 	}
@@ -4192,11 +4405,7 @@ func (o *Object) Remove(ctx context.Context) error {
 // copy+delete.
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	if f.space == spaceGroup {
-		// A group has a native move task (createBatchOprTask with
-		// eventType "move") that the family space lacks, but it is not
-		// wired up yet. Refuse so rclone falls back rather than sending a
-		// group id to the family or personal batch API.
-		return nil, fs.ErrorCantMove
+		return f.groupMove(ctx, src, remote)
 	}
 	srcObj, ok := src.(*Object)
 	if !ok {
@@ -4315,6 +4524,79 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	return o, nil
 }
 
+// groupMove moves an entry inside a shared group with the native batch move
+// task.
+//
+// A move that stays in the directory the entry already lives in is issued as a
+// rename: a move of an entry into itself is something the task refuses.
+// Renaming and moving are separate calls, so a move that also changes the leaf
+// moves first and renames afterwards.
+func (f *Fs) groupMove(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok {
+		return nil, fs.ErrorCantMove
+	}
+	if srcObj.fs != f && !srcObj.fs.sameCloud(f) {
+		return nil, fs.ErrorCantMove
+	}
+	dstLeaf, dstDirID, err := f.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.validateName(remote); err != nil {
+		return nil, err
+	}
+	srcLeaf := srcObj.leaf()
+	// The source's parent is resolved through the SOURCE's dircache: a source
+	// from another Fs of the same group carries a remote path relative to that
+	// Fs's root. An unresolvable source directory leaves the same-directory
+	// case undecidable, so fall through to the task rather than fail the move.
+	_, srcDirID, err := srcObj.fs.dirCache.FindPath(ctx, srcObj.remote, false)
+	if err == nil && srcDirID == dstDirID {
+		if dstLeaf == srcLeaf {
+			// Same directory and same name: nothing to do.
+			return srcObj, nil
+		}
+		if err := f.renameObject(ctx, srcObj.id, f.opt.Enc.FromStandardName(dstLeaf), dstDirID, false); err != nil {
+			return nil, err
+		}
+		return f.groupMoveLanded(ctx, remote, srcObj.id, dstLeaf)
+	}
+	if err := f.groupMoveTask(ctx, []string{srcObj.id}, dstDirID, false); err != nil {
+		return nil, err
+	}
+	// No path cache is touched here: only directories are cached, and an entry's
+	// own path is rebuilt from its parent when it is renamed.
+	if dstLeaf != "" && dstLeaf != srcLeaf {
+		if err := f.renameObject(ctx, srcObj.id, f.opt.Enc.FromStandardName(dstLeaf), dstDirID, false); err != nil {
+			// The content has moved even though the rename did not land, so
+			// report where it actually is: a caller that retried the move would
+			// be asking the server to move an entry that is no longer in the
+			// directory it thinks it is in.
+			if name, found, nerr := f.entryName(ctx, dstDirID, srcObj.id); nerr == nil && found {
+				return nil, fmt.Errorf("yun139: move to %q: the entry moved but the server stores it as %q: %w", dstLeaf, name, err)
+			}
+			return nil, fmt.Errorf("yun139: rename after move to %q: %w", dstLeaf, err)
+		}
+	}
+	return f.groupMoveLanded(ctx, remote, srcObj.id, dstLeaf)
+}
+
+// groupMoveLanded reads the moved entry back at remote and refuses to report
+// success unless the object there carries the id that was moved. A destination
+// name that was already taken is kept by the server, which parks the moved
+// entry under a suffixed name, so the object at remote would be the other one.
+func (f *Fs) groupMoveLanded(ctx context.Context, remote, wantID, dstLeaf string) (fs.Object, error) {
+	o, err := f.newObjectVisible(ctx, remote)
+	if err != nil {
+		return nil, err
+	}
+	if got := o.(*Object).id; got != wantID {
+		return nil, fmt.Errorf("yun139: move to %q: server kept the existing entry (moved file is under another name)", dstLeaf)
+	}
+	return o, nil
+}
+
 // moveTaskID is a helper that performs one batchMove and returns the task id.
 func (f *Fs) moveTaskID(ctx context.Context, id, dstDirID string) (string, error) {
 	var out struct {
@@ -4341,21 +4623,73 @@ func (f *Fs) moveTaskID(ctx context.Context, id, dstDirID string) (string, error
 
 // DirMove moves a directory
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
-	if f.space == spaceGroup {
-		return fs.ErrorCantDirMove
-	}
 	srcFs, ok := src.(*Fs)
 	if !ok || !srcFs.sameCloud(f) {
 		// Different account/family - cannot move across clouds.
 		return fs.ErrorCantDirMove
 	}
-	// Use lib/dircache's DirMove helper to resolve ids (it handles
-	// the MoveDir root-relative semantics, src==dst and
-	// dst-inside-src correctly).
-	srcID, _, _, _, _, err :=
+	// Use lib/dircache's DirMove helper to resolve ids (it refuses a move of or
+	// onto a root and checks the destination does not exist; it knows nothing
+	// about a backend's own subtree rules).
+	srcID, srcDirectoryID, srcLeaf, dstDirID, dstLeaf, err :=
 		f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
 	if err != nil {
 		return err
+	}
+	if f.space == spaceGroup {
+		// The group is the one space with a native directory move: the batch
+		// task takes the catalog id in catalogList and moves the subtree with
+		// it (capture 2026-10-19: 新建文件夹 moved into 新建文件夹2 came back as
+		// catalogList with reason "0").
+		seg := "/" + srcID
+		if p, ok := f.srvPathOf.get(dstDirID); ok && (strings.HasSuffix(p, seg) || strings.Contains(p, seg+"/")) {
+			// The destination is the source itself or something inside it.
+			// lib/dircache only refuses a move of or onto a root, and it has
+			// already created the destination's parent chain by the time it
+			// resolves the ids, so those empty directories stay behind.
+			f.dirCache.FlushDir(dstRemote)
+			return fmt.Errorf("yun139: cannot move %q into itself or a subdirectory", srcRemote)
+		}
+		if srcDirectoryID == dstDirID {
+			// The new home is the parent the directory already lives in, so
+			// this is a rename. The task refuses it - measured 2026-10-20: a
+			// same-parent move came back with result code 3 - while
+			// modifyGroupContent with the catalog type renames the directory
+			// and keeps its subtree.
+			if err := f.groupRenameCatalog(ctx, srcID, dstLeaf, dstDirID); err != nil {
+				return err
+			}
+			srcFs.dirCache.FlushDir(srcRemote)
+			f.dirCache.FlushDir(dstRemote)
+			return nil
+		}
+		// The old server path has to be read before the move, because after it
+		// the cached path of the moved subtree is exactly what must not be used.
+		oldPath := srcFs.groupSrvPath(srcID)
+		if err := f.groupMoveTask(ctx, []string{srcID}, dstDirID, true); err != nil {
+			return err
+		}
+		srcFs.srvPathOf.delSubtree(oldPath, srcID)
+		f.srvPathOf.delSubtree(oldPath, srcID)
+		// FIXME: only the caches reachable from these two Fs are corrected. An
+		// Object built earlier still carries the server path of the directory it
+		// was listed under, and the download-link request sends that path with
+		// the id; whether the server checks it is not measured. A third remote on
+		// the same group keeps its own stale cache until it re-lists.
+		// The paths both Fs held for the moved subtree are gone now, so drop the
+		// directory cache before the rename: a rename that fails must not leave
+		// either side pointing at a location the subtree no longer lives at.
+		srcFs.dirCache.FlushDir(srcRemote)
+		f.dirCache.FlushDir(dstRemote)
+		// The task keeps the directory's own name, so a move that also changes
+		// the leaf has to rename it: the caller asked for the subtree to live at
+		// dstRemote, not under whatever the directory was called before.
+		if dstLeaf != srcLeaf {
+			if err := f.groupRenameCatalog(ctx, srcID, dstLeaf, dstDirID); err != nil {
+				return fmt.Errorf("yun139: rename after directory move to %q: %w", dstLeaf, err)
+			}
+		}
+		return nil
 	}
 	if f.space == spaceFamily {
 		// No native family move API. The new server falls back to
@@ -4386,8 +4720,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 // bandwidth copy when ErrorCantCopy is returned.
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	if f.space == spaceGroup {
-		// Server-side copy in a group is not wired up; see Move.
-		return nil, fs.ErrorCantCopy
+		return f.groupRapidCopy(ctx, src, remote)
 	}
 	srcObj, ok := src.(*Object)
 	if !ok {
@@ -4447,6 +4780,101 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, err
 	}
 	return o, nil
+}
+
+// groupRapidCopy copies an entry inside a shared group without moving bytes.
+//
+// A group has no batch copy task, so the copy is offered as a rapid upload:
+// the source's SHA-256 goes to /hcy/group/dynamic/file/create and the store
+// mints a new entry for content it already holds. Measured 2026-10-19: a second
+// create carrying the hash of an existing entry answered rapidUpload with no
+// part URLs, and the entry it returned read back with that same SHA-256.
+//
+// When the hash matches nothing the answer carries part URLs instead. Nothing
+// is then uploaded and the copy is refused, so the engine falls back to a
+// bandwidth copy; a create whose parts are never PUT leaves no entry behind
+// (measured: an upload killed one second after create returned was missing from
+// the listing and stayed missing).
+func (f *Fs) groupRapidCopy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok {
+		return nil, fs.ErrorCantCopy
+	}
+	if srcObj.fs != f && !srcObj.fs.sameCloud(f) {
+		return nil, fs.ErrorCantCopy
+	}
+	dstLeaf, dstDirID, err := f.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.validateName(remote); err != nil {
+		return nil, err
+	}
+	taken, err := f.leafTaken(ctx, dstDirID, path.Base(remote))
+	if err != nil {
+		return nil, err
+	}
+	if taken {
+		fs.Debugf(srcObj, "Destination name %q is taken; using a bandwidth copy to replace it", path.Base(remote))
+		return nil, fs.ErrorCantCopy
+	}
+	hashHex, err := srcObj.Hash(ctx, hash.SHA256)
+	if err != nil || hashHex == "" {
+		// A hash that cannot be read is a copy that cannot be offered, not a
+		// transfer to abort: the bandwidth copy the engine falls back to reads
+		// the content itself and will report a real access problem there.
+		fs.Debugf(srcObj, "yun139: no content hash to offer for the rapid copy (%v); using a bandwidth copy", err)
+		return nil, fs.ErrorCantCopy
+	}
+	size := srcObj.Size()
+	// The entry is offered as a single part whatever size it is. The store
+	// matches on the content hash and the size, not on the layout the content
+	// arrived in: a 13 MiB file uploaded in three 5 MiB parts was copied this
+	// way (measured 2026-10-20, "Copied (server-side copy)", no bytes moved).
+	// Declaring the real three parts without their midstates is what the server
+	// refuses, with 02010501 请求不合法 - the midstates are a function of the
+	// bytes, and a copy does not read them.
+	body := buildCreateBody(dstDirID, f.opt.Enc.FromStandardName(dstLeaf), size, hashHex, nil, f.opt.RegionCode)
+	var resp struct {
+		api.BaseResp
+		Data struct {
+			FileID      string               `json:"fileId"`
+			FileName    string               `json:"fileName"`
+			RapidUpload bool                 `json:"rapidUpload"`
+			Exists      *bool                `json:"exist"`
+			PartInfos   []api.PartUploadInfo `json:"partInfos"`
+		} `json:"data"`
+	}
+	err = f.pacer.Call(func() (bool, error) {
+		err := f.spaceCall(ctx, "/hcy/group/dynamic/file/create", f.sharedCreateBody(body, []api.PartInfo{{PartNumber: 1, PartSize: size}}), &resp)
+		return shouldRetry(ctx, err)
+	})
+	if err != nil {
+		// A quota or entitlement refusal is a reason to stop, not a reason to
+		// re-upload the file the slow way: the bandwidth copy would read the
+		// whole object, land on the same server answer, and cost the transfer.
+		if qerr := noRetryOnQuotaRejection(err); qerr != err || fserrors.IsNoRetryError(err) {
+			return nil, qerr
+		}
+		// Anything else the server objects to is still a copy rclone can do by
+		// moving bytes, so decline rather than fail: an error here would abort
+		// the transfer outright.
+		fs.Debugf(srcObj, "yun139: group refused the rapid copy (%v); using a bandwidth copy", err)
+		return nil, fs.ErrorCantCopy
+	}
+	if resp.Data.Exists != nil && *resp.Data.Exists {
+		// The name was taken between the check above and this call, so the id
+		// in the answer is the other entry's. Acting on it - renaming it, or
+		// removing it after a failed copy - would touch a file this copy did
+		// not create.
+		fs.Debugf(srcObj, "Destination name %q was taken during the copy; using a bandwidth copy", path.Base(remote))
+		return nil, fs.ErrorCantCopy
+	}
+	if !resp.Data.RapidUpload || resp.Data.FileID == "" {
+		fs.Debugf(srcObj, "yun139: the store has no content for this hash; using a bandwidth copy")
+		return nil, fs.ErrorCantCopy
+	}
+	return f.resolveCopyLeaf(ctx, dstDirID, remote, srcObj.id, resp.Data.FileID)
 }
 
 // resolveCopyLeaf turns the id of a freshly created copy into an Object at
