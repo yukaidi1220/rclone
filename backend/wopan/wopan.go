@@ -193,6 +193,113 @@ const (
 	codeNameOccupied = "130012"
 )
 
+// ------------------------------------------------------------ benefit ------
+
+// Constants for the membership benefit probe.
+//
+// This is a second, unrelated request shape on the dispatcher's host: the body
+// and the response are plain JSON, there is no AES param and no signature, and
+// the envelope is meta/result. It is sent with the header set captured from the
+// wocloud PC client because that is the request that was observed to work.
+//
+// Measured against a live non-member account (2026-10-19): the answer is the
+// same for Client-Id 1001000209 and for the dispatcher's 1001000021, and it is
+// unchanged by dropping User-Agent, Client-Id, pc-version/pc-os or by adding
+// Origin and Referer. What the request cannot lose is the token: sending only
+// the lowercase `accesstoken` (the name the dispatcher uses) is answered
+// `10002404 用户未登录`, while `Access-Token` alone is accepted. All three names
+// are therefore sent - dropping to one of them, or to the dispatcher's spelling,
+// makes the probe fail open permanently and silently.
+const (
+	membershipBenefitPath = "/api/bff/membershipBenefit/displayMembershipBenefit"
+	benefitClientID       = "1001000209"
+	benefitPCVersion      = "2.8.13"
+	benefitUserAgent      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) wocloud/2.8.13 Chrome/108.0.5359.215 Electron/22.3.27 Safari/537.36"
+	benefitQryType        = "1" // TODO: meaning unprobed; sent as captured
+	benefitSuccessCode    = "200"
+	// benefitTimeout bounds the probe that runs while the remote is opening. The
+	// endpoint is not on the transfer path, so a stalled connection to it must never
+	// become the reason a command does not start.
+	benefitTimeout = 30 * time.Second
+
+	// uploadFileSizeUnit converts the reported uploadFileSize to bytes: the value
+	// is in MiB, measured against the same account's QueryCloudUsageInfo
+	// byteTotalSize (see api.MembershipBenefit). That method also carries a
+	// top-level vipLevel, and on the measured non-member account both endpoints
+	// say "0" - so running `rclone about` on the same remote is a cross-check of
+	// the tier code, at the cost of one extra quota request.
+	uploadFileSizeUnit = int64(1) << 20
+)
+
+// benefitStaticHeaders are the captured request headers that do not carry the
+// token. The token is sent under three different names, all with the same value.
+//
+// Host, Content-Length, Connection and Accept-Encoding are deliberately left to
+// the Go transport: the capture advertises `gzip, deflate, br`, and rclone reads
+// the response itself, so advertising brotli would ask the server for a body Go
+// cannot decode.
+//
+// One of these is not what it looks like. rclone's transport sets User-Agent on
+// every request it sends (fs/fshttp: req.Header.Set("User-Agent", ...)), so the
+// wocloud/Electron string below is replaced by `rclone/<version>` on the wire
+// unless the operator pins `--wopan-user_agent`, which is rclone's generic
+// per-remote Networking option. Measured 2026-10-20 (_benefit-probe/ua-probe.txt):
+// the captured UA, `rclone/v1.76.0` and no UA at all return byte-identical
+// responses, so the endpoint does not read it. The entry stays because it is what
+// the request was measured with, and because a transport that stops overwriting it
+// would then send the right thing.
+var benefitStaticHeaders = [][2]string{
+	{"pc-version", benefitPCVersion},
+	{"pc-os", "win"},
+	{"Client-Id", benefitClientID},
+	{"User-Agent", benefitUserAgent},
+	{"Accept", "application/json, text/plain, */*"},
+	{"Content-Type", "application/json"},
+	{"sec-ch-ua", `"Not?A_Brand";v="8", "Chromium";v="108"`},
+	{"sec-ch-ua-mobile", "?0"},
+	{"sec-ch-ua-platform", `"Windows"`},
+	{"Sec-Fetch-Site", "cross-site"},
+	{"Sec-Fetch-Mode", "cors"},
+	{"Sec-Fetch-Dest", "empty"},
+	{"Accept-Language", "zh-CN"},
+}
+
+// benefitTokenHeaders are the three header names the PC client puts the access
+// token in. Only `Access-Token` (and/or `X-YP-Access-Token`) is required - the
+// dispatcher's lowercase `accesstoken` on its own is answered 用户未登录 - but all
+// three are sent because that is the captured request.
+//
+// They are set through the header map rather than Header.Set so the captured
+// spelling is what goes on the wire. That fidelity has not been shown to matter:
+// the endpoint reads a name Header.Set would have spelled the same way. It is
+// kept so the request rclone sends is the request that was measured.
+var benefitTokenHeaders = []string{"accesstoken", "Access-Token", "X-YP-Access-Token"}
+
+// ------------------------------------------------------------ 秒传 ----------
+
+// Constants for the instant-upload ("秒传") probe.
+//
+// The host is not panservice: it is the openapi operator the official web bundle
+// itself names for uploads (`du.smartont.net:/openapi/client/upload2C`), and
+// b.smartont.net answers on the same address. The request is plain JSON with one
+// credential header, `access-token`, holding the same access token the dispatcher
+// uses; the envelope is meta/result with meta.code "0000".
+//
+// Verified against a live account on 2026-10-20: a SHA-256 the service had never
+// seen answers `hasFile 0` with `fileId null`; the SHA-256 of content that had
+// just been uploaded answers `hasFile 1` plus fid/wcFileId, and the entry appears
+// in the destination directory at once with no bytes transferred.
+const (
+	quickTransferURL = "https://b.smartont.net/openapi/transfer/quickTransfer"
+	// quickTransferMinSize is the floor the official client is reported to use,
+	// below which the probe is not worth a request. Third-party claim, not
+	// measured here.
+	quickTransferMinSize = int64(3) << 20
+	quickTransferTimeout = 30 * time.Second
+	// quickTransferSuccessCode is meta.code when the probe was understood.
+	quickTransferSuccessCode = "0000"
+)
+
 // ------------------------------------------------------------ crypto -------
 
 // pkcs7Pad pads b with PKCS#7 padding to a multiple of the given block size.
@@ -659,6 +766,8 @@ type Options struct {
 	UploadCutoff      fs.SizeSuffix        `config:"upload_cutoff"`
 	ChunkSize         fs.SizeSuffix        `config:"chunk_size"`
 	UploadConcurrency int                  `config:"upload_concurrency"`
+	NoMemberCheck     bool                 `config:"no_member_check"` // skip the membership probe and its over-limit notice entirely
+	QuickTransfer     bool                 `config:"quick_transfer"`  // probe openapi/transfer/quickTransfer before uploading files >=3 MiB
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -754,6 +863,39 @@ func init() {
 			Default:  4,
 			Advanced: true,
 		}, {
+			Name: "no_member_check",
+			Help: "Disable the membership probe and its over-limit notice.\n\n" +
+				"By default NewFs asks the account once for its membership and logs " +
+				"the single-file upload size it reports (1 GiB for a non-member " +
+				"account at the time of writing), and names any file larger than that " +
+				"in the log. Nothing is blocked because of it: measured 2026-10-20, " +
+				"uploads past the reported size complete through the chunked path and " +
+				"are stored at full size. Set this to skip that request and the notice " +
+				"as well. Default false.",
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name: "quick_transfer",
+			Help: "Try the instant-upload (" + "秒传" + ") service before uploading big files.\n\n" +
+				"When set, a file of 3 MiB or more in the personal space is offered to\n" +
+				"the service by SHA-256 first, and if the account already stores that\n" +
+				"content the object is created without transferring any bytes. The cost\n" +
+				"is the hash: getting SHA-256 means reading the source again, which for\n" +
+				"a local source is a second full pass over the file and for a remote one\n" +
+				"can mean downloading it. It is therefore off by default.\n" +
+				"Measured 2026-10-20: a created entry carries the moment it was\n" +
+				"registered, not the source modification time - the service ignores the\n" +
+				"timestamp sent here and wopan cannot set a modification time later - so\n" +
+				"a following copy or sync re-registers it. Use --size-only with this\n" +
+				"option: --checksum compares sizes anyway for files above upload_cutoff\n" +
+				"(they have no stored MD5) and needs a fragile per-file HEAD below it.\n" +
+				"A miss, any probe failure and every family-space transfer fall through\n" +
+				"to the normal upload; only a hit reported without an object id fails,\n" +
+				"because uploading then would store a second copy of content the service\n" +
+				"has already registered.",
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -795,6 +937,12 @@ type Fs struct {
 	tok       *tokenState // process wide token state shared by remotes of this account
 	userID    string      // userId from AppQueryUser - the invariant registry key
 	spaceType string      // spacePersonal or spaceFamily
+
+	// Detected membership benefit. oversizeNotice() is the only consumer; 0 means
+	// nothing is known, so nothing is ever reported.
+	memberMaxFileSize int64  // reported single-file upload size in bytes; 0 = unknown
+	memberLevelName   string // vipDesc, e.g. "非会员"; logging only
+	memberLevelCode   string // vipLevel, e.g. "0"; logging only
 
 	zoneMu     *sync.Mutex // protects zoneURL / zoneLoaded (a pointer so the NewFs tempF copy is safe)
 	zoneURL    string      // upload endpoint from GetZoneInfo, lazily discovered
@@ -1025,6 +1173,388 @@ func (f *Fs) refreshTokenLocked(ctx context.Context, ts *tokenState, usedToken s
 	return ts.accessToken, ts.refreshToken, nil
 }
 
+// ------------------------------------------------------- membership benefit -
+
+// benefitInfo is the account's detected membership tier and the single-file
+// upload size it reports with it.
+type benefitInfo struct {
+	maxFileSize int64  // bytes; 0 = unknown, which is never reported as an over-limit
+	levelCode   string // vipLevel, e.g. "0"
+	levelName   string // vipDesc, e.g. "非会员"
+	raw         string // the result block as received, for the Debug log
+}
+
+// benefitCache keys the detected benefit by userId.
+//
+// The limit is account level - the family space is covered by the same reported
+// value - so one entry per account serves every remote and both space types. A
+// failed probe is cached as the zero value, so an endpoint that is down or has
+// changed shape costs one request per process rather than one per remote. The
+// tier belongs to the account and not to the token, so a token refresh does not
+// invalidate an entry.
+var benefitCache = struct {
+	mu       sync.Mutex
+	byUserID map[string]benefitInfo
+}{byUserID: map[string]benefitInfo{}}
+
+// queryMembershipBenefit asks the account's benefit display for its single-file
+// upload limit.
+//
+// It uses f.httpClient directly rather than call(): this endpoint is not the
+// dispatcher, so there is no AES param to build, no signature to compute and no
+// RSP envelope to decode. It never refreshes the token - a rejected token is
+// simply a failed probe, and the caller fails open.
+func (f *Fs) queryMembershipBenefit(ctx context.Context) (benefitInfo, error) {
+	body, err := json.Marshal(map[string]string{"qryType": benefitQryType})
+	if err != nil {
+		return benefitInfo{}, err
+	}
+	// A deadline of its own: this runs while the remote is being opened, and the
+	// only other bound would be --timeout, which is 0 (no limit) by default. A
+	// stalled connection to this endpoint must not be able to hold up `rclone lsd`.
+	reqCtx, cancel := context.WithTimeout(ctx, benefitTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, baseURL+membershipBenefitPath, bytes.NewReader(body))
+	if err != nil {
+		return benefitInfo{}, err
+	}
+	token := f.tok.accessTokenNow()
+	for _, h := range benefitStaticHeaders {
+		req.Header[h[0]] = []string{h[1]}
+	}
+	for _, name := range benefitTokenHeaders {
+		req.Header[name] = []string{token}
+	}
+
+	res, err := f.httpClient.Do(req)
+	if err != nil {
+		return benefitInfo{}, fmt.Errorf("wopan: query membership benefit: %w", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	raw, err := io.ReadAll(res.Body)
+	if err != nil {
+		return benefitInfo{}, fmt.Errorf("wopan: query membership benefit: read: %w", err)
+	}
+	if res.StatusCode != http.StatusOK {
+		return benefitInfo{}, fmt.Errorf("wopan: query membership benefit: http %s: %s", res.Status, truncate(string(raw), 200))
+	}
+
+	var env api.MembershipBenefitResponse
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return benefitInfo{}, fmt.Errorf("wopan: query membership benefit: decode: %w (body %s)", err, truncate(string(raw), 200))
+	}
+	if env.Meta.Code != benefitSuccessCode {
+		// A dead token is answered here rather than with an HTTP status: measured
+		// 2026-10-19 against a live account, HTTP 200 with
+		// `{"meta":{"code":"10002404","message":"用户未登录"}}` and no result block.
+		// That is deliberately not wired into the refresh path - the benefit is
+		// account level, so a rejected token here is worth nothing to a retry, and
+		// rotating the pair on a shared account to learn a display value would cost
+		// the other program using it.
+		return benefitInfo{}, fmt.Errorf("wopan: query membership benefit: meta.code=%s meta.message=%s", env.Meta.Code, env.Meta.Message)
+	}
+	var b api.MembershipBenefit
+	if err := json.Unmarshal(env.Result, &b); err != nil {
+		return benefitInfo{}, fmt.Errorf("wopan: query membership benefit: decode result: %w", err)
+	}
+	// A missing or unparseable uploadFileSize is treated as "nothing reported" by
+	// the caller: inventing a number here would put files in the log that the
+	// account never named.
+	mib, err := strconv.ParseInt(string(b.UploadFileSize), 10, 64)
+	if err != nil || mib <= 0 {
+		return benefitInfo{}, fmt.Errorf("wopan: query membership benefit: unusable uploadFileSize %q", string(b.UploadFileSize))
+	}
+	return benefitInfo{
+		maxFileSize: mib * uploadFileSizeUnit,
+		levelCode:   string(b.VipLevel),
+		levelName:   b.VipDesc,
+		raw:         string(env.Result),
+	}, nil
+}
+
+// probeAndCacheMembershipBenefit learns this account's reported single-file
+// upload limit once per process and logs it.
+//
+// no_member_check skips the probe, and with it the over-limit notice. Every
+// failure path leaves the limit at 0, so an unreachable or unexpected endpoint
+// can never block a mount or a sync.
+func (f *Fs) probeAndCacheMembershipBenefit(ctx context.Context) {
+	if f.opt.NoMemberCheck {
+		return
+	}
+
+	key := f.userID
+	benefitCache.mu.Lock()
+	info, found := benefitCache.byUserID[key]
+	benefitCache.mu.Unlock()
+
+	if !found {
+		var err error
+		info, err = f.queryMembershipBenefit(ctx)
+		if err != nil {
+			fs.Debugf(f, "wopan: membership benefit probe failed, assuming no single-file upload limit: %v", err)
+			info = benefitInfo{}
+		}
+		benefitCache.mu.Lock()
+		// The first writer wins: two remotes of one account started at the same
+		// moment can both probe, and a hung endpoint must not make the second one
+		// wait on the first while holding the map lock.
+		if cached, raced := benefitCache.byUserID[key]; raced {
+			info = cached
+		} else {
+			benefitCache.byUserID[key] = info
+		}
+		benefitCache.mu.Unlock()
+	}
+
+	f.memberMaxFileSize = info.maxFileSize
+	f.memberLevelCode = info.levelCode
+	f.memberLevelName = info.levelName
+	// Logged only for the remote that ran the probe, so a sync over several
+	// remotes of one account says this once.
+	if !found && info.maxFileSize > 0 {
+		fs.Logf(f, "wopan: membership %q (vipLevel=%s): reported single-file upload size %s - files over it are warned about, not skipped",
+			info.levelName, info.levelCode, fs.SizeSuffix(info.maxFileSize))
+		fs.Debugf(f, "wopan: displayMembershipBenefit result: %s", info.raw)
+	}
+}
+
+// singleFileLimit returns the account's reported single-file upload limit in
+// bytes; 0 means nothing is known and nothing is reported. no_member_check turns
+// the probe off, and with it the notice.
+func (f *Fs) singleFileLimit() int64 {
+	if f.opt.NoMemberCheck {
+		return 0
+	}
+	return f.memberMaxFileSize
+}
+
+// oversizeNotice is the warning line for a file over the account's reported
+// single-file limit, or "" when the file fits or no limit is known.
+//
+// It warns and never blocks. Measured 2026-10-20 on the non-member account that
+// reports uploadFileSize 1024 MiB: uploads of limit+1 and of 1.2x that limit both
+// completed through the chunked path and were read back at full size. So the
+// reported number is a display of the benefit, not the ceiling rclone's chunked
+// uploads are held to - blocking on it would skip files the server accepts, which
+// is a silently smaller sync. The notice exists so that number is visible in the
+// log, and so a transfer that the *app* would refuse is still distinguishable here.
+func (f *Fs) oversizeNotice(leaf string, size int64) string {
+	limit := f.singleFileLimit()
+	if limit <= 0 || size <= limit {
+		return ""
+	}
+	return fmt.Sprintf("wopan: %s is %d bytes, over the single-file upload size the account reports (%d bytes, membership %q); uploading anyway - the chunked upload path is not held to that number",
+		leaf, size, limit, f.memberLevelName)
+}
+
+// warnOversize logs oversizeNotice when there is one. Every upload entry point
+// calls it before the first request.
+func (f *Fs) warnOversize(leaf string, size int64) {
+	if msg := f.oversizeNotice(leaf, size); msg != "" {
+		fs.Logf(f, "%s", msg)
+	}
+}
+
+// ---------------------------------------------------------- instant upload --
+
+// quickTransfer asks the openapi service to place `leaf` in dirID from content it
+// may already store, and reports whether that produced the object.
+//
+// Everything that should fall through to an ordinary upload returns hit=false with
+// no error: the feature disabled, a file below the probe floor, a source with no
+// SHA-256, a source with no modification time, a family space (the request shape
+// for spaceType 1 has not been measured), a miss, a refusal with a business code, a
+// rejected request (4xx), or two failed attempts to get an answer. The one case
+// that must not fall through is a hit whose ids are missing: uploading then would
+// store a second copy of content the service has already registered, and the
+// unreadable-answer path above exists to keep that case rare rather than to make
+// the upload cheap.
+//
+// It asks at most twice, and only when the first answer never arrived. A miss is
+// the expected answer for new content, so re-asking that would spend requests on an
+// account other programs share for nothing; an unreadable answer is different,
+// because the service may have registered the content already and re-registering
+// the same (directoryId, fileName, sha256) was measured on 2026-10-20 to leave one
+// entry, not two.
+func (f *Fs) quickTransfer(ctx context.Context, dirID, leaf string, size int64, src fs.ObjectInfo) (api.UploadData, bool, error) {
+	if !f.opt.QuickTransfer || size < quickTransferMinSize {
+		return api.UploadData{}, false, nil
+	}
+	if f.spaceType != spacePersonal {
+		// TODO: the family-space request shape is unmeasured. The family listing
+		// itself is confirmed (spaceType "1" plus familyId, and its entries carry
+		// no sha256 at all), but what quickTransfer wants for that space - whether
+		// spaceType "1" plus familyId is enough, or a different directoryId - has
+		// not been captured. Until it is, family transfers upload normally.
+		fs.Debugf(src, "wopan: rapid upload not attempted: the family-space request shape is unmeasured")
+		return api.UploadData{}, false, nil
+	}
+	// Hashing the source is the cost of this feature: for a remote source this
+	// reads it once more. Nothing else here may fail the transfer, so an
+	// unavailable hash simply means no probe.
+	sha256Hex, err := src.Hash(ctx, hash.SHA256)
+	if err != nil || sha256Hex == "" {
+		fs.Debugf(src, "wopan: rapid upload not attempted: no SHA-256 available")
+		return api.UploadData{}, false, nil
+	}
+
+	now := time.Now()
+	// The service ignores this field: measured twice on 2026-10-20, an entry
+	// created from a source dated 2019/2020 came back with ModTime equal to the
+	// registration instant, whatever was sent here. It stays set to the source's
+	// time because that is the field's meaning and the captured request fills it
+	// in; wopan cannot correct the timestamp afterwards either (Object.SetModTime
+	// is fs.ErrorCantSetModTime), which is why a hit has to say what it costs.
+	modTime := src.ModTime(ctx)
+	if modTime.IsZero() {
+		// The ordinary upload path leaves the timestamp unset for such a source
+		// (formatShootingTime returns ""), and no measured value stands in for
+		// "unknown" here, so do not guess - just upload normally.
+		fs.Debugf(src, "wopan: rapid upload not attempted: source has no modification time")
+		return api.UploadData{}, false, nil
+	}
+	body, err := json.Marshal(map[string]any{
+		"sha256":               sha256Hex,
+		"fileSize":             size,
+		"fileName":             leaf,
+		"fileType":             "5",
+		"batchNo":              now.In(api.Beijing).Format(api.TimeFormat),
+		"spaceType":            f.spaceType,
+		"directoryId":          dirID,
+		"fileModificationTime": modTime.UnixMilli(),
+	})
+	if err != nil {
+		return api.UploadData{}, false, nil
+	}
+	data, hit, inconclusive, err := f.quickTransferOnce(ctx, body, sha256Hex, leaf, size, src)
+	if err != nil {
+		return api.UploadData{}, false, err
+	}
+	if hit {
+		return data, true, nil
+	}
+	if inconclusive {
+		// The first answer could not be read, which is also the one shape in which
+		// the service may have registered the content already. Re-ask once: three
+		// registrations of the same (directoryId, fileName, sha256) were measured on
+		// 2026-10-20 to leave exactly one entry, no renamed copy and no second one,
+		// so asking again costs a request and cannot cost quota. Uploading without
+		// asking would risk two copies of the content instead.
+		fs.Debugf(src, "wopan: rapid upload answer was unreadable, asking once more")
+		data, hit, _, err := f.quickTransferOnce(ctx, body, sha256Hex, leaf, size, src)
+		if err != nil {
+			return api.UploadData{}, false, err
+		}
+		if hit {
+			return data, true, nil
+		}
+	}
+	return api.UploadData{}, false, nil
+}
+
+// quickTransferOnce sends one instant-upload offer and classifies the answer.
+//
+// inconclusive means "the service may or may not have registered the content" -
+// the request left and the answer never arrived, in any of its shapes. Every
+// other outcome is definitive: a clean miss, a refusal with a business code, or a
+// rejected request that never reached the business layer (4xx).
+func (f *Fs) quickTransferOnce(ctx context.Context, body []byte, sha256Hex, leaf string, size int64, src fs.ObjectInfo) (data api.UploadData, hit, inconclusive bool, err error) {
+	reqCtx, cancel := context.WithTimeout(ctx, quickTransferTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, quickTransferURL, bytes.NewReader(body))
+	if err != nil {
+		return api.UploadData{}, false, false, nil
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("access-token", f.tok.accessTokenNow())
+
+	res, err := f.httpClient.Do(req)
+	if err != nil {
+		fs.Debugf(src, "wopan: rapid upload probe failed: %v", err)
+		return api.UploadData{}, false, true, nil
+	}
+	defer func() { _ = res.Body.Close() }()
+	raw, err := io.ReadAll(res.Body)
+	if err != nil {
+		fs.Debugf(src, "wopan: rapid upload probe unreadable: %v", err)
+		return api.UploadData{}, false, true, nil
+	}
+	if res.StatusCode == http.StatusRequestTimeout || res.StatusCode >= http.StatusInternalServerError {
+		fs.Debugf(src, "wopan: rapid upload probe http %s: %s", res.Status, truncate(string(raw), 200))
+		return api.UploadData{}, false, true, nil
+	}
+	if res.StatusCode != http.StatusOK {
+		fs.Debugf(src, "wopan: rapid upload probe http %s, uploading normally: %s", res.Status, truncate(string(raw), 200))
+		return api.UploadData{}, false, false, nil
+	}
+	var env api.QuickTransferResponse
+	if err := json.Unmarshal(raw, &env); err != nil {
+		fs.Debugf(src, "wopan: rapid upload probe undecodable, uploading normally: %s", truncate(string(raw), 200))
+		return api.UploadData{}, false, true, nil
+	}
+	// One answer line per probe on the Fs, the way yun139 reports its rapid
+	// answer, so both backends can be grepped for "rapid" to see what each file did.
+	fs.Debugf(f, "wopan: rapid upload answered code=%q hasFile=%q fid=%q", env.Meta.Code, string(env.Result.HasFile), string(env.Result.Fid))
+	if env.Meta.Code != quickTransferSuccessCode {
+		fs.Debugf(src, "wopan: rapid upload probe meta.code=%s message=%s, uploading normally", env.Meta.Code, env.Meta.Message)
+		return api.UploadData{}, false, false, nil
+	}
+	if string(env.Result.HasFile) != "1" && string(env.Result.HasFile) != "true" {
+		fs.Debugf(src, "wopan: rapid upload miss (sha256 %s not stored), uploading normally", sha256Hex)
+		return api.UploadData{}, false, false, nil
+	}
+	data = api.UploadData{
+		Fid:         string(env.Result.Fid),
+		FileVersion: env.Result.FileVersion,
+		WcFileID:    string(env.Result.WcFileID),
+	}
+	if data.Fid == "" {
+		data.Fid = string(env.Result.FileID)
+	}
+	if data.Fid == "" || data.WcFileID == "" {
+		// The service registered the object but we cannot name it. Uploading now
+		// would duplicate it, so stop with what the response actually said.
+		return api.UploadData{}, false, false, fmt.Errorf("wopan: rapid upload reported a hit for %q without a usable id (response %s)", leaf, truncate(string(raw), 200))
+	}
+	fs.Logf(src, "wopan: rapid upload hit - %v already stored under this SHA-256, no bytes uploaded; the service stamps the entry with the current time and wopan cannot set a modification time afterwards, so a later copy or sync re-registers it unless --size-only is used", fs.SizeSuffix(size))
+	return data, true, false, nil
+}
+
+// uploadOrQuickTransfer places a whole file in dirID under leaf, asking the
+// instant-upload service first and otherwise doing the normal upload. Put and
+// Object.Update both go through here so the probe has one entry point.
+func (f *Fs) uploadOrQuickTransfer(ctx context.Context, in io.Reader, dirID, leaf string, size int64, src fs.ObjectInfo) (api.UploadData, error) {
+	data, hit, err := f.quickTransfer(ctx, dirID, leaf, size, src)
+	if err != nil {
+		return api.UploadData{}, err
+	}
+	if hit {
+		return data, nil
+	}
+	return f.uploadSingle(ctx, in, dirID, leaf, size, src)
+}
+
+// transferredChunkWriter stands in for a chunked transfer the instant-upload
+// probe has already completed: the chunks are acknowledged without being read and
+// Close writes nothing. The multi-thread engine re-reads the destination with
+// NewObject after Close(), which is exactly what a hit has just produced.
+type transferredChunkWriter struct{}
+
+// WriteChunk acknowledges a chunk without consuming it - the content is already
+// stored. It reports 0 bytes because nothing was transferred by this call.
+func (transferredChunkWriter) WriteChunk(_ context.Context, _ int, _ io.ReadSeeker) (int64, error) {
+	return 0, nil
+}
+
+// Abort and Close have nothing to undo or finalise.
+func (transferredChunkWriter) Abort(_ context.Context) error { return nil }
+
+// Close completes the transfer.
+func (transferredChunkWriter) Close(_ context.Context) error { return nil }
+
+var _ fs.ChunkWriter = transferredChunkWriter{}
+
 // ------------------------------------------------------------ Fs -----------
 
 // Name of the remote (as passed into NewFs)
@@ -1193,6 +1723,25 @@ func newHTTPClient(ctx context.Context, opt *Options) *http.Client {
 	})
 }
 
+// wopanFeatures is the feature set every wopan remote runs with.
+//
+// It is a function rather than a literal inside newFs so the unit tests build the
+// same Fs the transfer engine sees, and so that the absence of one particular flag
+// stays written down. ChunkWriterDoesntSeek would let multi-thread copies stream
+// each part instead of buffering it - which is what the instant-upload hit wants,
+// since its writer reads nothing - but fstests failed 19 times with "object not
+// found" with it on (2026-10-20, runs 3 and 4, run alone on the account, green
+// without it): buffering is also what protects a source whose Open does not honour
+// the byte range. The hit path is made cheap without the flag, by never enlarging
+// the chunk beyond the configured chunk size.
+func wopanFeatures(ctx context.Context, f *Fs) *fs.Features {
+	return (&fs.Features{
+		CaseInsensitive:         true,
+		CanHaveEmptyDirectories: true,
+		SlowHash:                true,
+	}).Fill(ctx, f)
+}
+
 // newFs partially constructs Fs from the path
 //
 // It constructs a valid Fs but doesn't attempt to figure out whether
@@ -1223,11 +1772,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		f.spaceType = spaceFamily
 	}
 	f.pacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
-	f.features = (&fs.Features{
-		CaseInsensitive:         true,
-		CanHaveEmptyDirectories: true,
-		SlowHash:                true,
-	}).Fill(ctx, f)
+	f.features = wopanFeatures(ctx, f)
 
 	// The wohome AES key is accessToken[:aesKeyLen], so a shorter token would
 	// panic on every encrypted request.
@@ -1271,6 +1816,10 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 	}
 	f.userID = userID
 	f.tok = f.tokenState()
+
+	// Learn the account's reported single-file upload size once per process
+	// (fail-open) so it is in the log before any upload starts.
+	f.probeAndCacheMembershipBenefit(ctx)
 
 	return f, nil
 }
@@ -1819,6 +2368,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if size == 0 {
 		return fs.ErrorCantUploadEmptyFiles
 	}
+	o.fs.warnOversize(o.remote, size)
 	leaf, dirID, err := o.fs.dirCache.FindPath(ctx, o.remote, true)
 	if err != nil {
 		return err
@@ -1855,7 +2405,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	// which are not visible as a file; a single-part upload whose response was
 	// lost can leave a temp file behind, which costs quota and is removable
 	// with --include "*rclone-tmp-*".
-	tmpData, err := o.fs.uploadSingle(ctx, in, dirID, tempLeaf, size, src)
+	tmpData, err := o.fs.uploadOrQuickTransfer(ctx, in, dirID, tempLeaf, size, src)
 	if err != nil {
 		return err
 	}
@@ -1982,6 +2532,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		// Return the bare sentinel: fstests compares it with ==.
 		return nil, fs.ErrorCantUploadEmptyFiles
 	}
+	f.warnOversize(src.Remote(), size)
 	if err := f.validateName(src.Remote()); err != nil {
 		return nil, err
 	}
@@ -1997,7 +2548,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		return nil, err
 	}
 
-	data, err := f.uploadSingle(ctx, in, dirID, leaf, size, src)
+	data, err := f.uploadOrQuickTransfer(ctx, in, dirID, leaf, size, src)
 	if err != nil {
 		return nil, err
 	}
@@ -2453,6 +3004,9 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	if size == 0 {
 		return info, nil, fs.ErrorCantUploadEmptyFiles
 	}
+	// The multi-thread copy engine starts reading the source before Close() runs,
+	// so the over-limit notice belongs here, where the size is first known.
+	f.warnOversize(remote, size)
 	if err := f.validateName(remote); err != nil {
 		return info, nil, err
 	}
@@ -2466,6 +3020,24 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	// actually sent.
 	if err := validateName(leaf); err != nil {
 		return info, nil, err
+	}
+	// A big file is what the instant-upload probe is worth most, and this is the
+	// last point where the transfer can still be avoided: the engine opens the
+	// source only after OpenChunkWriter returns.
+	if _, hit, qerr := f.quickTransfer(ctx, dirID, leaf, size, src); qerr != nil {
+		return info, nil, qerr
+	} else if hit {
+		// Keep the configured chunk size and one worker. The writer reads nothing,
+		// so the engine's only cost is walking the file; advertising the whole file
+		// as one chunk instead makes the engine reserve that many bytes in a single
+		// pooled buffer, and lib/pool waits for memory without ever giving up, so a
+		// --max-buffer-memory below the file size would hang a transfer of no bytes.
+		hitChunk := int64(f.opt.ChunkSize)
+		if size < hitChunk {
+			hitChunk = size
+		}
+		info = fs.ChunkWriterInfo{ChunkSize: hitChunk, Concurrency: 1}
+		return info, transferredChunkWriter{}, nil
 	}
 	zoneURL, fiEnc, _, uniqueID, token, err := f.newUploadSession(ctx, dirID, leaf, size, src)
 	if err != nil {
@@ -2815,6 +3387,13 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	}
 	obj, err := f.NewObject(ctx, remote)
 	if err != nil {
+		if errors.Is(err, fs.ErrorIsDir) {
+			// The trailing-slash test above only catches `dir/`. fstests hands
+			// over `dir`, and found this in the run of 2026-10-20: the lookup came
+			// back "is a directory not a file", which reads as a broken path rather
+			// than as "this drive cannot share a directory".
+			return "", fs.ErrorCantShareDirectories
+		}
 		return "", err
 	}
 	return obj.(*Object).downloadURL(ctx)
@@ -3287,6 +3866,10 @@ func sameDir(srcObj *Object, dstRoot, dstRemote string) bool {
 // destination listing is re-scanned to find it (with a name/age/id filter that
 // can never mistake a pre-existing same-name file for the copy), and a rename
 // follows when the requested leaf differs.
+//
+// The membership single-file upload size is deliberately not reported here: a
+// server-side copy transfers no bytes, and a copy rclone cannot do this way falls
+// back to Put, which does report it.
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (dst fs.Object, err error) {
 	srcObj, ok := src.(*Object)
 	if !ok {
