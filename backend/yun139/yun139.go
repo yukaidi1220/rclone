@@ -96,9 +96,16 @@ const (
 const (
 	spacePersonal = "personal"
 	spaceFamily   = "family"
+	spaceGroup    = "group"
 )
 
 // svcType values for the x-SvcType header: 1 = personal, 2 = family.
+//
+// A shared group is addressed with the same family-space request shape on
+// the same host, so group reuses svcTypeFamily. The value only reaches the
+// wire through pcHeaders, which pins x-yun-svc-type itself; it is kept in
+// sync so a future reader does not have to re-derive which space a token is
+// pointed at.
 const (
 	svcTypePersonal = "1"
 	svcTypeFamily   = "2"
@@ -111,6 +118,7 @@ type Options struct {
 	Authorization     string               `config:"authorization"` // base64("pc:account:token")
 	Space             string               `config:"space"`
 	FamilyID          string               `config:"family_id"`
+	GroupID           string               `config:"group_id"`
 	RootFolderID      string               `config:"root_folder_id"`
 	UserDomainID      string               `config:"user_domain_id"` // <user-domain-id>-style id, optional
 	HardDelete        bool                 `config:"hard_delete"`
@@ -163,6 +171,9 @@ func init() {
 			}, {
 				Value: spaceFamily,
 				Help:  "Family cloud (新家庭云)",
+			}, {
+				Value: spaceGroup,
+				Help:  "Shared group (共享群)",
 			}},
 		}, {
 			Name: "family_id",
@@ -170,6 +181,14 @@ func init() {
 				"A numeric id, e.g. 1303251918616070593. With exactly one family cloud it may be left " +
 				"blank and is auto-discovered; with several it must be set, and the backend refuses to " +
 				"guess. Family names can repeat, so only the id selects unambiguously.",
+			Advanced: true,
+		}, {
+			Name: "group_id",
+			Help: "Shared group ID (required when space is group).\n\n" +
+				"A numeric id, e.g. 1234567890123456789. With exactly one group it may be left blank " +
+				"and is auto-discovered; with several it must be set, and the backend refuses to " +
+				"guess. A group id is not a family cloud id: pointing space=group at a family cloud id " +
+				"fails in the server's own words as an internal error, not as \"not a group\".",
 			Advanced: true,
 		}, {
 			Name:      "root_folder_id",
@@ -268,12 +287,33 @@ func shouldRetry(ctx context.Context, err error) (bool, error) {
 	if ctx.Err() != nil {
 		return false, ctx.Err()
 	}
-	// Business errors (API rejections) are never retryable; transport errors are.
+	// Business errors (API rejections) are never retryable; transport errors
+	// are - except the codes in transientAPICodes.
 	var ae *apiError
 	if errors.As(err, &ae) {
+		if transientAPICodes[ae.Code] {
+			return true, err
+		}
 		return false, err
 	}
 	return true, err
+}
+
+// transientAPICodes are business errors the 139 API answers for a request that
+// succeeds when repeated, so they go through the pacer instead of ending the
+// run.
+//
+// '02010002: 调用外部系统异常' was seen once while listing a deeply nested
+// group directory; listing that same directory twice afterwards succeeded
+// (2026-10-19), so treating it as terminal turns a server-side hiccup into a
+// failed walk of a tree tens of thousands of objects deep.
+//
+// Deliberately absent: '1809112500: 系统内部错误', which is what the server
+// answers when a shared-group id is sent to the family adapter (or the other
+// way round). That is a misconfiguration, and retrying it only burns pacer
+// attempts on a call that can never succeed.
+var transientAPICodes = map[string]bool{
+	"02010002": true,
 }
 
 // apiError is a business error returned by the 139 API.
@@ -485,6 +525,20 @@ func errTooLarge(leaf string, size, limit int64, level string) error {
 // can make the request succeed; retrying only turns a full account into a storm
 // of identical failures. Unlike the member single-file limit, exhaustion can be
 // reported by any call, so this applies to the control plane too.
+// FIXME: a full shared group is unrecognised here. spaceQuotaErrorCode is the
+// personal space's answer, and neither shared adapter has ever been observed
+// returning it. A group that has run out of room therefore surfaces as an
+// ordinary business error, which fails the transfer (business errors are not
+// retried) but carries no "no space left" wording, so a caller cannot tell
+// "stop retrying, this will never fit" from a transient rejection.
+//
+// How to collect the code without deliberately filling a group: every business
+// failure already prints `yun139: API error <code>: <message>` (see apiError)
+// and the migration CI tees its copy log, so after a run that ran out of room,
+//
+//	grep -o 'yun139: API error [0-9]*' copy.log | sort | uniq -c
+//
+// gives the histogram to add here.
 func noSpaceError(err error) error {
 	if err == nil || fserrors.IsNoRetryError(err) {
 		return err
@@ -647,7 +701,7 @@ type Fs struct {
 	// lock-copy-free.
 	srvPathOf *srvPathCache
 
-	space   string // spacePersonal or spaceFamily
+	space   string // spacePersonal, spaceFamily or spaceGroup
 	svcType string // svcTypePersonal or svcTypeFamily
 
 	tokMu   *sync.Mutex // guards authorization + account (pointer so NewFs's tempF copy stays lock-safe)
@@ -660,6 +714,9 @@ type Fs struct {
 
 	familyRootMu *sync.Mutex
 	familyRootID string // server-side root catalog ID of the family cloud
+
+	groupRootMu *sync.Mutex
+	groupRootID string // server-side root catalog ID of the shared group
 
 	userDomainID string // <user-domain-id>-style domain id, learned from queryFamilyCloud
 
@@ -745,12 +802,24 @@ func (f *Fs) accessToken() string {
 // number is never accepted by the refresh endpoint, so this is the only
 // reliable source for the userId a refresh must send.
 func (f *Fs) discoverUserDomainID(ctx context.Context) (string, error) {
-	_, uid, err := f.queryFamilyCloud(ctx)
+	uid := ""
+	_, familyUID, err := f.queryFamilyCloud(ctx)
 	if err != nil {
 		return "", err
 	}
+	uid = familyUID
 	if uid == "" {
-		return "", errors.New("yun139: queryFamilyCloud returned no accountUserId")
+		// No family cloud to learn from: an account that only shares in
+		// groups answers queryFamilyCloud with an empty list (verified
+		// 2026-10-19), and queryGroupV2 carries the same id.
+		_, groupUID, gerr := f.queryGroup(ctx)
+		if gerr != nil {
+			return "", gerr
+		}
+		uid = groupUID
+	}
+	if uid == "" {
+		return "", errors.New("yun139: neither queryFamilyCloud nor queryGroupV2 returned an accountUserId")
 	}
 	f.userDomainID = uid
 	f.opt.UserDomainID = uid
@@ -1019,6 +1088,55 @@ func pcHeadersFull(auth, account, deviceID string) map[string]string {
 	}
 }
 
+// groupHeaders returns the header set the 139 PC client uses for a shared
+// group, split the way the client splits it (captured 2026-10-19):
+//
+//   - /hcy/mutual/adapter/isbo/openApi/* are issued by the Electron main
+//     process, so they carry the full browser-like set (app_cp, cp_version,
+//     mCloud UA, x-ExpRoute-Code, x-yun-svc-type: 1) plus x-yun-uni.
+//   - /hcy/group/dynamic/* (upload, complete) and getGroupFileDownLoadURLV2 come
+//     from the native module: short UA, x-DeviceInfo, x-huawei-channelSrc, and on
+//     the download call x-MM-Source, x-deviceID and x-yun-svc-type: 2.
+//
+// x-yun-uni is the 19-digit user domain id and appears on every captured group
+// request. It is empty until NewFs has learned it, and an empty value is sent
+// as an empty header rather than guessed at: the server tolerates it (the
+// family adapter never sends it), and inventing one would be worse than none.
+func (f *Fs) groupHeaders(p, ts, randStr, sign string) map[string]string {
+	if strings.HasSuffix(p, "/getGroupFileDownLoadURLV2") || strings.Contains(p, "/hcy/group/dynamic/") {
+		// Native module: short UA, x-DeviceInfo, x-huawei-channelSrc, and on the
+		// download-signing call x-MM-Source, x-deviceID, x-yun-svc-type: 2.
+		//
+		// x-yun-url-type: 3 belongs to this set and is the switch that makes the
+		// signed link come back on an *.eos.yun.139.com host rather than a bare
+		// cmecloud EOS host (measured both ways on 2026-10-19: without it the
+		// link is ykj-eos-wx2-01.eos-wuxi-3.cmecloud.cn, with it
+		// ykj-eos-*.eos.yun.139.com). Dropping it is not cosmetic - the direct
+		// link gateway's rules key on the host.
+		h := pcHeaders(f.accessToken(), f.account, ts, randStr, sign, f.svcType)
+		h["x-DeviceInfo"] = f.deviceInfoHeader()
+		h["x-huawei-channelSrc"] = pcAppChannel
+		h["x-yun-url-type"] = "3"
+		h["x-yun-uni"] = f.userDomainID
+		if strings.HasSuffix(p, "/getGroupFileDownLoadURLV2") {
+			h["x-MM-Source"] = "001"
+			h["x-deviceID"] = strings.ToUpper(md5hex(f.account))
+			h["x-yun-svc-type"] = "2"
+			h["Accept"] = "text/html, image/gif, image/jpeg, *; q=.2, */*; q=.2"
+		}
+		return h
+	}
+	// Electron main process: the isbo/openApi metadata calls.
+	//
+	// batchTrash and task/get are the exception to this split - they live under
+	// /hcy/group/dynamic/ so they take the native set above, while the capture
+	// saw them issued from the browser with the set below. Both variants are
+	// accepted by the server (verified 2026-10-19).
+	h := pcHeadersFull(f.accessToken(), f.account, md5hex(f.account)+"-ENDIN")
+	h["x-yun-uni"] = f.userDomainID
+	return h
+}
+
 // md5hex returns the lower-case hex MD5 of s. Used to derive a stable
 // x-yun-device-id from the account name.
 func md5hex(s string) string {
@@ -1079,7 +1197,13 @@ func (f *Fs) call(ctx context.Context, url string, body any, out any) error {
 
 	var headers map[string]string
 	host := strings.SplitN(url, "/", 4)[2]
-	if host == "group.yun.139.com" {
+	if host == "group.yun.139.com" && f.space == spaceGroup {
+		// Shared group: the official client sends two different header sets on
+		// this host (Electron main process for the isbo adapter, native module
+		// for the dynamic/upload/download endpoints), so match them per call.
+		p := strings.SplitN(url, "?", 2)[0]
+		headers = f.groupHeaders(p, ts, randStr, sign)
+	} else if host == "group.yun.139.com" {
 		// Family space: lean header set, short UA, x-yun-url-type:3 on
 		// every call (captured 2026-09-03, family cloud).
 		headers = pcHeaders(auth, f.account, ts, randStr, sign, f.svcType)
@@ -1363,6 +1487,491 @@ func (f *Fs) resolveFamilyID(ctx context.Context) error {
 	return nil
 }
 
+// ------------------------------------------------------- shared group -----
+
+// groupCall issues one shared-group request. Groups live on the same host as
+// family clouds and are served the same header set, so this differs from
+// familyCall only in namespace: group metadata sits under
+// /hcy/mutual/adapter/isbo/openApi, family metadata under
+// /hcy/family/adapter/andAlbum/openApi.
+func (f *Fs) groupCall(ctx context.Context, pathname string, body any, out any) error {
+	return f.call(ctx, api.FamilyBaseURL+pathname, body, out)
+}
+
+// groupAccountInfo returns the account envelope the isbo adapter accepts.
+//
+// Unlike the family adapter, which wants commonAccountInfo and works with an
+// empty userDomainId, the group adapter is keyed on accountName = the phone
+// number, and the calls that need the 19-digit domain id (tasks, complete,
+// trash) carry it as a top-level accountUserId instead.
+func (f *Fs) groupAccountInfo() map[string]any {
+	return map[string]any{"accountName": f.account, "accountType": 1}
+}
+
+// groupListBody builds a queryGroupContentListV2 request for one directory.
+//
+// Paging is a closed ordinal window (startNumber..endNumber), not the
+// pageNum/pageSize pair the family adapter takes. dirType 7, catalogType 0
+// and businessType 1 are the values the PC client sends for a normal group
+// folder view; filterType must stay 0 or the server drops the files and only
+// answers with folders.
+func (f *Fs) groupListBody(catalogID, dirPath string, start, end int) map[string]any {
+	return map[string]any{
+		"dirType":         7,
+		"catalogID":       catalogID,
+		"groupID":         f.opt.GroupID,
+		"path":            dirPath,
+		"accountInfo":     f.groupAccountInfo(),
+		"startNumber":     start,
+		"endNumber":       end,
+		"catalogSortType": 0,
+		"contentSortType": 0,
+		"sortDirection":   1,
+		"catalogType":     0,
+		"businessType":    1,
+		"filterType":      0,
+	}
+}
+
+// queryGroup returns the user's shared-group list from
+// POST /hcy/mutual/adapter/isbo/openApi/queryGroupV2, plus the 19-digit user
+// id the first entry carries.
+//
+// The client asks for the whole list in one page; groupList is empty when the
+// account shares in no group, which is a real answer rather than a token
+// problem (the same call with a family-only account returns an empty list
+// here and a full familyCloudList from queryFamilyCloud).
+func (f *Fs) queryGroup(ctx context.Context) ([]api.Group, string, error) {
+	body := map[string]any{
+		"accountInfo": f.groupAccountInfo(),
+		"pageParameter": map[string]any{
+			"isReturnTotal": "1",
+			"pageNum":       1,
+			"pageSize":      10000,
+		},
+	}
+	var resp struct {
+		GroupList []api.Group `json:"groupList"`
+	}
+	if err := f.groupCall(ctx, "/hcy/mutual/adapter/isbo/openApi/queryGroupV2", body, &resp); err != nil {
+		return nil, "", fmt.Errorf("yun139: queryGroupV2: %w", err)
+	}
+	userID := ""
+	for _, g := range resp.GroupList {
+		if g.AccountInfo.UserID != "" {
+			userID = g.AccountInfo.UserID
+			break
+		}
+	}
+	return resp.GroupList, userID, nil
+}
+
+// resolveGroupID ensures f.opt.GroupID is set, auto-discovering it from
+// queryGroup when the user did not configure group_id.
+//
+// It is called once at NewFs time (freezing GroupID before any operation can
+// race on it) and again inside groupRoot, which keeps the lock held so the
+// write can never race with a reader.
+func (f *Fs) resolveGroupID(ctx context.Context) error {
+	if f.opt.GroupID != "" {
+		return nil
+	}
+	groups, _, err := f.queryGroup(ctx)
+	if err != nil {
+		return err
+	}
+	switch len(groups) {
+	case 0:
+		return errors.New("yun139: account belongs to no shared group; create or join one in the 139 client first")
+	case 1:
+		f.opt.GroupID = groups[0].GroupID
+	default:
+		// Group names repeat freely (they are set by whoever created
+		// the group), so only the id selects unambiguously.
+		ids := make([]string, 0, len(groups))
+		for _, g := range groups {
+			ids = append(ids, fmt.Sprintf("%s (%s)", g.GroupID, g.GroupName))
+		}
+		return fmt.Errorf("yun139: account belongs to %d shared groups: %s; set --yun139-group-id to the one you want", len(groups), strings.Join(ids, ", "))
+	}
+	return nil
+}
+
+// groupRoot discovers the server-side root catalog ID of the shared group.
+//
+// A group root has no empty-path form: the client addresses it with
+// catalogID = the numeric group id and path = the fixed mount prefix plus
+// that id, and the response's parentCatalogID names the opaque root catalog
+// every child hangs under. That catalog id, not the group id, is what the
+// dircache stores as the root.
+func (f *Fs) groupRoot(ctx context.Context) (string, error) {
+	f.groupRootMu.Lock()
+	defer f.groupRootMu.Unlock()
+	if f.groupRootID != "" {
+		return f.groupRootID, nil
+	}
+	if err := f.resolveGroupID(ctx); err != nil {
+		return "", err
+	}
+	var resp struct {
+		GetGroupContentResult struct {
+			ParentCatalogID string `json:"parentCatalogID"`
+		} `json:"getGroupContentResult"`
+	}
+	body := f.groupListBody(f.opt.GroupID, api.GroupRootPathPrefix+"/"+f.opt.GroupID, 1, 1)
+	if err := f.groupCall(ctx, "/hcy/mutual/adapter/isbo/openApi/queryGroupContentListV2", body, &resp); err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(resp.GetGroupContentResult.ParentCatalogID)
+	if id == "" {
+		return "", errors.New("yun139: group root response carried no parentCatalogID")
+	}
+	f.groupRootID = id
+	// Children are addressed as "root:/<parent path>/<child id>", so the
+	// root's own server path is what every first-level listing must build
+	// from. Cache it here rather than re-deriving it per call.
+	f.srvPathOf.put(id, "root:/"+id)
+	return id, nil
+}
+
+// groupSrvPath returns the server path ("root:/...") of the directory dirID,
+// or "" when it has not been learned from a listing yet.
+func (f *Fs) groupSrvPath(dirID string) string {
+	rootID, err := f.groupRoot(context.Background())
+	if err != nil || rootID == "" {
+		return ""
+	}
+	if dirID == rootID {
+		return "root:/" + rootID
+	}
+	p, ok := f.srvPathOf.get(dirID) // cached from listGroup
+	if ok {
+		return p
+	}
+	// The parent is not derivable from an id alone; the caller has to list
+	// the parent directory first, which is what fills srvPathOf.
+	return ""
+}
+
+// listGroup lists the entries of a shared-group directory.
+//
+// One request returns folders and files together, so a walk costs one call
+// per directory. The server labels each entry with its own "root:/..." path,
+// which is why the backend can descend without guessing at the addressing.
+func (f *Fs) listGroup(ctx context.Context, dirID string, fn func(listEntry) bool) error {
+	rootID, err := f.groupRoot(ctx)
+	if err != nil {
+		return err
+	}
+	// The group root is addressed by the numeric group id under the fixed
+	// mount path; any other directory by its catalog id and the server
+	// path learned from the parent's listing.
+	catalogID, reqPath := dirID, f.groupSrvPath(dirID)
+	if dirID == rootID {
+		catalogID = f.opt.GroupID
+		reqPath = api.GroupRootPathPrefix + "/" + f.opt.GroupID
+	} else if reqPath == "" {
+		return fmt.Errorf("yun139: server path of group directory %s is not known; list its parent first", dirID)
+	}
+	dirPath := f.srvPathOfDirPath(dirID, rootID)
+	start := 1
+	seen := 0 // raw entries returned so far, across all pages of this listing
+	for page := 0; page < maxListPages; page++ {
+		end := start + listPageSize - 1
+		var resp struct {
+			GetGroupContentResult struct {
+				NodeCount       int    `json:"nodeCount"`
+				CtlgCnt         int    `json:"ctlgCnt"`
+				ContCnt         int    `json:"contCnt"`
+				IsCtlgCompleted int    `json:"isCtlgCompleted"`
+				IsCntCompleted  int    `json:"isCntCompleted"`
+				ParentCatalogID string `json:"parentCatalogID"`
+				CatalogList     []struct {
+					CatalogID   string `json:"catalogID"`
+					CatalogName string `json:"catalogName"`
+					UpdateTime  string `json:"updateTime"`
+					Path        string `json:"path"`
+					Tombstoned  int    `json:"tombstoned"`
+					Moved       int    `json:"moved"`
+				} `json:"catalogList"`
+				ContentList []struct {
+					ContentID   string `json:"contentID"`
+					ContentName string `json:"contentName"`
+					ContentSize int64  `json:"contentSize"`
+					UpdateTime  string `json:"updateTime"`
+					Tombstoned  int    `json:"tombstoned"`
+					Moved       int    `json:"moved"`
+				} `json:"contentList"`
+			} `json:"getGroupContentResult"`
+		}
+		err := f.pacer.Call(func() (bool, error) {
+			err := f.groupCall(ctx, "/hcy/mutual/adapter/isbo/openApi/queryGroupContentListV2", f.groupListBody(catalogID, reqPath, start, end), &resp)
+			return shouldRetry(ctx, err)
+		})
+		if err != nil {
+			return err
+		}
+		r := &resp.GetGroupContentResult
+		// Structural check: a child listing must answer as the directory we
+		// asked about. If it ever answers with a different parent, the
+		// catalogID/path pairing is wrong and the entries belong to some other
+		// directory - better to stop here than to walk (and later delete) a
+		// tree we mis-identified. The group root is excluded because it is
+		// addressed by the numeric group id while the reply names its catalog.
+		if dirID != rootID && r.ParentCatalogID != "" && !strings.EqualFold(r.ParentCatalogID, dirID) {
+			return fmt.Errorf("yun139: group listing of %s came back as the contents of %s", dirID, r.ParentCatalogID)
+		}
+		n := 0
+		for i := range r.CatalogList {
+			c := &r.CatalogList[i]
+			if c.CatalogID == "" {
+				continue
+			}
+			n++
+			// A trashed entry can keep showing in a listing until the
+			// delete task settles; only the flags say so.
+			if c.Tombstoned != 0 || c.Moved != 0 {
+				continue
+			}
+			modTime, _ := api.ParseTime(c.UpdateTime)
+			childPath := c.Path
+			if childPath == "" {
+				childPath = path.Join(dirPath, c.CatalogID)
+			}
+			f.srvPathOf.put(c.CatalogID, childPath)
+			entry := listEntry{
+				id:      c.CatalogID,
+				name:    f.opt.Enc.ToStandardName(c.CatalogName),
+				isDir:   true,
+				modTime: modTime,
+				srvPath: childPath,
+			}
+			if fn(entry) {
+				return nil
+			}
+		}
+		for i := range r.ContentList {
+			c := &r.ContentList[i]
+			if c.ContentID == "" {
+				continue
+			}
+			n++
+			if c.Tombstoned != 0 || c.Moved != 0 {
+				continue
+			}
+			modTime, _ := api.ParseTime(c.UpdateTime)
+			entry := listEntry{
+				id:      c.ContentID,
+				name:    f.opt.Enc.ToStandardName(c.ContentName),
+				size:    c.ContentSize,
+				isDir:   false,
+				modTime: modTime,
+				srvPath: dirPath,
+			}
+			if fn(entry) {
+				return nil
+			}
+		}
+		seen += n
+		// A short window ends the listing. This is the only termination signal
+		// that can be trusted: the isCtlgCompleted/isCntCompleted flags have
+		// been seen 0 for a genuinely complete empty directory (2026-10-19),
+		// and nodeCount is not a settled total either - a directory was
+		// captured with nodeCount=3 while only 2 entries were listable, in the
+		// window right after a delete. Paging on nodeCount would either skip
+		// the ordinals this short page did not return or spin to the page cap,
+		// so it is observed and reported instead of acted on.
+		if n < end-start+1 {
+			if r.NodeCount > seen {
+				fs.Debugf(f, "yun139: group directory %s: stopped after %d entries but nodeCount said %d (delete-consistency window?)", dirID, seen, r.NodeCount)
+			}
+			return nil
+		}
+		start = end + 1
+	}
+	return fmt.Errorf("yun139: group listing of %s did not terminate after %d pages", dirID, maxListPages)
+}
+
+// srvPathOfDirPath returns the server path of dirID as it must appear as the
+// parent of its children. groupRoot caches the root's own path, so the root
+// needs no special case here beyond the fallback for an uncached id.
+func (f *Fs) srvPathOfDirPath(dirID, rootID string) string {
+	if p, ok := f.srvPathOf.get(dirID); ok {
+		return p
+	}
+	if dirID == rootID {
+		return "root:/" + rootID
+	}
+	return ""
+}
+
+// groupMkdir creates a directory inside a shared group.
+//
+// POST .../createGroupCatalog takes the parent as parentCatalogID plus the
+// parent's server path, and answers with the new catalogID. The group root is
+// addressed the same way a listing addresses it: parentCatalogID is the
+// numeric group id and path is the fixed mount prefix, not "root:/...".
+func (f *Fs) groupMkdir(ctx context.Context, parentID, leaf string) (string, error) {
+	rootID, err := f.groupRoot(ctx)
+	if err != nil {
+		return "", err
+	}
+	parentCatalogID, parentPath := parentID, f.groupSrvPath(parentID)
+	if parentID == rootID {
+		parentCatalogID = f.opt.GroupID
+		parentPath = api.GroupRootPathPrefix + "/" + f.opt.GroupID
+	} else if parentPath == "" {
+		return "", fmt.Errorf("yun139: server path of group directory %s is not known; list its parent first", parentID)
+	}
+	var resp struct {
+		CatalogID string `json:"catalogID"`
+	}
+	body := map[string]any{
+		"catalogName":     leaf,
+		"parentCatalogID": parentCatalogID,
+		"path":            parentPath,
+		"groupID":         f.opt.GroupID,
+		"manualRename":    0,
+		"accountInfo":     f.groupAccountInfo(),
+	}
+	err = f.pacer.Call(func() (bool, error) {
+		return shouldRetry(ctx, f.groupCall(ctx, "/hcy/mutual/adapter/isbo/openApi/createGroupCatalog", body, &resp))
+	})
+	if err != nil {
+		return "", err
+	}
+	if resp.CatalogID == "" {
+		return "", errors.New("yun139: createGroupCatalog returned no catalogID")
+	}
+	// Cache the child path so the new directory is listable without
+	// re-listing the parent.
+	f.srvPathOf.put(resp.CatalogID, path.Join(f.srvPathOfDirPath(parentID, rootID), resp.CatalogID))
+	return resp.CatalogID, nil
+}
+
+// groupTaskPoll waits for a group-side async task (trash, and the move task
+// once it is wired) to leave the running state.
+//
+// The group task endpoint reports the same triple the batch task does:
+// taskStatus 2 = finished, taskResultCode 1 = success, progress 100.
+func (f *Fs) groupTaskPoll(ctx context.Context, taskID string) error {
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		var out struct {
+			TaskStatus     int  `json:"taskStatus"`
+			TaskResultCode *int `json:"taskResultCode"`
+		}
+		body := map[string]any{
+			"taskId":        taskID,
+			"groupId":       f.opt.GroupID,
+			"accountUserId": f.userDomainID,
+		}
+		err := f.pacer.Call(func() (bool, error) {
+			err := f.groupCall(ctx, "/hcy/group/dynamic/task/get", body, &out)
+			return shouldRetry(ctx, err)
+		})
+		if err != nil {
+			return fmt.Errorf("yun139: poll group task: %w", err)
+		}
+		switch out.TaskStatus {
+		case 0, 1:
+			// created / running
+		case 2:
+			if out.TaskResultCode != nil && *out.TaskResultCode == 1 {
+				return nil
+			}
+			return fmt.Errorf("yun139: group task %s finished with result code %v", taskID, out.TaskResultCode)
+		case 3:
+			return fmt.Errorf("yun139: group task %s failed", taskID)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("yun139: group task %s did not finish in 60s", taskID)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// groupTrash moves one entry to the group recycle bin.
+//
+// Deleting is asynchronous. It goes to the group recycle bin, which really does
+// exist - the PC client shows it and restores from it - but whose API is not
+// known, so from rclone the bin can be neither listed nor emptied and a deleted
+// entry is only recoverable by hand in the client or by re-uploading from the
+// source. hard_delete does not apply here.
+//
+// Both entries and directories go through it: trashing a three-level tree
+// (files plus the two parent catalogs) and re-listing the root left nothing
+// behind (verified 2026-10-19 against a live group).
+func (f *Fs) groupTrash(ctx context.Context, id string) error {
+	var out struct {
+		TaskID string `json:"taskId"`
+	}
+	body := map[string]any{
+		"accountUserId": f.userDomainID,
+		"groupId":       f.opt.GroupID,
+		"fileIdList":    []string{id},
+	}
+	err := f.pacer.Call(func() (bool, error) {
+		err := f.groupCall(ctx, "/hcy/group/dynamic/recyclebin/batchTrash", body, &out)
+		return shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return err
+	}
+	if out.TaskID == "" {
+		// batchTrash always answers with a taskId (captured 2026-10-19). A
+		// success reply carrying none means the server accepted the call but
+		// scheduled no delete, so treating it as success would let Rmdir,
+		// Purge and Remove report a deletion that never happened.
+		return errors.New("yun139: group batchTrash returned no taskId")
+	}
+	return f.groupTaskPoll(ctx, out.TaskID)
+}
+
+// groupRename renames a group entry.
+//
+// POST .../modifyGroupContent answers with the bare success envelope: it does
+// not echo the stored name, so a rename the server auto-suffixed cannot be
+// detected from the reply the way the family space detects one. manualRename 0
+// asks the server to fail on a taken name instead of renaming around it.
+//
+// fileType is only ever observed as "file"; the value for a directory is
+// unverified.
+func (f *Fs) groupRename(ctx context.Context, id, newName, dirID string) error {
+	rootID, err := f.groupRoot(ctx)
+	if err != nil {
+		return err
+	}
+	own := f.srvPathOfDirPath(id, rootID)
+	if own == "" {
+		// The path of a freshly uploaded entry is not cached, so rebuild it
+		// from the parent, which modifyGroupContent wants with the entry's
+		// own id appended.
+		parent := f.groupSrvPath(dirID)
+		if parent == "" {
+			return fmt.Errorf("yun139: server path of group entry %s is not known; list its parent first", id)
+		}
+		own = path.Join(parent, id)
+	}
+	body := map[string]any{
+		"contentName":     newName,
+		"contentID":       id,
+		"fileType":        "file",
+		"parentCatalogID": dirID,
+		"path":            own,
+		"groupID":         f.opt.GroupID,
+		"manualRename":    0,
+		"accountInfo":     f.groupAccountInfo(),
+	}
+	return f.pacer.Call(func() (bool, error) {
+		return shouldRetry(ctx, f.groupCall(ctx, "/hcy/mutual/adapter/isbo/openApi/modifyGroupContent", body, nil))
+	})
+}
+
 // ------------------------------------------------------------ NewFs -------
 
 // parsePath parses a remote path
@@ -1396,9 +2005,16 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		return nil, errors.New("yun139: authorization is required")
 	}
 	switch opt.Space {
-	case spacePersonal, spaceFamily:
+	case spacePersonal, spaceFamily, spaceGroup:
 	default:
-		return nil, fmt.Errorf("yun139: space must be %q or %q, got %q", spacePersonal, spaceFamily, opt.Space)
+		return nil, fmt.Errorf("yun139: space must be one of %q, %q, %q, got %q", spacePersonal, spaceFamily, spaceGroup, opt.Space)
+	}
+	if opt.Space == spaceGroup && opt.RootFolderID != "" {
+		// A group entry is addressed by catalogID *plus* the server path
+		// learned from its parent listing, so a bare root_folder_id cannot be
+		// resolved. Refuse here rather than failing later with "server path of
+		// group directory … is not known".
+		return nil, errors.New("yun139: root_folder_id is not supported for the shared group space")
 	}
 	// (family_id is auto-discovered in NewFs via queryFamilyCloud when
 	// not set; personal space needs no extra config.)
@@ -1427,10 +2043,11 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 				t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 			}
 		}),
-		space:   opt.Space,
-		svcType: svcTypePersonal,
+		space:     opt.Space,
+		svcType:   svcTypePersonal,
+		srvPathOf: newSrvPathCache(),
 	}
-	if opt.Space == spaceFamily {
+	if opt.Space == spaceFamily || opt.Space == spaceGroup {
 		f.svcType = svcTypeFamily
 	}
 	f.pacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
@@ -1449,6 +2066,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		SlowHash:                true,
 		ServerSideAcrossConfigs: false,
 	}).Fill(ctx, f)
+	f.clearUnsupportedSharedFeatures()
 	return f, nil
 }
 
@@ -1469,6 +2087,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if f.familyRootMu == nil {
 		f.familyRootMu = &sync.Mutex{}
 	}
+	if f.groupRootMu == nil {
+		f.groupRootMu = &sync.Mutex{}
+	}
 	// Validate the token and refresh if it is close to expiry.
 	if err := f.refreshToken(ctx); err != nil {
 		return nil, err
@@ -1484,10 +2105,23 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// this from login; we learn it in one extra request. An explicit
 	// --yun139-user-domain-id still wins.
 	if f.userDomainID == "" {
-		if _, accountUserID, err := f.queryFamilyCloud(ctx); err == nil && accountUserID != "" {
-			f.userDomainID = accountUserID
-			f.opt.UserDomainID = accountUserID
-			f.m.Set("user_domain_id", accountUserID)
+		// queryFamilyCloud returns it for an account with a family
+		// cloud; an account that only shares in groups has none, so
+		// fall back to the group list, which carries the same id in
+		// accountInfo.userId.
+		uid := ""
+		if _, accountUserID, err := f.queryFamilyCloud(ctx); err == nil {
+			uid = accountUserID
+		}
+		if uid == "" {
+			if _, accountUserID, err := f.queryGroup(ctx); err == nil {
+				uid = accountUserID
+			}
+		}
+		if uid != "" {
+			f.userDomainID = uid
+			f.opt.UserDomainID = uid
+			f.m.Set("user_domain_id", uid)
 		}
 		// A failure here is not fatal: personal-space operations
 		// that do not need the domain id keep working (the quota
@@ -1503,18 +2137,26 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			return nil, err
 		}
 	}
+	if f.space == spaceGroup {
+		// Same freeze-before-any-operation rule as family_id.
+		if err := f.resolveGroupID(ctx); err != nil {
+			return nil, err
+		}
+	}
 	if rootID == "" {
-		if f.space == spaceFamily {
+		switch f.space {
+		case spaceFamily:
 			rootID, err = f.familyRoot(ctx)
-			if err != nil {
-				return nil, err
-			}
-		} else {
+		case spaceGroup:
+			rootID, err = f.groupRoot(ctx)
+		default:
 			rootID = defaultRootID
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 	f.dirCache = dircache.New(f.root, rootID, f)
-	f.srvPathOf = newSrvPathCache()
 
 	// Find the current root
 	err = f.dirCache.FindRoot(ctx, false)
@@ -1539,6 +2181,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 				return nil, err2
 			}
 			f.features.Fill(ctx, &tempF)
+			f.clearUnsupportedSharedFeatures()
 			f.dirCache = tempF.dirCache
 			f.root = tempF.root
 			return f, fs.ErrorIsFile
@@ -1550,6 +2193,73 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 // ------------------------------------------------------------ Fs basics ---
 
+// sharedSpace reports whether the remote points at a space served on
+// group.yun.139.com - a family cloud or a shared group. Both speak the same
+// /hcy/group/dynamic/* upload, trash and task pipeline; only the space id and
+// the groupType field differ, so the upload code branches on this rather than
+// on a specific space.
+func (f *Fs) sharedSpace() bool { return f.space != spacePersonal }
+
+// spaceID returns the id of the configured shared space: family_id for a
+// family cloud, group_id for a shared group. It is empty for the personal
+// space, which has no such id.
+func (f *Fs) spaceID() string {
+	if f.space == spaceGroup {
+		return f.opt.GroupID
+	}
+	return f.opt.FamilyID
+}
+
+// dynamicGroupType is the groupType field the /hcy/group/dynamic/* upload
+// endpoints expect: 1 for a family cloud (captured 2026-09-03), 2 for a shared
+// group (captured 2026-10-19).
+func (f *Fs) dynamicGroupType() int {
+	if f.space == spaceGroup {
+		return 2
+	}
+	return 1
+}
+
+// spaceCall issues one request against the shared-space host
+// (group.yun.139.com), which serves both the family adapter and the group
+// adapter. The transport, header set and envelope handling are identical, so
+// callers that branch on sharedSpace() rather than on a specific space use
+// this instead of familyCall or groupCall.
+func (f *Fs) spaceCall(ctx context.Context, pathname string, body any, out any) error {
+	return f.call(ctx, api.FamilyBaseURL+pathname, body, out)
+}
+
+// clearUnsupportedSharedFeatures drops the capabilities a shared group has no
+// server-side implementation for yet (native move exists in the API but is not
+// wired up, and there is no server-side copy at all).
+//
+// fs.Features.Fill discovers these by interface and the methods do exist on
+// *Fs, so every Fill must be followed by this call - including the one NewFs
+// does when a remote is pointed at a single file. Advertising a capability that
+// is then refused at run time turns what should be a skipped subtest into a
+// failure, and turns rclone's clean fallbacks into an error path.
+func (f *Fs) clearUnsupportedSharedFeatures() {
+	if f.space != spaceGroup || f.features == nil {
+		return
+	}
+	f.features.Move = nil
+	f.features.Copy = nil
+	f.features.DirMove = nil
+}
+
+// spaceSrvPath returns the server path ("root:/...") of a shared-space
+// directory, learned from a listing. It is empty for the personal space, whose
+// objects are addressed by id alone.
+func (f *Fs) spaceSrvPath(dirID string) string {
+	switch f.space {
+	case spaceFamily:
+		return f.familySrvPath(dirID)
+	case spaceGroup:
+		return f.groupSrvPath(dirID)
+	}
+	return ""
+}
+
 // Name of the remote (as passed into NewFs)
 func (f *Fs) Name() string { return f.name }
 
@@ -1558,8 +2268,11 @@ func (f *Fs) Root() string { return f.root }
 
 // String converts this Fs to a string
 func (f *Fs) String() string {
-	if f.space == spaceFamily {
+	switch f.space {
+	case spaceFamily:
 		return fmt.Sprintf("yun139 root '%s' (family %s)", f.root, f.opt.FamilyID)
+	case spaceGroup:
+		return fmt.Sprintf("yun139 root '%s' (group %s)", f.root, f.opt.GroupID)
 	}
 	return fmt.Sprintf("yun139 root '%s'", f.root)
 }
@@ -1580,10 +2293,13 @@ func (f *Fs) Precision() time.Duration { return fs.ModTimeNotSupported }
 
 // Hashes returns the supported hash sets.
 // The personal-space listing carries a server-computed SHA-256
-// (contentHash) for every file, so SHA-256 is the native hash. The
-// family listing exposes no hash, so the family space advertises no
-// hashes and rclone falls back to size+modtime comparison (check
-// reports "no hashes supported" instead of aborting mid-way).
+// (contentHash) for every file, so SHA-256 is free there. The shared group
+// answers it too, but not in the listing: Object.Hash fetches it with a
+// one-byte ranged GET against the download link (see groupContentHash), which
+// is why the backend keeps SlowHash set. The family listing exposes no hash
+// and no such header has been verified for it, so the family space advertises
+// none and rclone falls back to size+modtime comparison (check reports
+// "no hashes supported" instead of aborting mid-way).
 func (f *Fs) Hashes() hash.Set {
 	if f.space == spaceFamily {
 		return hash.Set(0)
@@ -1771,8 +2487,11 @@ func (f *Fs) listFamily(ctx context.Context, dirID string, fn func(listEntry) bo
 
 // listAll lists the entries of dirID in the current space.
 func (f *Fs) listAll(ctx context.Context, dirID string, fn func(listEntry) bool) error {
-	if f.space == spaceFamily {
+	switch f.space {
+	case spaceFamily:
 		return f.listFamily(ctx, dirID, fn)
+	case spaceGroup:
+		return f.listGroup(ctx, dirID, fn)
 	}
 	return f.listPersonal(ctx, dirID, fn)
 }
@@ -1831,6 +2550,9 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	leaf = f.opt.Enc.FromStandardName(leaf)
 	if err := validateName(leaf); err != nil {
 		return "", err
+	}
+	if f.space == spaceGroup {
+		return f.groupMkdir(ctx, pathID, leaf)
 	}
 	if f.space == spaceFamily {
 		srvPath := ""
@@ -1958,6 +2680,20 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 	if len(entries) > 0 {
 		return fs.ErrorDirectoryNotEmpty
+	}
+	if f.space == spaceGroup {
+		rootID, err := f.groupRoot(ctx)
+		if err != nil {
+			return err
+		}
+		if dirID == rootID {
+			return errors.New("yun139: cannot remove the group root")
+		}
+		if err := f.groupTrash(ctx, dirID); err != nil {
+			return err
+		}
+		f.dirCache.FlushDir(dir)
+		return nil
 	}
 	if f.space == spaceFamily {
 		// Deleting the family root is not allowed.
@@ -2087,6 +2823,27 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	}
 	// Not cached (e.g. the object was built from a listing that predates
 	// the field). Refetch the entry once.
+	// A shared group's listing carries no hash (digest:null, fileEtag:0), but
+	// the EOS answer for a 1-byte ranged GET does, so ask the object itself.
+	//
+	// A probe that fails is reported as "no hash" rather than an error:
+	// operations.checkHashes turns an empty hash into a size comparison for
+	// that one file, while an error here would be counted and would mark the
+	// file unequal - one unreachable object would then look like corruption in
+	// a long `rclone check` run.
+	if o.fs.space == spaceGroup {
+		h, herr := o.fs.groupContentHash(ctx, o)
+		if herr != nil {
+			fs.Debugf(o, "yun139: group sha256 probe failed: %v", herr)
+			return "", nil
+		}
+		if h != "" {
+			o.hashMu.Lock()
+			o.sha256 = h
+			o.hashMu.Unlock()
+		}
+		return h, nil
+	}
 	if o.fs.space == spacePersonal {
 		leaf, dirID, err := o.fs.dirCache.FindPath(ctx, o.remote, false)
 		if err == nil {
@@ -2110,6 +2867,57 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 }
 
 // ------------------------------------------------------------ helpers ----
+
+// groupContentHash returns the server-computed SHA-256 of a shared-group
+// object without reading its content.
+//
+// A one-byte ranged GET against the object's download link answers with
+// x-eos-hash-sha256 (mirrored in x-amz-content-sha256) for the WHOLE object,
+// single-part and multi-part alike - measured 2026-10-19 on a 1 MiB object and
+// a 12 MiB object uploaded in three 5 MiB parts, both byte-identical to the
+// local sha256.
+//
+// HEAD is not usable: the presignature covers the HTTP method, so a HEAD
+// against a GET-signed link returns an XML error page carrying no hash. The
+// ETag is not usable either - it is "<md5>-<part count>", so for a multipart
+// object it is not the content MD5.
+//
+// Cost is one link mint plus one 1-byte request per object, which is why the
+// backend keeps SlowHash set: rclone will not reach for this hash unless the
+// user asked for checksum comparison. A missing header or a refused link
+// returns an empty string rather than an error, so one odd object cannot abort
+// a whole `rclone check`.
+func (f *Fs) groupContentHash(ctx context.Context, o *Object) (string, error) {
+	url, err := f.fetchDownloadURL(ctx, o)
+	if err != nil {
+		return "", err
+	}
+	return f.contentHashFromLink(ctx, url)
+}
+
+// contentHashFromLink issues the one-byte ranged GET and reads the hash header
+// off the response. It is split out so the header handling can be tested
+// without minting a real link.
+func (f *Fs) contentHashFromLink(ctx context.Context, url string) (string, error) {
+	res, err := f.getURL(ctx, url, map[string]string{"Range": "bytes=0-0"})
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = res.Body.Close() }()
+	switch res.StatusCode {
+	case http.StatusPartialContent, http.StatusOK:
+		// 200 means the edge ignored Range and began sending the object; the
+		// headers still carry the hash and closing the body (deferred above)
+		// keeps us from pulling the file down.
+	default:
+		return "", fmt.Errorf("yun139: hash probe: HTTP %s", res.Status)
+	}
+	h := res.Header.Get("x-eos-hash-sha256")
+	if h == "" {
+		h = res.Header.Get("x-amz-content-sha256")
+	}
+	return strings.ToLower(strings.TrimSpace(h)), nil
+}
 
 // getURL performs a GET for a download URL.
 func (f *Fs) getURL(ctx context.Context, url string, headers map[string]string) (*http.Response, error) {
@@ -2166,11 +2974,51 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 		f.dirCache.FlushDir(dir)
 		return nil
 	}
+	if f.space == spaceGroup {
+		// No recursive delete on the group side either: walk the tree and
+		// trash the leaves first. Unlike the family walk this one reports
+		// the first failure instead of swallowing it, so a half-deleted
+		// directory is visible to the caller.
+		if err := f.purgeGroupDir(ctx, dirID); err != nil {
+			return err
+		}
+		f.dirCache.FlushDir(dir)
+		return nil
+	}
 	if err := f.deleteObject(ctx, dirID, "", false); err != nil {
 		return err
 	}
 	f.dirCache.FlushDir(dir)
 	return nil
+}
+
+// purgeGroupDir removes a group directory and everything under it, deepest
+// first.
+//
+// The group API has no recursive delete, and trashing a directory that still
+// holds entries leaves the two sides inconsistent, so the listing is taken
+// before anything is deleted and children are trashed one by one.
+func (f *Fs) purgeGroupDir(ctx context.Context, id string) error {
+	var entries []listEntry
+	err := f.listAll(ctx, id, func(e listEntry) bool {
+		entries = append(entries, e)
+		return false
+	})
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		var lerr error
+		if e.isDir {
+			lerr = f.purgeGroupDir(ctx, e.id)
+		} else {
+			lerr = f.groupTrash(ctx, e.id)
+		}
+		if lerr != nil {
+			return lerr
+		}
+	}
+	return f.groupTrash(ctx, id)
 }
 
 // purgeFamilyDir removes a non-empty family directory by walking its children
@@ -2190,16 +3038,26 @@ func (f *Fs) purgeFamilyDir(ctx context.Context, id string) error {
 	return f.deleteObject(ctx, id, "", true)
 }
 
-// About returns quota information for the personal cloud.
+// About returns the account-wide quota.
 //
-// POST user-njs.yun.139.com/user/disk/quota/detail with
-// {"userDomainId": ...} returns diskSize/freeDiskSize in MiB units
-// (captured 2026-09-03: diskSize 701440 = 685 MiB... actually the
-// captured values 701440/700028 look like MiB for a 685 GB drive,
-// so scale by 1024*1024 when reporting).
+// POST user-njs.yun.139.com/user/disk/quota/detail with {"userDomainId": ...}
+// returns diskSize/freeDiskSize in MiB units (captured 2026-09-03: diskSize
+// 701440 = 685 MiB... actually the captured values 701440/700028 look like MiB
+// for a 685 GB drive, so scale by 1024*1024 when reporting).
+//
+// The endpoint is keyed on the user, not on a space, and a family cloud or a
+// shared group draws on the same pool as the personal cloud (confirmed by the
+// account owner 2026-10-19), so all three spaces answer these same numbers.
+// They are the account's numbers, not the tree's: `rclone size remote:` is the
+// only way to measure what one space actually holds, and neither shared space
+// has a quota API of its own.
+//
+// The different nodes behind this endpoint have been seen reporting different
+// figures for the same account, so treat one reading as a sample rather than a
+// fact; a full drive can also stop reporting freeDiskSize at all.
 func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	if f.space != spacePersonal {
-		return nil, errors.New("yun139: about is only supported for the personal space")
+		fs.Debugf(f, "yun139: reporting the account-wide quota - the %s space has no quota API of its own", f.space)
 	}
 	userID := f.userDomainID
 	if userID == "" {
@@ -2321,7 +3179,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		// The create call may have registered an entry before the upload
 		// failed; drop it so a failed Put leaves nothing at the target path.
 		if res != nil && res.fileID != "" {
-			f.discardUpload(ctx, res.fileID, dirID, f.space == spaceFamily)
+			f.discardUpload(ctx, res.fileID, dirID, f.sharedSpace())
 		}
 		return nil, err
 	}
@@ -2347,8 +3205,8 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		hashMu:  &sync.Mutex{},
 		urlMu:   &sync.Mutex{},
 	}
-	if f.space == spaceFamily {
-		o.serverPath = f.familySrvPath(dirID)
+	if f.sharedSpace() {
+		o.serverPath = f.spaceSrvPath(dirID)
 	}
 	return o, nil
 }
@@ -2439,7 +3297,11 @@ func (f *Fs) settleAutoRename(ctx context.Context, dirID, leafStd, newID string)
 // the parent whose server-side path a family delete task addresses.
 func (f *Fs) discardUpload(ctx context.Context, id, dirID string, family bool) {
 	srvPath := ""
-	if family {
+	if f.space == spaceFamily {
+		// A family delete task addresses its parent by server path, which is
+		// only known once that parent has been listed; a fresh upload has not
+		// listed it. A shared group delete task is addressed by id alone, so
+		// the path stays empty there.
 		srvPath = f.familySrvPath(dirID)
 		if srvPath == "" {
 			if err := f.primeSrvPathFor(ctx, dirID); err != nil {
@@ -2626,15 +3488,15 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	}
 	var callPath string
 	var callBody any = body
-	if f.space == spaceFamily {
+	if f.sharedSpace() {
 		callPath = "/hcy/group/dynamic/file/create"
 		fb := map[string]any{
 			"contentHash":          body.ContentHash,
 			"contentHashAlgorithm": body.ContentHashAlgorithm,
 			"expireSec":            86400,
 			"fileRenameMode":       body.FileRenameMode,
-			"groupId":              f.opt.FamilyID,
-			"groupType":            1,
+			"groupId":              f.spaceID(),
+			"groupType":            f.dynamicGroupType(),
 			"localCreatedAt":       body.LocalCreatedAt,
 			"localUpdatedAt":       body.LocalUpdatedAt,
 			"name":                 body.Name,
@@ -2655,8 +3517,8 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	} else {
 		callPath = "/hcy/file/create"
 	}
-	if f.space == spaceFamily {
-		if err := f.familyCall(ctx, callPath, callBody, &resp); err != nil {
+	if f.sharedSpace() {
+		if err := f.spaceCall(ctx, callPath, callBody, &resp); err != nil {
 			return nil, noRetryOnQuotaRejection(fmt.Errorf("create: %w", err))
 		}
 	} else {
@@ -2700,9 +3562,9 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 			"parallelUpload": true,
 			"partInfos":      allPartInfos[i:end],
 		}
-		if f.space == spaceFamily {
-			urlBody["groupId"] = f.opt.FamilyID
-			urlBody["groupType"] = 1
+		if f.sharedSpace() {
+			urlBody["groupId"] = f.spaceID()
+			urlBody["groupType"] = f.dynamicGroupType()
 		}
 		var urlResp struct {
 			api.BaseResp
@@ -2711,11 +3573,11 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 			} `json:"data"`
 		}
 		urlPath := "/hcy/file/getUploadUrl"
-		if f.space == spaceFamily {
+		if f.sharedSpace() {
 			urlPath = "/hcy/group/dynamic/file/getUploadUrl"
 		}
 		callURL := func() (string, error) {
-			if f.space == spaceFamily {
+			if f.sharedSpace() {
 				return api.FamilyBaseURL + urlPath, nil
 			}
 			host, err := f.personalCloudHost(ctx)
@@ -2780,17 +3642,17 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		ContentHash:          hashHex,
 		ContentHashAlgorithm: "SHA256",
 	}
-	if f.space == spaceFamily {
-		cmpl.GroupID = f.opt.FamilyID
+	if f.sharedSpace() {
+		cmpl.GroupID = f.spaceID()
 		cmpl.AccountUserID = f.userDomainID
 	}
 	cmplPath := "/hcy/file/complete"
-	if f.space == spaceFamily {
+	if f.sharedSpace() {
 		cmplPath = "/hcy/group/dynamic/file/complete"
 	}
 	var cmplResp api.PersonalCompleteResp
 	cmplHost := api.FamilyBaseURL
-	if f.space != spaceFamily {
+	if !f.sharedSpace() {
 		var err error
 		cmplHost, err = f.personalCloudHost(ctx)
 		if err != nil {
@@ -3140,6 +4002,11 @@ func (f *Fs) cleanupOldBackups(ctx context.Context, dirID, leaf, keepID string) 
 // family=true uses the family batch-delete endpoint; false uses the personal
 // /recyclebin/batchTrash (or /file/batchDelete if hard_delete is on).
 func (f *Fs) deleteObject(ctx context.Context, id, srvPath string, family bool) error {
+	if f.space == spaceGroup {
+		// The group recycle bin is reached by id alone; srvPath and the
+		// family flag carry no meaning here.
+		return f.groupTrash(ctx, id)
+	}
 	if family {
 		taskID, err := f.familyBatchOprTask(ctx, familyBatchReq{
 			ContentList:       []string{id},
@@ -3201,6 +4068,14 @@ func (f *Fs) deleteTask(ctx context.Context, endpoint, id string) error {
 //
 // Personal: POST /hcy/file/update {fileId, name}.
 func (f *Fs) renameObject(ctx context.Context, id, newName, dirID string, family bool) error {
+	if f.space == spaceGroup {
+		if err := f.groupRename(ctx, id, newName, dirID); err != nil {
+			return err
+		}
+		// modifyGroupContent answers with a bare success envelope, so the
+		// stored name has to come from a listing of the parent.
+		return f.confirmRename(ctx, dirID, id, f.opt.Enc.ToStandardName(newName), "")
+	}
 	if family {
 		srvPath := f.familySrvPath(id)
 		body := map[string]any{
@@ -3316,6 +4191,13 @@ func (o *Object) Remove(ctx context.Context) error {
 // Returns the new object, or ErrorCantMove so the engine falls back to
 // copy+delete.
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	if f.space == spaceGroup {
+		// A group has a native move task (createBatchOprTask with
+		// eventType "move") that the family space lacks, but it is not
+		// wired up yet. Refuse so rclone falls back rather than sending a
+		// group id to the family or personal batch API.
+		return nil, fs.ErrorCantMove
+	}
 	srcObj, ok := src.(*Object)
 	if !ok {
 		return nil, fs.ErrorCantMove
@@ -3459,6 +4341,9 @@ func (f *Fs) moveTaskID(ctx context.Context, id, dstDirID string) (string, error
 
 // DirMove moves a directory
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	if f.space == spaceGroup {
+		return fs.ErrorCantDirMove
+	}
 	srcFs, ok := src.(*Fs)
 	if !ok || !srcFs.sameCloud(f) {
 		// Different account/family - cannot move across clouds.
@@ -3500,6 +4385,10 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 // remote path. Returns the new object; the caller falls back to a
 // bandwidth copy when ErrorCantCopy is returned.
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	if f.space == spaceGroup {
+		// Server-side copy in a group is not wired up; see Move.
+		return nil, fs.ErrorCantCopy
+	}
 	srcObj, ok := src.(*Object)
 	if !ok {
 		return nil, fs.ErrorCantCopy
@@ -3776,6 +4665,9 @@ func (f *Fs) sameCloud(other *Fs) bool {
 		return false
 	}
 	if f.space == spaceFamily && f.opt.FamilyID != other.opt.FamilyID {
+		return false
+	}
+	if f.space == spaceGroup && f.opt.GroupID != other.opt.GroupID {
 		return false
 	}
 	return true
@@ -4179,7 +5071,11 @@ func sha256Feed(h interface {
 // server fixes each space's link lifetime, so the window is per space and well
 // under the granted life (see the constants).
 func (f *Fs) downloadURLTTL() time.Duration {
-	if f.space == spaceFamily {
+	switch f.space {
+	case spaceFamily, spaceGroup:
+		// Both shared spaces mint 24h links and take no expiry parameter:
+		// family was captured 2026-09-03, the group link lifetime was
+		// measured live on 2026-10-19 (X-Amz-Expires=86400).
 		return familyDownloadURLTTL
 	}
 	return personalDownloadURLTTL
@@ -4212,6 +5108,38 @@ func (o *Object) invalidateURL() {
 
 // fetchDownloadURL requests a fresh download URL for the object.
 func (f *Fs) fetchDownloadURL(ctx context.Context, o *Object) (string, error) {
+	if f.space == spaceGroup {
+		// POST .../getGroupFileDownLoadURLV2 (captured 2026-10-19). Like
+		// the family call it returns one "downloadURL" string and takes no
+		// expiry parameter, and its path ends with the containing
+		// directory rather than the file itself.
+		body := map[string]any{
+			"accountInfo": map[string]any{
+				"accountName": f.account,
+				"accountType": "1",
+			},
+			"contentID": o.id,
+			"extInfo": map[string]string{
+				"isReturnCdnDownloadUrl": "1",
+			},
+			"groupID": f.opt.GroupID,
+			"path":    o.serverPath,
+		}
+		var resp struct {
+			DownloadURL string `json:"downloadURL"`
+		}
+		err := f.pacer.Call(func() (bool, error) {
+			err := f.groupCall(ctx, "/hcy/mutual/adapter/isbo/openApi/getGroupFileDownLoadURLV2", body, &resp)
+			return shouldRetry(ctx, err)
+		})
+		if err != nil {
+			return "", err
+		}
+		if resp.DownloadURL == "" {
+			return "", fmt.Errorf("yun139: no download URL returned for %q", o.remote)
+		}
+		return resp.DownloadURL, nil
+	}
 	if f.space == spaceFamily {
 		// POST .../getFileDownLoadURLV2 (captured 2026-09-03). The
 		// server returns a single "downloadURL" string.
@@ -4312,10 +5240,10 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 		return "", err
 	}
 	o := obj.(*Object)
-	// The family API takes no expiry parameter.
-	if f.space == spaceFamily {
+	// Neither shared space takes an expiry parameter.
+	if f.space != spacePersonal {
 		if expire.IsSet() {
-			fs.Logf(f, "Public Link: the 139 family cloud has no expiry parameter, ignoring the requested expiry of %v", expire)
+			fs.Logf(f, "Public Link: the 139 %s space has no expiry parameter, ignoring the requested expiry of %v", f.space, expire)
 		}
 		// fetchDownloadURL is the uncached path.
 		return f.fetchDownloadURL(ctx, o)

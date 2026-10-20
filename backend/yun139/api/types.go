@@ -407,6 +407,40 @@ type FamilyUploadCompleteReq struct {
 	UploadID             string `json:"uploadId"`
 }
 
+// ---------------------------------------------------------- group --------
+
+// GroupRootPathPrefix is the fixed mount point every 共享群 (shared group)
+// path hangs under. Captured 2026-10-19 from the PC client: a group's root
+// catalog is addressed as "<prefix>/<groupID>", and the numeric groupID is
+// passed as catalogID for that one request. Unlike a family cloud, a group
+// root has no empty-path form: the client never asks for it the way the
+// family adapter accepts path "".
+//
+// Both segments are constant across the 14 endpoints in that capture;
+// whether they are constant across accounts and across groups is not
+// verified, so a 1809112500 here means "the server did not understand the
+// addressing", not "the group is missing".
+const GroupRootPathPrefix = "00019700101000000001/00019700101000000216"
+
+// Group is one entry in the queryGroupV2 response. Captured 2026-10-19 from
+// the PC client 8.9.1. Groups share the family-cloud host (FamilyBaseURL)
+// but live under the /hcy/mutual/adapter/isbo/openApi namespace and key
+// everything off groupID instead of cloudID.
+type Group struct {
+	GroupID   string `json:"groupID"`
+	GroupName string `json:"groupName"`
+	RoleID    int    `json:"roleID"`
+	// AccountInfo.UserID is the same 19-digit user domain id that
+	// queryFamilyCloud returns as accountUserId, so listing groups can
+	// bootstrap userDomainId discovery too.
+	AccountInfo struct {
+		AccountName string `json:"accountName"`
+		UserID      string `json:"userId"`
+	} `json:"accountInfo"`
+	CreateTime     string `json:"createTime"`
+	LastUpdateTime string `json:"lastUpdateTime"`
+}
+
 // ------------------------------------------------------------ quota ------
 
 // DiskQuotaDetailResp is the response of the disk-quota endpoint.
