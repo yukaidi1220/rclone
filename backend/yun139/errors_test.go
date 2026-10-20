@@ -1,9 +1,56 @@
 package yun139
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
 )
+
+// TestShouldRetry_TransientAPICodes pins which business codes go back through
+// the pacer. The two halves both matter: 02010002 must retry (server-side
+// "调用外部系统异常", observed once and then succeeding twice on the same
+// directory), while 1809112500 must NOT, because that is the answer to a
+// shared-group id sent to the family adapter - retrying a misconfiguration
+// would only burn attempts. A table that only asserted the retry half would
+// also pass if everything retried, so the non-retry rows are the point.
+func TestShouldRetry_TransientAPICodes(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"transient external-system error", &apiError{Code: "02010002", Message: "调用外部系统异常"}, true},
+		{"transient code wrapped in context", fmt.Errorf("listing: %w", &apiError{Code: "02010002", Message: "调用外部系统异常"}), true},
+		{"wrong space answers internal error", &apiError{Code: "1809112500", Message: "系统内部错误"}, false},
+		{"family cloud missing", &apiError{Code: "1809012303", Message: "家庭云不存在"}, false},
+		{"member tier too low", &apiError{Code: "04010319", Message: "权益不足"}, false},
+		{"quota exhausted", &apiError{Code: "04000024", Message: "空间不足"}, false},
+		{"plain transport error", errors.New("dial tcp: i/o timeout"), true},
+		{"no error at all", nil, false},
+	}
+	for _, c := range cases {
+		got, _ := shouldRetry(context.Background(), c.err)
+		if got != c.want {
+			t.Errorf("shouldRetry(%s) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestShouldRetry_CancelledContextWins asserts that a cancelled context stops
+// retrying even for a code that is on the transient list - otherwise a Ctrl-C
+// during a walk keeps hammering the API.
+func TestShouldRetry_CancelledContextWins(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	retry, err := shouldRetry(ctx, &apiError{Code: "02010002", Message: "调用外部系统异常"})
+	if retry {
+		t.Errorf("a cancelled context must not schedule another attempt")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("shouldRetry lost the cancellation: got %v", err)
+	}
+}
 
 // TestAPIError_Message exercises the apiError type returned by upload
 // /file/create and /file/complete on server-side rejection. The live
