@@ -106,6 +106,13 @@ The advanced options are:
   same SHA-256 before uploading, and if it does, create the new directory entry
   without sending any bytes. Off by default because the answer costs a full hash
   of each source - see [Quick transfer](#quick-transfer) below.
+- `--wopan-fatal_if_no_space`: make the exhausted-quota answer (`RSP_CODE 2001`)
+  cancel the whole run instead of only that file. Freeing space is a manual act
+  outside the run, so the no-retry marking on that answer stops the low level
+  retries but leaves `--retries` to re-run the transfer list: a real run on 2026-10-21
+  spent 32 minutes failing 126 file paths about ten times each. Defaults to
+  `false`. Cancelling early means the rest of the list is never attempted, so
+  check what is missing afterwards rather than reading the abort as a full pass.
 - `--wopan-encoding`: the encoding for the backend. The default is `Standard`
   plus `EncodeQuestion`, `EncodeAsterisk`, `EncodeLtGt` and `EncodeInvalidUtf8`
   and should normally be left alone. The server rejects `?`, `*`, `<` and `>`
@@ -165,21 +172,35 @@ request. Larger files go through the service's chunked upload protocol:
    by `--wopan-upload_concurrency` workers. Each part is read from its own range of
    the source and buffered before it is posted; parts are posted concurrently, so
    arrival order is shuffled; the server reassembles the file by part index, and
-   out-of-order arrival has been verified against the live service. A failed part
-   is not re-sent inside the session - the whole transfer is retried with a fresh
-   session - but the buffering stays, because it also protects a source whose
-   `Open` does not honour the requested byte range.
-3. When the final part is accepted the server assembles the file and returns
-   the finished file ID.
+   out-of-order arrival has been verified against the live service. The buffering
+   stays even though parts can be re-posted, because it also protects a source
+   whose `Open` does not honour the requested byte range.
+3. A part whose POST fails at the transport level is re-posted within the same
+   session - only that part, up to `--low-level-retries` attempts for it, with a
+   short wait between attempts. A re-post has to produce the same bytes again from
+   the start of the part; if the source cannot be rewound there, nothing is
+   re-posted and the original failure is reported.
+4. The finished file ID comes back with whichever part's response completes the
+   set, not with the highest part index. Measured 2026-10-21: a session that is
+   missing a part answers the final part's POST with success and no file ID, and
+   the part that later fills the gap returns the ID itself. Once a session has
+   produced an ID every part of it is stored, so no part is re-posted after that -
+   measured on the same day, a re-post after completion is answered with success
+   and ignored, and never reports the ID a second time.
 
 Memory usage is about `chunk_size * upload_concurrency` per transferring
 file (and `--transfers` files may upload at once); each buffer is sized for
-the largest part, so it may reach twice `chunk_size`. A failure on any part
-aborts the whole upload and rclone surfaces the error for that file.
-Abandoned parts remain on the server side - invisible and not counted
-against quota - and the retry starts a new upload session with a fresh id.
-A transient server 5xx keeps the file retryable, so `--retries` re-runs the
-whole upload; a 4xx rejection is treated as deterministic and not retried.
+the largest part, so it may reach twice `chunk_size`. A part that exhausts its
+own re-posts fails the file, and the error is marked so the copy engine does not
+re-upload the whole file in this pass - `--retries` still decides whether the
+command runs the list again, and a re-run starts a fresh session with a new id.
+That marking is what makes the layering readable: one part's POST count is set by
+`--low-level-retries`, and the number of times a file is uploaded is set by
+`--retries`. Before this, a single broken part cost the entire upload: cutting one
+part's request mid-body on a 96 MiB file made rclone start over from part 1 in a
+new session, which is 96 MiB of extra uplink for 8 MiB of lost bytes.
+A 4xx rejection, and the single-request path below `--wopan-upload_cutoff`, are
+treated as deterministic and are never re-posted.
 
 Chunked uploads leave the file in the server's shard storage with a
 composite ETag, which is never a content MD5 - the caveats in
@@ -219,6 +240,10 @@ arrival order is fine. The stream count comes from `--multi-thread-streams`
 (default `4`), raised to `--wopan-upload_concurrency` when that is higher.
 `--multi-thread-chunk_size` does not apply here because the destination
 supplies the chunk size.
+
+A re-post of a part rewinds that chunk's reader to the start of the chunk, which
+both the buffered reader and a local source's ranged reader position correctly.
+A reader that refuses to seek is not re-posted; its failure is reported as is.
 
 If the source server ignores a ranged request (rclone detects this and
 fails the chunk with `fs.ErrorRangeIgnored`), rclone logs

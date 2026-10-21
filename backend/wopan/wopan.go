@@ -766,8 +766,9 @@ type Options struct {
 	UploadCutoff      fs.SizeSuffix        `config:"upload_cutoff"`
 	ChunkSize         fs.SizeSuffix        `config:"chunk_size"`
 	UploadConcurrency int                  `config:"upload_concurrency"`
-	NoMemberCheck     bool                 `config:"no_member_check"` // skip the membership probe and its over-limit notice entirely
-	QuickTransfer     bool                 `config:"quick_transfer"`  // probe openapi/transfer/quickTransfer before uploading files >=3 MiB
+	NoMemberCheck     bool                 `config:"no_member_check"`   // skip the membership probe and its over-limit notice entirely
+	QuickTransfer     bool                 `config:"quick_transfer"`    // probe openapi/transfer/quickTransfer before uploading files >=3 MiB
+	FatalIfNoSpace    bool                 `config:"fatal_if_no_space"` // turn the exhausted-quota answer into a fatal error that cancels the run
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -893,6 +894,20 @@ func init() {
 				"to the normal upload; only a hit reported without an object id fails,\n" +
 				"because uploading then would store a second copy of content the service\n" +
 				"has already registered.",
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name: "fatal_if_no_space",
+			Help: "Make the exhausted-quota answer (RSP_CODE 2001) cancel the whole run.\n\n" +
+				"A full account is only freed by hand, so the NoRetry marking on that\n" +
+				"answer stops the low level retries but not the round itself: --retries\n" +
+				"still re-runs the transfer list. Measured on a real run 2026-10-21,\n" +
+				"an exhausted account spent 32 minutes failing 126 file paths about ten\n" +
+				"times each before rclone gave up. With this set the first 2001 becomes\n" +
+				"a fatal error, which cancels the sync at once (fs/sync/sync.go). It\n" +
+				"defaults to false, so interactive use is unchanged. Pair it with a\n" +
+				"check of what is missing afterwards, because cancelling early leaves\n" +
+				"the rest of the list untouched rather than failed.",
 			Default:  false,
 			Advanced: true,
 		}, {
@@ -1649,13 +1664,46 @@ func shouldRetryCall(ctx context.Context, err error) (bool, error) {
 	return true, err
 }
 
-// call issues one dispatcher request using the shared access token.
+// call issues one dispatcher request through doCall and applies the
+// fatal_if_no_space decision to whatever came back.
+//
+// This is the single choke point for the control plane: every wohome/wocloud
+// and api-user request goes through here, so the option does not have to be
+// honoured in the individual callers.
+func (f *Fs) call(ctx context.Context, channel, method string, param any, extra map[string]any) (json.RawMessage, error) {
+	data, err := f.doCall(ctx, channel, method, param, extra)
+	if err != nil {
+		err = f.wrapNoSpace(err)
+	}
+	return data, err
+}
+
+// wrapNoSpace promotes the exhausted-quota answer to a fatal error when
+// fatal_if_no_space is set, and leaves every other error alone.
+//
+// fserrors.FatalError is what cancels the sync at the first one (sync.go
+// checks IsFatalError and calls s.cancel()), which also stops --retries from
+// re-running the round. The NoRetry marking stays underneath, so a caller that
+// only recognises NoRetry sees the same decision it saw before, and asAPIError
+// can still unwrap the *apiError from either shape.
+func (f *Fs) wrapNoSpace(err error) error {
+	if !f.opt.FatalIfNoSpace {
+		return err
+	}
+	var ae *apiError
+	if asAPIError(err, &ae) && ae.Code == codeSpaceFull {
+		return fserrors.FatalError(err)
+	}
+	return err
+}
+
+// doCall issues one dispatcher request using the shared access token.
 //
 // param is encrypted into body.param; extra is merged into body as plaintext
 // fields. When the server rejects the token with the auth-invalid code the
 // token is refreshed once and the whole request is rebuilt - the old ciphertext
 // was encrypted with the previous token's key and is useless otherwise.
-func (f *Fs) call(ctx context.Context, channel, method string, param any, extra map[string]any) (json.RawMessage, error) {
+func (f *Fs) doCall(ctx context.Context, channel, method string, param any, extra map[string]any) (json.RawMessage, error) {
 	ts := f.tok
 	token := ts.accessTokenNow()
 	data, err := call(ctx, f.httpClient, "", token, channel, method, param, extra)
@@ -2709,7 +2757,7 @@ func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string,
 	fs.Debugf(src, "wopan: upload session %s: %d part(s) of up to %v",
 		uniqueID, total, f.opt.ChunkSize)
 
-	var data api.UploadData
+	st := &partState{}
 	// The upload channel never goes through the dispatcher, so an expired
 	// token cannot refresh itself mid-upload: on 1001 refresh once, re-encrypt
 	// the fileInfo with the new key, and retry a single time (fifth round
@@ -2734,7 +2782,7 @@ func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string,
 			if err != nil {
 				return api.UploadData{}, err
 			}
-			data = api.UploadData{}
+			st = &partState{} // the new session has produced no fid yet
 			// The fresh session gets a new uniqueId: without logging it, the
 			// retried POSTs cannot be correlated in server-side logs.
 			fs.Debugf(src, "wopan: upload session %s: %d part(s) of up to %v",
@@ -2753,13 +2801,13 @@ func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string,
 					// retry here - that is left to the outer copy retry loop.
 					return true, err
 				}
-				data = d
+				st.note(d)
 				return false, nil
 			})
 		} else {
 			// The reader is consumed sequentially while the parts are sent
 			// concurrently, mirroring the s3 backend's multipart pipeline.
-			err = f.uploadPartsConcurrent(ctx, in, zoneURL, dirID, name, size, fiEnc, uniqueID, token, plans, total, &data)
+			err = f.uploadPartsConcurrent(ctx, in, zoneURL, dirID, name, size, fiEnc, uniqueID, token, plans, total, st)
 		}
 		fs.Debugf(f, "wopan: upload attempt #%d took %s (err=%v)", attempt+1, time.Since(uploadStart).Round(time.Millisecond), err)
 		if err == nil || !isAuthInvalid(err) || attempt > 0 || f.opt.NoRefresh {
@@ -2780,6 +2828,7 @@ func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string,
 	if err != nil {
 		return api.UploadData{}, err
 	}
+	data := st.snapshot()
 	if data.WcFileID == "" || data.Fid == "" {
 		// A ghost object: rclone would build an Object that cannot be
 		// downloaded or updated. Fail loudly instead.
@@ -2798,9 +2847,10 @@ type partJob struct {
 // uploadPartsConcurrent sends the parts of one file through
 // upload_concurrency workers sharing the uniqueId session. The source is read
 // sequentially - the server assembles out-of-order parts by part index, so
-// only the sending needs concurrency. Any part failure cancels the remaining
-// ones; the retry decision is left to the caller's attempt loop.
-func (f *Fs) uploadPartsConcurrent(ctx context.Context, in io.Reader, zoneURL, dirID, name string, size int64, fiEnc, uniqueID, token string, plans []api.PartPlan, total int64, data *api.UploadData) error {
+// only the sending needs concurrency. A part whose transport fails is re-posted
+// before anything else is decided; any failure that survives that cancels the
+// remaining parts.
+func (f *Fs) uploadPartsConcurrent(ctx context.Context, in io.Reader, zoneURL, dirID, name string, size int64, fiEnc, uniqueID, token string, plans []api.PartPlan, total int64, st *partState) error {
 	concurrency := f.opt.UploadConcurrency
 	if concurrency < 1 {
 		concurrency = 1
@@ -2819,7 +2869,6 @@ func (f *Fs) uploadPartsConcurrent(ctx context.Context, in io.Reader, zoneURL, d
 		free <- make([]byte, maxPart)
 	}
 	jobs := make(chan partJob)
-	var mu sync.Mutex
 
 	// Producer: fill buffers from the reader one part at a time.
 	g.Go(func() error {
@@ -2847,27 +2896,16 @@ func (f *Fs) uploadPartsConcurrent(ctx context.Context, in io.Reader, zoneURL, d
 	for w := 0; w < concurrency; w++ {
 		g.Go(func() error {
 			for job := range jobs {
-				perr := f.pacer.CallNoRetry(func() (bool, error) {
-					d, err := f.uploadPart(gctx, bytes.NewReader(job.buf), zoneURL, dirID, name, size, fiEnc, uniqueID, token, job.plan, total)
-					if err != nil {
-						var ae *apiError
-						if asAPIError(err, &ae) {
-							return false, err
-						}
-						return true, err
-					}
-					if d.Fid != "" {
-						mu.Lock()
-						// Intermediate parts answer with empty data; the
-						// last completed part carries the fid (and wcFileId).
-						*data = d
-						mu.Unlock()
-					}
-					return false, nil
-				})
+				// The buffer only goes back to the pool once this part is
+				// settled: a re-post reads the same bytes, and returning the
+				// array earlier would let the producer fill it with the next
+				// part while this one is still being sent.
+				_, err := f.postPartRetry(gctx, st, func(int) (io.Reader, error) {
+					return bytes.NewReader(job.buf), nil
+				}, zoneURL, dirID, name, size, fiEnc, uniqueID, token, job.plan, total)
 				free <- job.buf
-				if perr != nil {
-					return perr
+				if err != nil {
+					return err
 				}
 			}
 			return nil
@@ -2975,7 +3013,7 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, zoneURL, dirID, name 
 		// An exhausted account is freed by hand outside the run, so the
 		// whole-file retry --retries offers cannot succeed either.
 		if ur.Code == codeSpaceFull {
-			err = noSpaceError(ae)
+			err = f.wrapNoSpace(noSpaceError(ae))
 		}
 		// Wrapped with %w so asAPIError can still unwrap the *apiError for
 		// isAuthInvalid while the message carries the part/session context.
@@ -2986,6 +3024,176 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, zoneURL, dirID, name 
 		plan.Index, total, fs.SizeSuffix(plan.PartSize), uniqueID, zoneHost, peerAddr, reusedConn,
 		elapsed.Round(time.Millisecond), fs.SizeSuffix(float64(plan.PartSize)/elapsed.Seconds()).ByteRateUnit())
 	return ur.Data, nil
+}
+
+// partState holds the one response that completes a chunked upload session.
+//
+// The fid belongs to whichever part's POST completes the server's set, not to
+// the highest part index. Measured 2026-10-21 against a live account: a session
+// missing a part answers 0000 with empty data even for the highest index, and
+// the part that later fills the gap returns the fid and wcFileId itself. Every
+// worker of one session shares a single partState, so "already completed" is a
+// session-wide fact rather than each worker's local knowledge.
+type partState struct {
+	mu   sync.Mutex
+	data api.UploadData
+}
+
+// finalised reports whether some part's response has already completed the session.
+func (s *partState) finalised() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.data.Fid != ""
+}
+
+// note records a response that carried the fid. Responses without one are
+// intermediate parts or a duplicate post after completion, so they are ignored.
+func (s *partState) note(d api.UploadData) {
+	if d.Fid == "" {
+		return
+	}
+	s.mu.Lock()
+	s.data = d
+	s.mu.Unlock()
+}
+
+// snapshot returns the recorded answer, or the zero value if no part ever carried a fid.
+func (s *partState) snapshot() api.UploadData {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.data
+}
+
+// partRetryDelay is how long to wait before re-posting a part. It is a variable
+// so tests can remove the wait.
+//
+// The wait is short and capped because the point is to outlast a flapping edge,
+// not to park a transfer: a part that is still failing after this ladder has
+// had its attempts is left to the caller's retry decision.
+var partRetryDelay = func(attempt, partIdx int) time.Duration {
+	const (
+		base     = 500 * time.Millisecond
+		maxDelay = 5 * time.Second
+	)
+	d := base
+	for i := 1; i < attempt && d < maxDelay; i++ {
+		d *= 2
+	}
+	if d > maxDelay {
+		d = maxDelay
+	}
+	// Stagger the parts of one file so a flapping edge does not see all of
+	// them come back at the same instant.
+	d += time.Duration(partIdx%5) * 100 * time.Millisecond
+	if jitter := int64(d) / 2; jitter > 0 {
+		d += time.Duration(rand.Int63n(jitter+1)) - d/4
+	}
+	if d < time.Millisecond {
+		d = time.Millisecond
+	}
+	return d
+}
+
+// partSleep waits for d, giving up if ctx is done first.
+func partSleep(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// postPartRetry posts one part of a chunked session, re-posting that part while
+// the transport keeps failing it.
+//
+// next(attempt) must hand back exactly plan.PartSize bytes again, positioned at
+// the start of the part: a re-post overwrites the same part index, and a partial
+// or mis-positioned body would be stored as that part's content. It is told which
+// attempt it is so a reader that only has to be rewound for a re-post is not
+// touched on the first one. A next that cannot rewind returns an error, which is
+// not retried.
+//
+// Only transport-level failures are re-posted. A business code is deterministic
+// for the request, and 4xx rejections and the single-part path are already
+// marked no-retry by uploadPart, so they come straight back.
+//
+// A part is never re-posted once the session has produced a fid. Completing a
+// session requires every part to be present, so a fid means this part's bytes are
+// already stored and the failure was only in the answer; re-posting then costs a
+// part's worth of bytes and, measured 2026-10-21, cannot report the fid twice.
+//
+// When the attempts run out the error carries no fserrors.RetryError marker, so
+// the copy engine does not re-upload the whole file this round and --retries
+// decides whether to run the command again.
+func (f *Fs) postPartRetry(ctx context.Context, st *partState, next func(attempt int) (io.Reader, error), zoneURL, dirID, name string, size int64, fileInfoEnc, uniqueID, token string, plan api.PartPlan, total int64) (api.UploadData, error) {
+	attempts := max(fs.GetConfig(ctx).LowLevelRetries, 1)
+	if total <= 1 {
+		// One part holds the whole file. uploadPart marks an HTTP rejection
+		// there as no-retry because the server answers a bare 500 for names it
+		// cannot store, and a second POST of that cannot succeed; leave the
+		// whole-file ladder in the caller as the only retry, as before.
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return api.UploadData{}, err
+		}
+		// Only a re-post may be skipped this way. A part that has never been
+		// posted has to be posted: the measured invariant is that a completed
+		// session implies every part arrived, so a fid that appeared while this
+		// part was retrying means its bytes are already stored - it says nothing
+		// about a part that was never sent at all.
+		if attempt > 1 && st.finalised() {
+			return st.snapshot(), nil
+		}
+		body, err := next(attempt)
+		if err != nil {
+			if lastErr != nil {
+				return api.UploadData{}, noLowLevelRetry(lastErr)
+			}
+			return api.UploadData{}, err
+		}
+		var data api.UploadData
+		err = f.pacer.CallNoRetry(func() (bool, error) {
+			d, uerr := f.uploadPart(ctx, body, zoneURL, dirID, name, size, fileInfoEnc, uniqueID, token, plan, total)
+			if uerr != nil {
+				var ae *apiError
+				if asAPIError(uerr, &ae) {
+					// A business rejection never succeeds on retry.
+					return false, uerr
+				}
+				return true, uerr
+			}
+			data = d
+			return false, nil
+		})
+		if err == nil {
+			st.note(data)
+			return data, nil
+		}
+		var ae *apiError
+		if asAPIError(err, &ae) || fserrors.IsNoRetryError(err) {
+			return api.UploadData{}, err
+		}
+		lastErr = err
+		if attempt >= attempts {
+			if total <= 1 {
+				return api.UploadData{}, err
+			}
+			fs.Debugf(f, "wopan: part %d/%d of session %s still failing after %d attempt(s)", plan.Index, total, uniqueID, attempt)
+			return api.UploadData{}, noLowLevelRetry(err)
+		}
+		delay := partRetryDelay(attempt, int(plan.Index))
+		fs.Debugf(f, "wopan: part %d/%d of session %s attempt %d/%d failed, re-posting in %v: %v",
+			plan.Index, total, uniqueID, attempt, attempts, delay, err)
+		if err := partSleep(ctx, delay); err != nil {
+			return api.UploadData{}, noLowLevelRetry(lastErr)
+		}
+	}
 }
 
 // OpenChunkWriter returns a ChunkWriter for the multi-thread copy engine.
@@ -3081,8 +3289,7 @@ type wopanChunkWriter struct {
 	uniqueID string
 	token    string
 
-	mu   sync.Mutex
-	data api.UploadData // populated by the part whose response carries the fid
+	state partState // holds whichever part's response completed the session
 }
 
 // planFor computes the part parameters of a 0-based chunk number.
@@ -3096,40 +3303,34 @@ func (w *wopanChunkWriter) planFor(chunkNumber int) api.PartPlan {
 
 // WriteChunk posts one part of the session. The engine may call it
 // concurrently and out of order; the server reassembles by part index and the
-// final part's response carries the fid, whichever arrives first.
+// part whose response completes the set carries the fid.
+//
+// The reader is rewound only for a re-post. Its offset is relative to this part
+// either way: the buffered path hands over a pool.RW holding just this chunk
+// (lib/pool SeekStart is the buffer's own coordinate) and a local source hands
+// over an operations.ReOpen whose seek base is the range start, not the file
+// start (fs/operations/reopen.go builds the next RangeOption from start+offset).
 func (w *wopanChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (bytesWritten int64, err error) {
 	plan := w.planFor(chunkNumber)
-	perr := w.f.pacer.CallNoRetry(func() (bool, error) {
-		d, err := w.f.uploadPart(ctx, io.LimitReader(reader, plan.PartSize), w.zoneURL, w.dirID, w.name, w.size, w.fiEnc, w.uniqueID, w.token, plan, w.total)
-		if err != nil {
-			var ae *apiError
-			if asAPIError(err, &ae) {
-				// A business rejection never succeeds on retry.
-				return false, err
+	_, err = w.f.postPartRetry(ctx, &w.state, func(attempt int) (io.Reader, error) {
+		if attempt > 1 {
+			if _, serr := reader.Seek(0, io.SeekStart); serr != nil {
+				return nil, serr
 			}
-			// A transport failure: signal the pacer to back off, but do not
-			// retry here - that is left to the outer copy retry loop.
-			return true, err
 		}
-		if d.Fid != "" {
-			w.mu.Lock()
-			w.data = d
-			w.mu.Unlock()
-		}
-		return false, nil
-	})
-	if perr != nil {
-		return 0, perr
+		return io.LimitReader(reader, plan.PartSize), nil
+	}, w.zoneURL, w.dirID, w.name, w.size, w.fiEnc, w.uniqueID, w.token, plan, w.total)
+	if err != nil {
+		return 0, err
 	}
 	return plan.PartSize, nil
 }
 
-// Close finishes the session. The last part posted already assembled the file
-// server-side, so this only checks that a fid came back.
+// Close finishes the session. The part that completed the set already assembled
+// the file server-side, so this only checks that a fid came back.
 func (w *wopanChunkWriter) Close(ctx context.Context) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.data.WcFileID == "" || w.data.Fid == "" {
+	data := w.state.snapshot()
+	if data.WcFileID == "" || data.Fid == "" {
 		return fmt.Errorf("wopan: chunked upload session %s (%s) response has an empty fid or wcFileId", w.uniqueID, w.name)
 	}
 	return nil
