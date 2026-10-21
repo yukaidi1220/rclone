@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -89,6 +90,10 @@ type groupTransport struct {
 	// task id, and moves nothing - which is the point: only a transport that
 	// leaves the entries where they were can prove a decline is a decline.
 	taskRefusal string
+
+	// sensitiveOnCreate answers createGroupCatalog the way the server answers a
+	// name its filter rejects (1909011520), creating nothing.
+	sensitiveOnCreate bool
 }
 
 func (tr *groupTransport) record(path string, body map[string]any) {
@@ -271,6 +276,11 @@ func (tr *groupTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return w.done(okResult(nil)), nil
 
 	case strings.HasSuffix(reqPath, "createGroupCatalog"):
+		if tr.sensitiveOnCreate {
+			return w.done(map[string]any{"result": map[string]any{
+				"resultCode": groupSensitiveWordErrorCode, "resultDesc": "敏感词校验失败",
+			}}), nil
+		}
 		parent := tr.normalize(asString(body["parentCatalogID"]))
 		name := asString(body["catalogName"])
 		id := "NEWCAT-" + name
@@ -1113,4 +1123,28 @@ func TestUnitGroupDirMoveStaleDestPathDeclines(t *testing.T) {
 	for _, c := range tr.calls {
 		assert.NotContains(t, c, "modifyGroupContent", "a declined directory move must not rename: %s", c)
 	}
+}
+
+// TestUnitGroupSensitiveWordMkdirDeclinesOnce covers the refusal the first
+// full sync produced: a directory name the group's filter rejects. The same
+// name is refused every time, so retrying the files below it only repeats the
+// answer - and the migration's verify step needs the subtree named in a SKIP
+// line or it reports those files as missing from the destination.
+func TestUnitGroupSensitiveWordMkdirDeclinesOnce(t *testing.T) {
+	tr := &groupTransport{dirs: gtestDirs(), sensitiveOnCreate: true}
+	f := newGroupTestFs(tr)
+
+	name := "blocked-name"
+	err := f.Mkdir(context.Background(), name)
+	require.Error(t, err)
+	assert.True(t, fserrors.IsNoRetryError(err), "a refused name must stop the retry ladder: %v", err)
+	assert.Contains(t, err.Error(), groupSensitiveWordErrorCode)
+
+	// The executor turns the SKIP line into an --exclude pattern with
+	//   grep 'SKIP ' copy.log | sed -E 's/.*SKIP ([^:]+):.*/\1/'
+	// so the line this backend emits has to survive that extractor verbatim.
+	line := "NOTICE: " + groupSensitiveSkipMessage(name)
+	m := regexp.MustCompile(`.*SKIP ([^:]+):.*`).FindStringSubmatch(line)
+	require.Len(t, m, 2, "the SKIP line must match the executor's extractor: %q", line)
+	assert.Equal(t, "blocked-name/", m[1])
 }
