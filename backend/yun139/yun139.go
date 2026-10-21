@@ -410,9 +410,9 @@ func isSensitiveFileNameError(err error) bool {
 //
 // The consumer separates path from reason at the fixed message tail rather
 // than at the first colon, because the standard name may legitimately contain
-// ':' - the encoder maps it to a fullwidth form only for the server. The
-// trailing slash marks the entry as a directory, so it covers the subtree the
-// server refused to create.
+// ':': the encoder maps it to a fullwidth form, and that fullwidth form is what
+// the server stores. The trailing slash marks the entry as a directory, so it
+// covers the subtree the server refused to create.
 func groupSensitiveSkipMessage(dir string) string {
 	return fmt.Sprintf("SKIP %s/: the server rejects a name in this path as a sensitive word (%s); skipping the subtree", dir, groupSensitiveWordErrorCode)
 }

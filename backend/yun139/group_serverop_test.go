@@ -1145,10 +1145,10 @@ func TestUnitGroupSensitiveWordMkdirDeclinesOnce(t *testing.T) {
 	assert.Contains(t, err.Error(), groupSensitiveWordErrorCode)
 
 	// verify reads the SKIP line back into its "deliberately not uploaded" set.
-	// executorExtractor replays that reading, so this asserts the emitted line
+	// skipEntries replays that reading, so this asserts the emitted line
 	// survives it, rather than that we built a string we like.
 	line := "NOTICE: " + groupSensitiveSkipMessage(name)
-	assert.Equal(t, name+"/", executorExtractor(t, line))
+	assert.Equal(t, []string{name + "/"}, skipEntries(t, line))
 }
 
 // TestUnitEmptyFileNamesItselfInASkipLine covers what the bucket runs showed:
@@ -1166,7 +1166,7 @@ func TestUnitEmptyFileNamesItselfInASkipLine(t *testing.T) {
 	assert.True(t, fserrors.IsNoRetryError(err))
 
 	line := "NOTICE: " + fmt.Sprintf("SKIP %s: this remote cannot store empty files; skipping", "empty.txt")
-	assert.Equal(t, "empty.txt", executorExtractor(t, line))
+	assert.Equal(t, []string{"empty.txt"}, skipEntries(t, line))
 }
 
 // TestUnitGroupSensitiveFileNameDeclinesOnce covers the file-name variant of
@@ -1184,5 +1184,5 @@ func TestUnitGroupSensitiveFileNameDeclinesOnce(t *testing.T) {
 	assert.Contains(t, err.Error(), sensitiveFileNameErrorCode)
 
 	line := "NOTICE: " + fmt.Sprintf("SKIP %s: the server rejects this file name as a sensitive word (%s); skipping", src.Remote(), sensitiveFileNameErrorCode)
-	assert.Equal(t, "ixQpUqSq_51cg.apk", executorExtractor(t, line))
+	assert.Equal(t, []string{"ixQpUqSq_51cg.apk"}, skipEntries(t, line))
 }

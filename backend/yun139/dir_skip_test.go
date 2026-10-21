@@ -34,18 +34,28 @@ func captureLogs(t *testing.T) *strings.Builder {
 // at the first colon, because a standard name may legitimately contain ':'.
 var skipReasonTail = regexp.MustCompile(`: (?:the server rejects|this remote cannot store|[0-9]+ bytes exceeds)`)
 
-// executorExtractor replays how the migration's verify step reads a SKIP line:
-// the leftmost "SKIP " starts the path and the fixed reason tail ends it.
-// Replaying it here is what makes a passed test mean "the exclude set gets this
-// path", not "the backend printed something".
-func executorExtractor(t *testing.T, logged string) string {
+// skipEntries replays how the migration's verify step reads copy.log: one entry
+// per SKIP line, each starting at the leftmost "SKIP " and ending at the fixed
+// reason tail. Doing it per line is what keeps this honest - scanning the whole
+// buffer would silently return only the first entry when a run emits two.
+// A line that carries "SKIP " but no recognised tail yields no entry, so the
+// expected-slice assertions below are what fail, not a silent pass.
+func skipEntries(t *testing.T, logged string) []string {
 	t.Helper()
-	i := strings.Index(logged, "SKIP ")
-	require.GreaterOrEqual(t, i, 0, "no SKIP line in %q", logged)
-	rest := logged[i+len("SKIP "):]
-	m := skipReasonTail.FindStringIndex(rest)
-	require.NotNil(t, m, "SKIP line carries no recognised reason tail: %q", rest)
-	return rest[:m[0]]
+	var got []string
+	for _, line := range strings.Split(logged, "\n") {
+		i := strings.Index(line, "SKIP ")
+		if i < 0 {
+			continue
+		}
+		rest := line[i+len("SKIP "):]
+		m := skipReasonTail.FindStringIndex(rest)
+		if m == nil {
+			continue
+		}
+		got = append(got, rest[:m[0]])
+	}
+	return got
 }
 
 // TestUnitGroupSensitiveWordPutNamesParentInSkipLine is the shape production
@@ -66,7 +76,7 @@ func TestUnitGroupSensitiveWordPutNamesParentInSkipLine(t *testing.T) {
 	_, err := f.Put(context.Background(), strings.NewReader(""), srcEmpty)
 	require.Error(t, err)
 	require.Contains(t, logs.String(), "SKIP empty.txt: this remote cannot store empty files")
-	require.Equal(t, "empty.txt", executorExtractor(t, logs.String()))
+	require.Equal(t, []string{"empty.txt"}, skipEntries(t, logs.String()))
 	logs.Reset()
 
 	remote := "blocked-name/sub/x.txt"
@@ -74,8 +84,8 @@ func TestUnitGroupSensitiveWordPutNamesParentInSkipLine(t *testing.T) {
 	_, err = f.Put(context.Background(), strings.NewReader("data"), src)
 	require.Error(t, err, "a refused parent directory must fail the upload")
 
-	got := executorExtractor(t, logs.String())
-	assert.Equal(t, "blocked-name/sub/", got, "the exclude must name the object's parent directory")
+	assert.Equal(t, []string{"blocked-name/sub/"}, skipEntries(t, logs.String()),
+		"the exclude set must name the object's parent directory")
 
 	assert.True(t, fserrors.IsNoRetryError(err),
 		"the refusal must not be re-run by the retry ladder: %v", err)
@@ -100,7 +110,7 @@ func TestUnitGroupSensitiveWordUpdateNamesParentInSkipLine(t *testing.T) {
 	err := o.Update(context.Background(), strings.NewReader("data"), src)
 	require.Error(t, err, "a refused parent directory must fail the re-upload")
 
-	assert.Equal(t, "blocked-name/sub/", executorExtractor(t, logs.String()))
+	assert.Equal(t, []string{"blocked-name/sub/"}, skipEntries(t, logs.String()))
 	assert.True(t, fserrors.IsNoRetryError(err), "the refusal must not be re-run: %v", err)
 	assert.Equal(t, 1, strings.Count(logs.String(), "SKIP "))
 }
@@ -120,8 +130,9 @@ func TestUnitGroupSensitiveWordChunkWriterNamesParentInSkipLine(t *testing.T) {
 	_, _, err := f.OpenChunkWriter(context.Background(), remote, src)
 	require.Error(t, err, "a refused parent directory must fail the chunk writer")
 
-	assert.Equal(t, "blocked-name/sub/", executorExtractor(t, logs.String()))
+	assert.Equal(t, []string{"blocked-name/sub/"}, skipEntries(t, logs.String()))
 	assert.True(t, fserrors.IsNoRetryError(err), "the refusal must not be re-run: %v", err)
+	assert.Equal(t, 1, strings.Count(logs.String(), "SKIP "), "one line for one refused file")
 }
 
 // TestUnitGroupSensitiveWordPersonalSpaceStaysQuiet keeps the recognition bound
