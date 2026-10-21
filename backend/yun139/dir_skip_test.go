@@ -29,17 +29,23 @@ func captureLogs(t *testing.T) *strings.Builder {
 	return &buf
 }
 
-// executorExtractor is the pipeline the migration executor runs over copy.log:
-//
-//	grep 'SKIP ' copy.log | sed -E 's/.*SKIP ([^:]+):.*/\1/'
-//
-// Replaying it here is what makes a passed test mean "the exclude file gets
-// this path", not "the backend printed something".
+// skipReasonTail is the fixed wording each permanent refusal ends with. The
+// migration's verify step separates path from reason at this tail rather than
+// at the first colon, because a standard name may legitimately contain ':'.
+var skipReasonTail = regexp.MustCompile(`: (?:the server rejects|this remote cannot store|[0-9]+ bytes exceeds)`)
+
+// executorExtractor replays how the migration's verify step reads a SKIP line:
+// the leftmost "SKIP " starts the path and the fixed reason tail ends it.
+// Replaying it here is what makes a passed test mean "the exclude set gets this
+// path", not "the backend printed something".
 func executorExtractor(t *testing.T, logged string) string {
 	t.Helper()
-	m := regexp.MustCompile(`.*SKIP ([^:]+):.*`).FindStringSubmatch(logged)
-	require.Len(t, m, 2, "no SKIP line survived the executor's extractor in %q", logged)
-	return m[1]
+	i := strings.Index(logged, "SKIP ")
+	require.GreaterOrEqual(t, i, 0, "no SKIP line in %q", logged)
+	rest := logged[i+len("SKIP "):]
+	m := skipReasonTail.FindStringIndex(rest)
+	require.NotNil(t, m, "SKIP line carries no recognised reason tail: %q", rest)
+	return rest[:m[0]]
 }
 
 // TestUnitGroupSensitiveWordPutNamesParentInSkipLine is the shape production

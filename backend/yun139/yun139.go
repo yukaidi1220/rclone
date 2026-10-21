@@ -403,14 +403,16 @@ func isSensitiveFileNameError(err error) bool {
 	return errors.As(err, &ae) && ae.Code == sensitiveFileNameErrorCode
 }
 
-// groupSensitiveSkipMessage is the line the migration executor's verify step
-// turns into an --exclude pattern:
+// groupSensitiveSkipMessage is the line a migration's verify step turns into a
+// "these files are deliberately not uploaded" entry:
 //
-//	grep 'SKIP ' copy.log | sed -E 's/.*SKIP ([^:]+):.*/\1/'
+//	grep 'SKIP ' copy.log
 //
-// The trailing slash makes the pattern cover the whole directory, which is
-// what the server refused to create. Group paths cannot contain a colon (the
-// server rejects it), so the executor's first-colon split stays exact.
+// The consumer separates path from reason at the fixed message tail rather
+// than at the first colon, because the standard name may legitimately contain
+// ':' - the encoder maps it to a fullwidth form only for the server. The
+// trailing slash marks the entry as a directory, so it covers the subtree the
+// server refused to create.
 func groupSensitiveSkipMessage(dir string) string {
 	return fmt.Sprintf("SKIP %s/: the server rejects a name in this path as a sensitive word (%s); skipping the subtree", dir, groupSensitiveWordErrorCode)
 }
