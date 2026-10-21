@@ -1237,15 +1237,42 @@ type zoneRecorder struct {
 	// failPartCode, if non-empty, is the business code answered for failPart
 	// instead of the generic 9999.
 	failPartCode string
-	mu           sync.Mutex
-	urls         []string
-	parts        []partValues
+	// transportFailPart and transportFailTimes make that partIndex's first N
+	// round trips fail with no answer at all - the shape the part re-post
+	// exists for. The message is the one actually seen against the live
+	// service, so the retry classification is tested on a real error string.
+	transportFailPart  int
+	transportFailTimes int
+	// hardCap, if non-zero, turns any further post of transportFailPart into a
+	// business rejection. Without it a mutation that removes the attempt bound
+	// would make the test hang instead of failing red, which proves nothing.
+	hardCap int
+	// fidPart, if non-zero, is the partIndex whose answer carries the fid even
+	// when it is not the highest index. Measured 2026-10-21: the fid belongs to
+	// whichever part completes the server's set, not to the last part index.
+	fidPart  int
+	mu       sync.Mutex
+	urls     []string
+	parts    []partValues
+	attempts map[string]int
 }
 
 type partValues struct {
 	url.Values
 	partBytes   int64
 	fileContent []byte
+}
+
+// jsonResponse answers a plain 200 with a JSON body, the shape upload2C uses for
+// both success and business rejections.
+func jsonResponse(body string) (*http.Response, error) {
+	return &http.Response{
+		StatusCode:    http.StatusOK,
+		Status:        "200 OK",
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+	}, nil
 }
 
 func (z *zoneRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -1269,6 +1296,22 @@ func (z *zoneRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
 			}
 		}
 		z.parts = append(z.parts, pv)
+		if z.attempts == nil {
+			z.attempts = map[string]int{}
+		}
+		idx := pv.Get("partIndex")
+		z.attempts[idx]++
+		n := z.attempts[idx]
+		if z.transportFailPart > 0 && idx == strconv.Itoa(z.transportFailPart) {
+			switch {
+			case z.hardCap > 0 && n > z.hardCap:
+				// 兜底：让"去掉重发次数上限"这种变异以断言变红收场，而不是把测试挂死。
+				return jsonResponse(`{"code":"9999","msg":"hard cap reached"}`)
+			case n <= z.transportFailTimes:
+				return nil, errors.New(`Post "https://tjupload.pan.wo.cn/openapi/client/upload2C": ` +
+					"wsarecv: An existing connection was forcibly closed by the remote host.")
+			}
+		}
 		if idx, err := strconv.Atoi(pv.Get("partIndex")); err == nil && idx == z.failPart5xx {
 			return &http.Response{
 				StatusCode:    http.StatusInternalServerError,
@@ -1284,7 +1327,7 @@ func (z *zoneRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
 			} else {
 				body = `{"code":"9999","msg":"boom"}`
 			}
-		} else if pv.Get("partIndex") != "" && pv.Get("partIndex") != pv.Get("totalPart") {
+		} else if pv.Get("partIndex") != "" && !z.carriesFID(pv.Get("partIndex"), pv.Get("totalPart")) {
 			body = `{"code":"0000","data":{},"msg":"ok"}`
 		}
 	} else if strings.HasSuffix(r.URL.Path, "/wohome/dispatcher") {
@@ -1301,6 +1344,306 @@ func (z *zoneRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
 		ContentLength: int64(len(body)),
 		Header:        http.Header{"Content-Type": []string{"application/json"}},
 	}, nil
+}
+
+// carriesFID decides which part's answer completes the session.
+func (z *zoneRecorder) carriesFID(idx, total string) bool {
+	if z.fidPart > 0 {
+		return idx == strconv.Itoa(z.fidPart)
+	}
+	return idx == total
+}
+
+// countOf returns how many POSTs the recorder saw for a part index. It is the
+// only way to tell "re-posted" from "answered success without storing bytes",
+// because both come back as 0000.
+func (z *zoneRecorder) countOf(idx int) int {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	return z.attempts[strconv.Itoa(idx)]
+}
+
+// contentOf returns the file bytes posted for a part index, in the order the
+// recorder saw them, so a re-post can be compared byte for byte with the
+// attempt it replaced.
+func (z *zoneRecorder) contentOf(idx int) [][]byte {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	var out [][]byte
+	for _, pv := range z.parts {
+		if pv.Get("partIndex") == strconv.Itoa(idx) {
+			out = append(out, pv.fileContent)
+		}
+	}
+	return out
+}
+
+// withPartRetries pins the part re-post ladder for one test: the attempt budget
+// comes from --low-level-retries, which unit tests never parse, and the wait
+// between re-posts is a variable precisely so it can be removed here.
+func withPartRetries(t *testing.T, attempts int) {
+	t.Helper()
+	ci := fs.GetConfig(context.Background())
+	oldLLR, oldDelay := ci.LowLevelRetries, partRetryDelay
+	ci.LowLevelRetries = attempts
+	partRetryDelay = func(int, int) time.Duration { return 0 }
+	t.Cleanup(func() {
+		ci.LowLevelRetries = oldLLR
+		partRetryDelay = oldDelay
+	})
+}
+
+// threePartFs builds an Fs whose upload of a threePartSize source splits into
+// three parts and is posted by one serial worker, so which part was posted how
+// many times is a fact a test can assert rather than race.
+func threePartFs(rec *zoneRecorder) *Fs {
+	f := newUnitTestFs(rec)
+	f.zoneURL = "https://zone-from-server.example"
+	f.zoneLoaded = true
+	f.opt.UploadConcurrency = 1
+	f.opt.UploadCutoff = 1 << 20
+	return f
+}
+
+// threePartSize is 25 Mi against the default 8 Mi chunk: api.PlanParts makes the
+// last part absorb the remainder, so this yields exactly three parts (8, 8, 9)
+// and a totalPart of 3 - the shape the assertions below count on.
+const threePartSize = int64(25 << 20)
+
+// TestUnitPartRetryRePostsTransportFailure is the feature itself: one part's
+// transport failure must be recovered by re-posting that part, with the same
+// bytes, without touching the other parts.
+func TestUnitPartRetryRePostsTransportFailure(t *testing.T) {
+	withPartRetries(t, 3)
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example", transportFailPart: 2, transportFailTimes: 1}
+	f := threePartFs(rec)
+	src := fsobject.NewStaticObjectInfo("a", time.Now(), threePartSize, true, nil, nil)
+	data, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, threePartSize)), "dirID", "big.bin", threePartSize, src)
+	require.NoError(t, err)
+	assert.NotEmpty(t, data.Fid, "the upload must finish through the re-post")
+	assert.Equal(t, 2, rec.countOf(2), "part 2 must be posted twice: once failed, once re-posted")
+	assert.Equal(t, 1, rec.countOf(1), "a neighbouring part must not be re-sent")
+	assert.Equal(t, 1, rec.countOf(3), "the completing part must not be re-sent")
+	got := rec.contentOf(2)
+	require.Len(t, got, 2)
+	assert.Len(t, got[0], 8<<20)
+	assert.Equal(t, got[0], got[1], "a re-post must carry byte-for-byte the same part content")
+}
+
+// TestUnitPartRetryGivesUpWithoutWholeFileRetry locks the layering: when the
+// part's own attempts run out the error must not carry the pacer's RetryError
+// marker, because that marker is what makes copy.go re-upload the whole file.
+func TestUnitPartRetryGivesUpWithoutWholeFileRetry(t *testing.T) {
+	withPartRetries(t, 3)
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example", transportFailPart: 2, transportFailTimes: 99, hardCap: 6}
+	f := threePartFs(rec)
+	src := fsobject.NewStaticObjectInfo("a", time.Now(), threePartSize, true, nil, nil)
+	_, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, threePartSize)), "dirID", "big.bin", threePartSize, src)
+	require.Error(t, err)
+	assert.Equal(t, 3, rec.countOf(2), "the part must be posted exactly --low-level-retries times")
+	assert.False(t, fserrors.IsRetryError(err), "the pacer marker must be stripped, or the whole file is re-uploaded")
+	assert.False(t, fserrors.ShouldRetry(err), "and no other retriable marker may be left on it")
+	assert.True(t, fserrors.IsNoLowLevelRetryError(err))
+	// The wrapping the copy engine adds on top must not resurrect the marker.
+	wrapped := fmt.Errorf("multi-thread copy: failed to write chunk: %w", err)
+	assert.False(t, fserrors.IsRetryError(wrapped))
+	assert.False(t, fserrors.ShouldRetry(wrapped))
+}
+
+// TestUnitPartRetryBusinessCodeNotReposted keeps the rejection path untouched:
+// a 0000-or-not business answer is deterministic for the request.
+func TestUnitPartRetryBusinessCodeNotReposted(t *testing.T) {
+	withPartRetries(t, 3)
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example", failPart: 2}
+	f := threePartFs(rec)
+	src := fsobject.NewStaticObjectInfo("a", time.Now(), threePartSize, true, nil, nil)
+	_, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, threePartSize)), "dirID", "big.bin", threePartSize, src)
+	require.Error(t, err)
+	assert.Equal(t, 1, rec.countOf(2), "a business rejection must never be re-posted")
+	var ae *apiError
+	require.True(t, asAPIError(err, &ae))
+	assert.Equal(t, "9999", ae.Code)
+}
+
+// funcTransport drives one RoundTrip at a time, so a test can make another
+// worker's completion land between this part's failure and its re-post.
+type funcTransport func(*http.Request) (*http.Response, error)
+
+func (fn funcTransport) RoundTrip(r *http.Request) (*http.Response, error) { return fn(r) }
+
+// TestUnitPartRetryStopsAfterSessionCompleted is the gate the J measurement
+// bought: a session cannot complete while a part is missing, so a fid that
+// appeared while this part was retrying means its bytes are already stored.
+// Re-posting then costs a part's worth of bytes and cannot report the fid twice
+// (both measured on the live account).
+func TestUnitPartRetryStopsAfterSessionCompleted(t *testing.T) {
+	withPartRetries(t, 3)
+	st := &partState{}
+	var posts int
+	f := newUnitTestFs(funcTransport(func(r *http.Request) (*http.Response, error) {
+		posts++
+		if posts == 1 {
+			// 这片的第一次 POST 在路上断了，而另一片在此期间凑齐了会话
+			st.note(api.UploadData{Fid: "F", WcFileID: "W"})
+			return nil, errors.New(`Post "https://tjupload.pan.wo.cn/openapi/client/upload2C": ` +
+				"wsarecv: An existing connection was forcibly closed by the remote host.")
+		}
+		t.Errorf("a part must not be re-posted once the session has produced a fid (post #%d)", posts)
+		return nil, errors.New("unexpected extra post")
+	}))
+	f.zoneURL = "https://zone-from-server.example"
+	f.zoneLoaded = true
+
+	data, err := f.postPartRetry(context.Background(), st, func(int) (io.Reader, error) {
+		return bytes.NewReader(make([]byte, 8<<20)), nil
+	}, "https://zone-from-server.example", "dirID", "big.bin", threePartSize, "enc", "unit-session", testAccessToken, api.PartPlan{Index: 2, PartSize: 8 << 20}, 3)
+	require.NoError(t, err)
+	assert.Equal(t, 1, posts, "the failed part must be posted once and then left alone")
+	assert.Equal(t, "F", data.Fid, "the completion answer recorded by the other part is what the caller gets back")
+}
+
+// TestUnitPartFidCanComeFromAnyPart locks the answer handling onto the measured
+// rule: the part that completes the set returns the fid, and it does not have to
+// be the highest index. A pipeline that only trusted the last part would report
+// "empty fid" for an upload the server had already finished.
+func TestUnitPartFidCanComeFromAnyPart(t *testing.T) {
+	withPartRetries(t, 3)
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example", fidPart: 2}
+	f := threePartFs(rec)
+	src := fsobject.NewStaticObjectInfo("a", time.Now(), threePartSize, true, nil, nil)
+	data, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, threePartSize)), "dirID", "big.bin", threePartSize, src)
+	require.NoError(t, err)
+	assert.Equal(t, "F", data.Fid)
+	assert.Equal(t, "W", data.WcFileID)
+	assert.Equal(t, 1, rec.countOf(1))
+	assert.Equal(t, 1, rec.countOf(2))
+	assert.Equal(t, 1, rec.countOf(3), "every part is still posted exactly once")
+}
+
+// countingSeeker counts seeks, so "rewound only for the re-post" is observable.
+type countingSeeker struct {
+	*bytes.Reader
+	seeks     int
+	seekFails error
+}
+
+func (c *countingSeeker) Seek(offset int64, whence int) (int64, error) {
+	if c.seekFails != nil {
+		return 0, c.seekFails
+	}
+	c.seeks++
+	return c.Reader.Seek(offset, whence)
+}
+
+func newChunkWriter(f *Fs) *wopanChunkWriter {
+	return &wopanChunkWriter{
+		f:        f,
+		zoneURL:  "https://zone-from-server.example",
+		dirID:    "dirID",
+		name:     "big.bin",
+		size:     12 << 20,
+		chunk:    8 << 20,
+		total:    2,
+		fiEnc:    "encrypted-fileinfo",
+		uniqueID: "unit-session",
+		token:    testAccessToken,
+	}
+}
+
+// TestUnitWriteChunkRepostsAndRewinds drives the multi-thread copy engine's path,
+// where the part bytes come from a reader the engine owns. The re-post must
+// rewind to the start of THIS part and send the same bytes again.
+func TestUnitWriteChunkRepostsAndRewinds(t *testing.T) {
+	withPartRetries(t, 3)
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example", transportFailPart: 1, transportFailTimes: 1}
+	f := newUnitTestFs(rec)
+	f.zoneURL = "https://zone-from-server.example"
+	f.zoneLoaded = true
+
+	// A reader longer than the part: reading without rewinding would hand the
+	// server the following bytes, so equal content on both attempts proves the
+	// rewind happened rather than merely that a second POST did.
+	buf := make([]byte, 16<<20)
+	for i := range buf {
+		buf[i] = byte(i)
+	}
+	rs := &countingSeeker{Reader: bytes.NewReader(buf)}
+	w := newChunkWriter(f)
+	n, err := w.WriteChunk(context.Background(), 0, rs)
+	require.NoError(t, err)
+	assert.Equal(t, int64(8<<20), n)
+	assert.Equal(t, 2, rec.countOf(1), "the failed part must be re-posted on this path too")
+	assert.Equal(t, 1, rs.seeks, "the reader must be rewound once, for the re-post only")
+	got := rec.contentOf(1)
+	require.Len(t, got, 2)
+	assert.Equal(t, got[0], got[1], "the re-post must not drift to the next bytes of the source")
+	assert.Equal(t, buf[:8<<20], got[0], "and both must be this part's own bytes")
+}
+
+// TestUnitWriteChunkGivesUpStripped is the layering lock for this path.
+func TestUnitWriteChunkGivesUpStripped(t *testing.T) {
+	withPartRetries(t, 2)
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example", transportFailPart: 1, transportFailTimes: 99, hardCap: 5}
+	f := newUnitTestFs(rec)
+	f.zoneURL = "https://zone-from-server.example"
+	f.zoneLoaded = true
+	rs := &countingSeeker{Reader: bytes.NewReader(make([]byte, 16<<20))}
+	w := newChunkWriter(f)
+	_, err := w.WriteChunk(context.Background(), 0, rs)
+	require.Error(t, err)
+	assert.Equal(t, 2, rec.countOf(1))
+	assert.False(t, fserrors.IsRetryError(err), "exhausted part attempts must not trigger a whole-file re-upload")
+	assert.False(t, fserrors.ShouldRetry(err))
+}
+
+// TestUnitWriteChunkSeekFailureNotReposted: a reader that cannot be rewound keeps
+// today's behaviour exactly - the original failure is reported, nothing re-posted.
+func TestUnitWriteChunkSeekFailureNotReposted(t *testing.T) {
+	withPartRetries(t, 3)
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example", transportFailPart: 1, transportFailTimes: 1}
+	f := newUnitTestFs(rec)
+	f.zoneURL = "https://zone-from-server.example"
+	f.zoneLoaded = true
+	rs := &countingSeeker{Reader: bytes.NewReader(make([]byte, 16<<20)), seekFails: errors.New("seek not supported here")}
+	w := newChunkWriter(f)
+	_, err := w.WriteChunk(context.Background(), 0, rs)
+	require.Error(t, err)
+	assert.Equal(t, 1, rec.countOf(1), "with no way to rewind, nothing may be re-posted")
+	assert.Contains(t, err.Error(), "forcibly closed", "the reported failure must stay the transport error")
+}
+
+// TestUnitSinglePartNotReposted holds the deliberate exception: one part holding
+// the whole file keeps the deterministic-rejection rule and the outer ladder, so
+// it gets no inner re-post and no marker stripping.
+func TestUnitSinglePartNotReposted(t *testing.T) {
+	withPartRetries(t, 3)
+	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example", transportFailPart: 1, transportFailTimes: 1}
+	f := newUnitTestFs(rec)
+	f.zoneURL = "https://zone-from-server.example"
+	f.zoneLoaded = true
+	size := int64(12 << 20) // under the 64Mi upload_cutoff of newUnitTestFs => one part
+	src := fsobject.NewStaticObjectInfo("a", time.Now(), size, true, nil, nil)
+	_, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, size)), "dirID", "one.bin", size, src)
+	require.Error(t, err)
+	assert.Equal(t, 1, rec.countOf(1), "the single-part path must post once, as before")
+	assert.True(t, fserrors.IsRetryError(err), "and it must keep the retry marker the whole-file ladder runs on")
+}
+
+// TestUnitPartRetryDelayShape keeps the wait bounded and staggered; a test that
+// only ever runs with the delay stubbed out would not notice a runaway ladder.
+func TestUnitPartRetryDelayShape(t *testing.T) {
+	for attempt := 1; attempt <= 8; attempt++ {
+		d := partRetryDelay(attempt, attempt)
+		assert.LessOrEqual(t, d, 6*time.Second, "the ladder must stay capped however many attempts")
+		assert.Greater(t, d, time.Duration(0))
+	}
+	// attempt 1 is the base plus the stagger and jitter only: 500ms, at most
+	// +400ms of part offset, at most ±125ms of jitter.
+	for i := 0; i < 40; i++ {
+		d := partRetryDelay(1, 0)
+		assert.GreaterOrEqual(t, d, 375*time.Millisecond)
+		assert.LessOrEqual(t, d, 625*time.Millisecond)
+	}
 }
 
 // TestUnitUploadZoneOverride is the regression lock for upload_zone: a
@@ -1402,12 +1745,14 @@ func TestUnitUploadPartFailure(t *testing.T) {
 	assert.Equal(t, 3, len(rec.parts), "parts 4+ must never reach the server after part 3 failed")
 }
 
-// TestUnitUploadPart5xxRetryable locks the retry semantics of transport-level
-// failures: a bare HTTP 500 in the chunked path must NOT be marked NoRetry,
-// so --retries still re-runs the whole file (probe E4 saw transient 500s
-// there), while a 4xx and the single-part path keep their deterministic
-// NoRetry protection.
+// TestUnitUploadPart5xxRetryable locks what a bare HTTP 500 in the chunked path
+// is allowed to do. Probe E4 saw transient 500s there that have nothing to do
+// with the file name, so it stays a transport-level failure rather than a
+// permanent rejection: it is re-posted for that part up to --low-level-retries
+// times, and once those run out it must not ask for the whole file either,
+// because --retries still gets to decide whether the round runs again.
 func TestUnitUploadPart5xxRetryable(t *testing.T) {
+	withPartRetries(t, 3)
 	rec := &zoneRecorder{zoneURL: "https://zone-from-server.example", failPart5xx: 3}
 	f := newUnitTestFs(rec)
 	f.zoneURL = "https://zone-from-server.example"
@@ -1420,8 +1765,12 @@ func TestUnitUploadPart5xxRetryable(t *testing.T) {
 	_, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, size)), "dirID", "big.bin", size, src)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "500 Internal Server Error")
-	assert.False(t, fserrors.IsNoRetryError(err), "a chunked-path 5xx must stay retryable")
-	assert.Equal(t, 3, len(rec.parts), "parts 4+ must never reach the server after part 3 failed")
+	assert.Equal(t, 3, rec.countOf(3), "the failing part is re-posted up to --low-level-retries times")
+	assert.Equal(t, 0, rec.countOf(4), "parts 4+ must never reach the server after part 3 gave up")
+	assert.False(t, fserrors.IsNoRetryError(err), "a chunked-path 5xx must not be a permanent rejection")
+	assert.False(t, fserrors.IsRetryError(err), "and after the part's own attempts, the whole file must not be re-uploaded")
+	assert.False(t, fserrors.ShouldRetry(err))
+	assert.True(t, fserrors.IsNoLowLevelRetryError(err))
 }
 
 // TestUnitUploadPartSpaceFullNoRetry locks the quota mapping: 2001 (空间已满) is
@@ -3196,4 +3545,85 @@ func TestUnitChunkWriterFeaturesExist(t *testing.T) {
 	f := newQuickFs(&benefitTransport{body: quickTransferHitBody})
 	require.NotNil(t, f.Features())
 	assert.True(t, f.Features().CaseInsensitive, "the unit Fs must carry the production feature set")
+}
+
+// noSpaceEnvelope is the dispatcher answer of an exhausted account.
+const noSpaceEnvelope = `{"STATUS":"200","MSG":"ok","LOGID":"L","RSP":{"RSP_CODE":"2001","RSP_DESC":"空间已满","DATA":""}}`
+
+// otherBusinessEnvelope is a business rejection that is NOT the quota code, so a
+// promotion that ignored which code it was gets caught by this row.
+const otherBusinessEnvelope = `{"STATUS":"200","MSG":"ok","LOGID":"L","RSP":{"RSP_CODE":"9999","RSP_DESC":"d","DATA":""}}`
+
+// TestUnitNoSpaceFatalOption locks the fatal_if_no_space decision on the control
+// plane.
+//
+// The expectations are written out per row instead of read back from a table, so
+// changing the promotion rule cannot also move what the test expects. The two
+// negatives are the point: the option off must stay non-fatal, and a code that is
+// not 2001 must stay non-fatal even with the option on.
+func TestUnitNoSpaceFatalOption(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		body        string
+		code        string
+		fatalOpt    bool
+		wantFatal   bool
+		wantNoRetry bool
+	}{
+		{"2001 with the option on", noSpaceEnvelope, codeSpaceFull, true, true, true},
+		{"2001 with the option off", noSpaceEnvelope, codeSpaceFull, false, false, true},
+		{"9999 with the option on", otherBusinessEnvelope, "9999", true, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newUnitTestFs(&scriptedTransport{steps: []qtStep{{body: tc.body}}})
+			f.opt.FatalIfNoSpace = tc.fatalOpt
+			_, err := f.call(context.Background(), chanWoHome, "QueryAllFiles", nil, nil)
+			require.Error(t, err)
+			assert.Equal(t, tc.wantFatal, fserrors.IsFatalError(err),
+				"fatal decision for RSP_CODE %s with fatal_if_no_space=%v: %v", tc.code, tc.fatalOpt, err)
+			assert.Equal(t, tc.wantNoRetry, fserrors.IsNoRetryError(err),
+				"no-retry decision for RSP_CODE %s with fatal_if_no_space=%v: %v", tc.code, tc.fatalOpt, err)
+			// The code must stay unwrappable under whichever wrappers were added,
+			// or isAuthInvalid and the log lines lose the RSP_CODE.
+			var ae *apiError
+			require.True(t, asAPIError(err, &ae), "the *apiError must stay reachable: %v", err)
+			assert.Equal(t, tc.code, ae.Code)
+		})
+	}
+}
+
+// TestUnitUploadNoSpaceFatalOption locks the same decision on the upload path,
+// where 2001 arrives as the response of one part rather than a dispatcher answer.
+func TestUnitUploadNoSpaceFatalOption(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		fatalOpt  bool
+		wantFatal bool
+	}{
+		{"option on", true, true},
+		{"option off", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &zoneRecorder{zoneURL: "https://zone-from-server.example", failPart: 3, failPartCode: codeSpaceFull}
+			f := newUnitTestFs(rec)
+			f.zoneURL = "https://zone-from-server.example"
+			f.zoneLoaded = true
+			f.opt.FatalIfNoSpace = tc.fatalOpt
+			// Serial worker, so the part count below stays deterministic.
+			f.opt.UploadConcurrency = 1
+
+			size := int64(65<<20) + 1 // 8 parts
+			src := fsobject.NewStaticObjectInfo("a", time.Now(), size, true, nil, nil)
+			_, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, size)), "dirID", "big.bin", size, src)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "no space left")
+			assert.Equal(t, tc.wantFatal, fserrors.IsFatalError(err),
+				"fatal decision with fatal_if_no_space=%v: %v", tc.fatalOpt, err)
+			assert.True(t, fserrors.IsNoRetryError(err), "2001 must stay no-retry either way: %v", err)
+			var ae *apiError
+			require.True(t, asAPIError(err, &ae), "the *apiError must stay reachable: %v", err)
+			assert.Equal(t, codeSpaceFull, ae.Code)
+			assert.Equal(t, 3, len(rec.parts), "parts 4+ must never be sent after the account-full answer")
+		})
+	}
 }
