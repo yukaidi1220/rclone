@@ -1151,7 +1151,7 @@ func TestUnitGroupSensitiveWordMkdirDeclinesOnce(t *testing.T) {
 	line := "NOTICE: " + groupSensitiveSkipMessage(name)
 	m := regexp.MustCompile(`.*SKIP ([^:]+):.*`).FindStringSubmatch(line)
 	require.Len(t, m, 2, "the SKIP line must match the executor's extractor: %q", line)
-	assert.Equal(t, "blocked-name/", m[1])
+	assert.Equal(t, name+"/", m[1])
 }
 
 // TestUnitEmptyFileNamesItselfInASkipLine covers what the bucket runs showed:
