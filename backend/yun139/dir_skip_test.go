@@ -99,6 +99,25 @@ func TestUnitGroupSensitiveWordUpdateNamesParentInSkipLine(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(logs.String(), "SKIP "))
 }
 
+// TestUnitGroupSensitiveWordChunkWriterNamesParentInSkipLine covers the
+// multi-thread copy engine. Above --multi-thread-cutoff a file never reaches
+// Put, so the chunk path needs the same recognition or those files reappear as
+// missing from the destination.
+func TestUnitGroupSensitiveWordChunkWriterNamesParentInSkipLine(t *testing.T) {
+	logs := captureLogs(t)
+
+	tr := &groupTransport{dirs: gtestDirs(), sensitiveOnCreate: true}
+	f := newGroupTestFs(tr)
+
+	remote := "blocked-name/sub/big.bin"
+	src := fsobject.NewStaticObjectInfo(remote, time.Now(), 1<<10, true, nil, nil)
+	_, _, err := f.OpenChunkWriter(context.Background(), remote, src)
+	require.Error(t, err, "a refused parent directory must fail the chunk writer")
+
+	assert.Equal(t, "blocked-name/sub/", executorExtractor(t, logs.String()))
+	assert.True(t, fserrors.IsNoRetryError(err), "the refusal must not be re-run: %v", err)
+}
+
 // TestUnitGroupSensitiveWordPersonalSpaceStaysQuiet keeps the recognition bound
 // to the space that produces this refusal. A personal-cloud remote has no group
 // filter, so an unrelated error must reach the caller unchanged and silently.
