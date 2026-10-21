@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"regexp"
@@ -16,6 +17,7 @@ import (
 	"github.com/rclone/rclone/backend/yun139/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
+	fsobject "github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
@@ -1147,4 +1149,25 @@ func TestUnitGroupSensitiveWordMkdirDeclinesOnce(t *testing.T) {
 	m := regexp.MustCompile(`.*SKIP ([^:]+):.*`).FindStringSubmatch(line)
 	require.Len(t, m, 2, "the SKIP line must match the executor's extractor: %q", line)
 	assert.Equal(t, "blocked-name/", m[1])
+}
+
+// TestUnitEmptyFileNamesItselfInASkipLine covers what the bucket runs showed:
+// a zero-byte file cannot be stored, the sentinel is already a NoRetryError,
+// and verify reports it missing unless the copy log carries a SKIP line the
+// executor can turn into an --exclude pattern.
+func TestUnitEmptyFileNamesItselfInASkipLine(t *testing.T) {
+	tr := &groupTransport{dirs: gtestDirs()}
+	f := newGroupTestFs(tr)
+
+	src := fsobject.NewStaticObjectInfo("empty.txt", time.Now(), 0, true, nil, nil)
+	_, err := f.Put(context.Background(), strings.NewReader(""), src)
+	require.Error(t, err)
+	assert.Equal(t, fs.ErrorCantUploadEmptyFiles, err, "the engine's sentinel must survive unchanged")
+	assert.True(t, fserrors.IsNoRetryError(err))
+
+	// Replay the executor's extractor on the line the backend emits.
+	line := "NOTICE: " + fmt.Sprintf("SKIP %s: this remote cannot store empty files; skipping", "empty.txt")
+	m := regexp.MustCompile(`.*SKIP ([^:]+):.*`).FindStringSubmatch(line)
+	require.Len(t, m, 2)
+	assert.Equal(t, "empty.txt", m[1])
 }

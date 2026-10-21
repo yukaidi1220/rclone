@@ -3410,6 +3410,10 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		return nil, errors.New("yun139: can't upload files of unknown size")
 	}
 	if size == 0 {
+		// The sentinel is already a NoRetryError, so nothing is retried; the
+		// SKIP line is what lets a migration's verify step exclude the file
+		// instead of reporting it missing from the destination.
+		fs.Logf(f, "SKIP %s: this remote cannot store empty files; skipping", src.Remote())
 		return nil, fs.ErrorCantUploadEmptyFiles
 	}
 	if limit := f.maxFileSize(); limit > 0 && size > limit {
@@ -4008,6 +4012,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return errors.New("yun139: can't upload files of unknown size")
 	}
 	if size == 0 {
+		fs.Logf(o.fs, "SKIP %s: this remote cannot store empty files; skipping", src.Remote())
 		return fs.ErrorCantUploadEmptyFiles
 	}
 	leafStd, dirID, err := o.fs.dirCache.FindPath(ctx, o.remote, true)
