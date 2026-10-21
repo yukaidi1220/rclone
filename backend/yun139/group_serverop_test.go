@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -1145,13 +1144,11 @@ func TestUnitGroupSensitiveWordMkdirDeclinesOnce(t *testing.T) {
 	assert.True(t, fserrors.IsNoRetryError(err), "a refused name must stop the retry ladder: %v", err)
 	assert.Contains(t, err.Error(), groupSensitiveWordErrorCode)
 
-	// The executor turns the SKIP line into an --exclude pattern with
-	//   grep 'SKIP ' copy.log | sed -E 's/.*SKIP ([^:]+):.*/\1/'
-	// so the line this backend emits has to survive that extractor verbatim.
+	// verify reads the SKIP line back into its "deliberately not uploaded" set.
+	// executorExtractor replays that reading, so this asserts the emitted line
+	// survives it, rather than that we built a string we like.
 	line := "NOTICE: " + groupSensitiveSkipMessage(name)
-	m := regexp.MustCompile(`.*SKIP ([^:]+):.*`).FindStringSubmatch(line)
-	require.Len(t, m, 2, "the SKIP line must match the executor's extractor: %q", line)
-	assert.Equal(t, name+"/", m[1])
+	assert.Equal(t, name+"/", executorExtractor(t, line))
 }
 
 // TestUnitEmptyFileNamesItselfInASkipLine covers what the bucket runs showed:
@@ -1168,11 +1165,8 @@ func TestUnitEmptyFileNamesItselfInASkipLine(t *testing.T) {
 	assert.Equal(t, fs.ErrorCantUploadEmptyFiles, err, "the engine's sentinel must survive unchanged")
 	assert.True(t, fserrors.IsNoRetryError(err))
 
-	// Replay the executor's extractor on the line the backend emits.
 	line := "NOTICE: " + fmt.Sprintf("SKIP %s: this remote cannot store empty files; skipping", "empty.txt")
-	m := regexp.MustCompile(`.*SKIP ([^:]+):.*`).FindStringSubmatch(line)
-	require.Len(t, m, 2)
-	assert.Equal(t, "empty.txt", m[1])
+	assert.Equal(t, "empty.txt", executorExtractor(t, line))
 }
 
 // TestUnitGroupSensitiveFileNameDeclinesOnce covers the file-name variant of
@@ -1190,7 +1184,5 @@ func TestUnitGroupSensitiveFileNameDeclinesOnce(t *testing.T) {
 	assert.Contains(t, err.Error(), sensitiveFileNameErrorCode)
 
 	line := "NOTICE: " + fmt.Sprintf("SKIP %s: the server rejects this file name as a sensitive word (%s); skipping", src.Remote(), sensitiveFileNameErrorCode)
-	m := regexp.MustCompile(`.*SKIP ([^:]+):.*`).FindStringSubmatch(line)
-	require.Len(t, m, 2)
-	assert.Equal(t, "ixQpUqSq_51cg.apk", m[1])
+	assert.Equal(t, "ixQpUqSq_51cg.apk", executorExtractor(t, line))
 }
