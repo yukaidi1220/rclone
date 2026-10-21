@@ -5720,7 +5720,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	}
 	leaf, dirID, err := f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
-		return info, nil, err
+		return info, nil, f.groupDirSensitiveSkip(err, path.Dir(remote))
 	}
 	if err := f.validateName(remote); err != nil {
 		return info, nil, err
