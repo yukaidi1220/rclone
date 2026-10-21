@@ -1632,9 +1632,13 @@ func TestUnitSinglePartNotReposted(t *testing.T) {
 // TestUnitPartRetryDelayShape keeps the wait bounded and staggered; a test that
 // only ever runs with the delay stubbed out would not notice a runaway ladder.
 func TestUnitPartRetryDelayShape(t *testing.T) {
+	// The wait is capped at 5s, then carries at most 400ms of part stagger and
+	// at most a quarter of its own value in jitter, so the ceiling is about
+	// 6.65s. Asserting tighter than that is what made this test fail on a
+	// different machine rather than protect anything.
 	for attempt := 1; attempt <= 8; attempt++ {
 		d := partRetryDelay(attempt, attempt)
-		assert.LessOrEqual(t, d, 6*time.Second, "the ladder must stay capped however many attempts")
+		assert.LessOrEqual(t, d, 7*time.Second, "the ladder must stay capped however many attempts")
 		assert.Greater(t, d, time.Duration(0))
 	}
 	// attempt 1 is the base plus the stagger and jitter only: 500ms, at most
