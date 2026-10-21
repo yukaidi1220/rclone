@@ -378,6 +378,30 @@ func isGroupStalePathError(err error) bool {
 	return errors.As(err, &ae) && ae.Code == groupStalePathErrorCode
 }
 
+// groupSensitiveWordErrorCode is the shared group's answer when a name it is
+// asked to create carries a word its filter rejects: 1909011520 敏感词校验失败
+// (measured 2026-10-20, ~10 identical refusals per file in the refused
+// directory). It is deterministic: the same name is refused every time, so
+// retrying the files under it only repeats the answer.
+const groupSensitiveWordErrorCode = "1909011520"
+
+func isGroupSensitiveWordError(err error) bool {
+	var ae *apiError
+	return errors.As(err, &ae) && ae.Code == groupSensitiveWordErrorCode
+}
+
+// groupSensitiveSkipMessage is the line the migration executor's verify step
+// turns into an --exclude pattern:
+//
+//	grep 'SKIP ' copy.log | sed -E 's/.*SKIP ([^:]+):.*/\1/'
+//
+// The trailing slash makes the pattern cover the whole directory, which is
+// what the server refused to create. Group paths cannot contain a colon (the
+// server rejects it), so the executor's first-colon split stays exact.
+func groupSensitiveSkipMessage(dir string) string {
+	return fmt.Sprintf("SKIP %s/: the server rejects a name in this path as a sensitive word (%s); skipping the subtree", dir, groupSensitiveWordErrorCode)
+}
+
 // memberLevelInfo is a detected member tier and its single-file upload limit.
 type memberLevelInfo struct {
 	maxFileSize int64  // 0 = unknown/no limit (fail-open)
@@ -2882,6 +2906,14 @@ func (f *Fs) familySrvPath(dirID string) string {
 // Mkdir creates the container if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	_, err := f.dirCache.FindDir(ctx, dir, true)
+	if err != nil && f.space == spaceGroup && isGroupSensitiveWordError(err) {
+		// Every file below this directory would hit the same refused name and
+		// be retried the full ladder for nothing. Decline once, name the
+		// subtree in the log so the migration's verify step can exclude it,
+		// and stop the retries on this one file.
+		fs.Logf(f, "%s", groupSensitiveSkipMessage(dir))
+		return fserrors.NoRetryError(fmt.Errorf("yun139: directory %q: %w", dir, err))
+	}
 	return err
 }
 
