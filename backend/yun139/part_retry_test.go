@@ -471,7 +471,9 @@ func TestPutPartRedactsSignedURLInErrorBody(t *testing.T) {
 		drainBody(r)
 		return httpResponse(http.StatusInternalServerError,
 			"failed "+signed+" and X-Amz-Signature=deadbeef2"+
-				" encoded X-Amz-Signature%3Ddeadbeef3%26X-Amz-Credential%3Dsecret3"), nil
+				" encoded X-Amz-Signature%3Ddeadbeef3%26X-Amz-Credential%3Dsecret3"+
+				" token X-Amz-Security-Token%3Dabc%2Fdef%2Bghi%3D"+
+				` json "X-Amz-Signature": "deadbeef4"`), nil
 	})
 	f := &Fs{httpClient: &http.Client{Transport: rt}}
 
@@ -479,7 +481,7 @@ func TestPutPartRedactsSignedURLInErrorBody(t *testing.T) {
 	if err == nil {
 		t.Fatal("putPart: want error")
 	}
-	for _, secret := range []string{"deadbeef", "secret", "deadbeef2", "deadbeef3", "secret3"} {
+	for _, secret := range []string{"deadbeef", "secret", "deadbeef2", "deadbeef3", "secret3", "abc/def", "deadbeef4"} {
 		if strings.Contains(err.Error(), secret) {
 			t.Fatalf("error body leaks %q: %v", secret, err)
 		}
@@ -530,6 +532,9 @@ func TestPutPartHonorsRetryAfter(t *testing.T) {
 func TestPutPartRetryAfterSurvivesToCommandLevel(t *testing.T) {
 	ctx := withLowLevelRetries(t, 1)
 	stubPartRetryDelay(t, time.Millisecond)
+	oldSleep := partSleep
+	partSleep = func(ctx context.Context, d time.Duration) error { return nil }
+	t.Cleanup(func() { partSleep = oldSleep })
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		drainBody(r)
 		resp := httpResponse(http.StatusTooManyRequests, "slow down")
@@ -551,16 +556,53 @@ func TestPutPartRetryAfterSurvivesToCommandLevel(t *testing.T) {
 	if !fserrors.IsRetryAfterError(err) {
 		t.Fatalf("final error lost Retry-After: %v", err)
 	}
-	if d := time.Until(fserrors.RetryAfterErrorTime(err)); d < 100*time.Second {
-		t.Errorf("final Retry-After = %v, want about 120s (not capped to 30s)", d)
+	if d := time.Until(fserrors.RetryAfterErrorTime(err)); d < 25*time.Second || d > 35*time.Second {
+		t.Errorf("final Retry-After = %v, want the 30s cap", d)
 	}
 	stats := accounting.NewStats(ctx)
 	_ = stats.Error(err)
 	if !stats.HadRetryError() {
 		t.Error("Stats.HadRetryError = false; --retries would not wait and re-run")
 	}
-	if d := time.Until(stats.RetryAfter()); d < 100*time.Second {
-		t.Errorf("Stats.RetryAfter = %v, want about 120s", d)
+	if d := time.Until(stats.RetryAfter()); d < 25*time.Second || d > 35*time.Second {
+		t.Errorf("Stats.RetryAfter = %v, want the 30s cap", d)
+	}
+}
+
+func TestPutPartCapsInLoopRetryAfter(t *testing.T) {
+	ctx := withLowLevelRetries(t, 2)
+	stubPartRetryDelay(t, time.Millisecond)
+	var sleeps []time.Duration
+	oldSleep := partSleep
+	partSleep = func(ctx context.Context, d time.Duration) error {
+		sleeps = append(sleeps, d)
+		return nil
+	}
+	t.Cleanup(func() { partSleep = oldSleep })
+
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		drainBody(r)
+		resp := httpResponse(http.StatusTooManyRequests, "slow down")
+		resp.Header.Set("Retry-After", "120")
+		return resp, nil
+	})
+	f := &Fs{httpClient: &http.Client{Transport: rt}}
+
+	err := f.putPart(ctx, 1, 1, "x.bin", bytes.NewReader([]byte("x")), 0, 1, "https://cdn.example/p")
+	if err == nil {
+		t.Fatal("putPart: want error")
+	}
+	if len(sleeps) != 1 {
+		t.Fatalf("sleeps = %v, want one", sleeps)
+	}
+	if sleeps[0] < 29*time.Second || sleeps[0] > 31*time.Second {
+		t.Errorf("in-loop Retry-After = %v, want the 30s cap", sleeps[0])
+	}
+	if !fserrors.IsRetryAfterError(err) {
+		t.Fatalf("final error lost Retry-After: %v", err)
+	}
+	if d := time.Until(fserrors.RetryAfterErrorTime(err)); d < 25*time.Second || d > 35*time.Second {
+		t.Errorf("final Retry-After = %v, want the 30s cap", d)
 	}
 }
 
@@ -618,9 +660,6 @@ func (r *slowReaderAt) ReadAt(p []byte, off int64) (int, error) {
 func TestPutPartSlowBodyIsNotKilled(t *testing.T) {
 	ctx, ci := fs.AddConfig(context.Background())
 	ci.LowLevelRetries = 1
-	// --timeout is the transport's response-header timeout. It must not
-	// bound the upload body: this part needs ~320ms to send.
-	ci.Timeout = fs.Duration(100 * time.Millisecond)
 
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -630,11 +669,21 @@ func TestPutPartSlowBodyIsNotKilled(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	// This is the production shape: --timeout becomes the transport's
+	// ResponseHeaderTimeout, which starts only after the body is written.
+	tr := &http.Transport{ResponseHeaderTimeout: 100 * time.Millisecond}
+	defer tr.CloseIdleConnections()
 	const size = 256 << 10
 	slow := &slowReaderAt{data: make([]byte, size), chunk: 4 << 10, delay: 5 * time.Millisecond}
-	f := &Fs{httpClient: srv.Client()}
-	if err := f.putPart(ctx, 1, 1, "x.bin", slow, 0, size, srv.URL); err != nil {
+	f := &Fs{httpClient: &http.Client{Transport: tr}}
+	start := time.Now()
+	err := f.putPart(ctx, 1, 1, "x.bin", slow, 0, size, srv.URL)
+	elapsed := time.Since(start)
+	if err != nil {
 		t.Fatalf("putPart: %v", err)
+	}
+	if elapsed < 300*time.Millisecond {
+		t.Errorf("body was not slow enough (%v) to prove the point", elapsed)
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Errorf("requests = %d, want 1", got)
@@ -764,6 +813,74 @@ func TestUploadFromRandomMissingPartURL(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Errorf("part requests = %d, want 1", got)
+	}
+}
+
+func TestUploadFromRandomNoPartURLs(t *testing.T) {
+	ctx := withLowLevelRetries(t, 1)
+	f := newPartTestFs(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/hcy/file/create") {
+			drainBody(r)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"code":    "200",
+				"data": map[string]any{
+					"fileId":   "",
+					"fileName": "x.bin",
+					"uploadId": "u",
+				},
+			})
+			return
+		}
+		t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		http.NotFound(w, r)
+	}))
+
+	data := bytes.Repeat([]byte("x"), 2048)
+	_, err := f.uploadFromRandom(ctx, bytes.NewReader(data), "dir", "x.bin", int64(len(data)), "00")
+	if err == nil {
+		t.Fatal("uploadFromRandom: want error when create returns no part URLs")
+	}
+	if !fserrors.IsNoLowLevelRetryError(err) {
+		t.Errorf("error is not NoLowLevel: %v", err)
+	}
+	if fserrors.IsNoRetryError(err) {
+		t.Errorf("error is NoRetry: %v", err)
+	}
+	if fserrors.ShouldRetry(err) {
+		t.Errorf("ShouldRetry = true: %v", err)
+	}
+}
+
+func TestPutPartUnreadable400IsNoLowLevel(t *testing.T) {
+	ctx := withLowLevelRetries(t, 1)
+	oldTimeout := partErrorBodyTimeout
+	partErrorBodyTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { partErrorBodyTimeout = oldTimeout })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		drainBody(r)
+		w.WriteHeader(http.StatusBadRequest)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	f := &Fs{httpClient: srv.Client()}
+	err := f.putPart(ctx, 1, 1, "x.bin", bytes.NewReader([]byte("x")), 0, 1, srv.URL)
+	if err == nil {
+		t.Fatal("putPart: want error")
+	}
+	if !fserrors.IsNoLowLevelRetryError(err) {
+		t.Errorf("unreadable 400 is not NoLowLevel: %v", err)
+	}
+	if fserrors.IsNoRetryError(err) {
+		t.Errorf("unreadable 400 is NoRetry: %v", err)
 	}
 }
 
