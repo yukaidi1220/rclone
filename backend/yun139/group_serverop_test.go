@@ -306,6 +306,9 @@ func (tr *groupTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 			// The account is full: this is a reason to stop, not to re-upload
 			// the file the slow way.
 			return w.done(map[string]any{"success": false, "code": "04000012", "message": "资源配额不足"}), nil
+		case "sensitive":
+			// The file-name filter, measured 2026-10-21.
+			return w.done(map[string]any{"success": false, "code": sensitiveFileNameErrorCode, "message": "文件名包含敏感词"}), nil
 		case "unexpected":
 			return w.done(nil), nil
 		case "exist":
@@ -1170,4 +1173,24 @@ func TestUnitEmptyFileNamesItselfInASkipLine(t *testing.T) {
 	m := regexp.MustCompile(`.*SKIP ([^:]+):.*`).FindStringSubmatch(line)
 	require.Len(t, m, 2)
 	assert.Equal(t, "empty.txt", m[1])
+}
+
+// TestUnitGroupSensitiveFileNameDeclinesOnce covers the file-name variant of
+// the filter: the create endpoint answers 020101057 文件名包含敏感词, which is
+// just as deterministic as the directory one and must stop the retry ladder
+// and name the file for verify.
+func TestUnitGroupSensitiveFileNameDeclinesOnce(t *testing.T) {
+	tr := &groupTransport{dirs: gtestDirs(), createMode: "sensitive"}
+	f := newGroupTestFs(tr)
+
+	src := fsobject.NewStaticObjectInfo("ixQpUqSq_51cg.apk", time.Now(), 4, true, nil, nil)
+	_, err := f.Put(context.Background(), strings.NewReader("data"), src)
+	require.Error(t, err)
+	assert.True(t, fserrors.IsNoRetryError(err), "a refused file name must stop the retry ladder: %v", err)
+	assert.Contains(t, err.Error(), sensitiveFileNameErrorCode)
+
+	line := "NOTICE: " + fmt.Sprintf("SKIP %s: the server rejects this file name as a sensitive word (%s); skipping", src.Remote(), sensitiveFileNameErrorCode)
+	m := regexp.MustCompile(`.*SKIP ([^:]+):.*`).FindStringSubmatch(line)
+	require.Len(t, m, 2)
+	assert.Equal(t, "ixQpUqSq_51cg.apk", m[1])
 }

@@ -390,6 +390,17 @@ func isGroupSensitiveWordError(err error) bool {
 	return errors.As(err, &ae) && ae.Code == groupSensitiveWordErrorCode
 }
 
+// sensitiveFileNameErrorCode is the create endpoint's refusal of a file NAME
+// that carries a word its filter rejects: 020101057 文件名包含敏感词 (measured
+// 2026-10-21, three files refused, each retried the full ladder). The
+// directory check uses a different code, so both are recognised.
+const sensitiveFileNameErrorCode = "020101057"
+
+func isSensitiveFileNameError(err error) bool {
+	var ae *apiError
+	return errors.As(err, &ae) && ae.Code == sensitiveFileNameErrorCode
+}
+
 // groupSensitiveSkipMessage is the line the migration executor's verify step
 // turns into an --exclude pattern:
 //
@@ -3436,6 +3447,12 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		if res != nil && res.fileID != "" {
 			f.discardUpload(ctx, res.fileID, dirID, f.sharedSpace())
 		}
+		if isSensitiveFileNameError(err) {
+			// Same shape as the directory refusal: a name the filter rejects is
+			// rejected for good, and verify needs the file named to exclude it.
+			fs.Logf(f, "SKIP %s: the server rejects this file name as a sensitive word (%s); skipping", src.Remote(), sensitiveFileNameErrorCode)
+			return nil, fserrors.NoRetryError(err)
+		}
 		return nil, err
 	}
 	// /hcy/file/create never overwrites: a name the directory already holds
@@ -4087,6 +4104,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 		if oldMoved {
 			o.restoreOldName(ctx, leaf, dirID, oldAt)
+		}
+		if isSensitiveFileNameError(err) {
+			fs.Logf(o.fs, "SKIP %s: the server rejects this file name as a sensitive word (%s); skipping", o.remote, sensitiveFileNameErrorCode)
+			return fserrors.NoRetryError(err)
 		}
 		return err
 	}
