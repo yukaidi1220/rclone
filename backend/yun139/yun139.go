@@ -4016,7 +4016,7 @@ var partErrorBodyTimeout = 5 * time.Second
 
 // readPartErrorBody reads a bounded error body, then closes it if the
 // server stalls. Closing from this goroutine unblocks the reader.
-func readPartErrorBody(ctx context.Context, body io.ReadCloser, limit int64) []byte {
+func readPartErrorBody(ctx context.Context, body io.ReadCloser, limit int64) ([]byte, bool) {
 	type result struct{ b []byte }
 	ch := make(chan result, 1)
 	go func() {
@@ -4028,23 +4028,21 @@ func readPartErrorBody(ctx context.Context, body io.ReadCloser, limit int64) []b
 	defer timer.Stop()
 	select {
 	case r := <-ch:
-		return r.b
+		return r.b, false
 	case <-timer.C:
 		_ = body.Close()
-		return nil
+		return nil, true
 	case <-ctx.Done():
 		_ = body.Close()
-		return nil
+		return nil, true
 	}
 }
 
-// partRetryAfterError carries the server's Retry-After alongside a
-// retryable status error. after is capped for the in-loop sleep;
-// serverAfter keeps the full value for the command-level retry.
+// partRetryAfterError carries the server's Retry-After (already capped at
+// partRetryMaxServerDelay) alongside a retryable status error.
 type partRetryAfterError struct {
-	err         error
-	after       time.Duration
-	serverAfter time.Duration
+	err   error
+	after time.Duration
 }
 
 func (e *partRetryAfterError) Error() string { return e.err.Error() }
@@ -4118,16 +4116,27 @@ func isExpiredPartURLStatus(status int, body string) bool {
 // URI, and copy.log is uploaded as a build artifact. The second pattern
 // covers a body where the URL itself was percent-encoded.
 var (
-	signedPartQuery        = regexp.MustCompile(`(?i)(X-Amz-(?:Signature|Credential|Security-Token)=)[^&\s"']+`)
-	signedPartQueryEncoded = regexp.MustCompile(`(?i)(X-Amz-(?:Signature|Credential|Security-Token)%3D)[^%&\s"']+`)
+	signedPartQuery     = regexp.MustCompile(`(?i)(X-Amz-(?:Signature|Credential|Security-Token)=)[^&\s"']+`)
+	signedPartQueryJSON = regexp.MustCompile(`(?i)("?(?:X-Amz-(?:Signature|Credential|Security-Token))"?\s*:\s*"?)[^",}\s]+`)
 )
 
-func redactPartBody(body, url string) string {
+func redactPartBodyOnce(body, url string) string {
 	if url != "" {
 		body = strings.ReplaceAll(body, url, "<part-url>")
 	}
 	body = signedPartQuery.ReplaceAllString(body, "${1}<redacted>")
-	return signedPartQueryEncoded.ReplaceAllString(body, "${1}<redacted>")
+	return signedPartQueryJSON.ReplaceAllString(body, "${1}<redacted>")
+}
+
+func redactPartBody(body, url string) string {
+	body = redactPartBodyOnce(body, url)
+	// A percent-encoded body hides the parameter separators; decode it and
+	// redact the readable form so credentials containing %2F/%2B/%3D do
+	// not survive past the first %.
+	if unescaped, err := neturl.QueryUnescape(body); err == nil && unescaped != body {
+		body = redactPartBodyOnce(unescaped, url)
+	}
+	return body
 }
 
 // partPermanentError stops both retry ladders: the copy engine must not
@@ -4172,18 +4181,14 @@ func (f *Fs) putPart(ctx context.Context, partIdx, total int, leaf string, fread
 		retryAt = time.Time{}
 		var retryAfter *partRetryAfterError
 		if errors.As(err, &retryAfter) {
-			// Keep the whole remaining server delay for cmd's sleep even
-			// though the in-loop delay is capped.
-			retryAt = time.Now().Add(retryAfter.serverAfter)
+			retryAt = time.Now().Add(retryAfter.after)
 		}
 		if attempt == attempts {
 			break
 		}
 		delay := partRetryDelay(attempt, partIdx)
-		if !retryAt.IsZero() {
-			if d := time.Until(retryAt); d > delay {
-				delay = d
-			}
+		if retryAfter != nil && retryAfter.after > delay {
+			delay = retryAfter.after
 		}
 		fs.Debugf(f, "yun139: %s: upload part %d/%d attempt %d/%d failed, retrying in %v: %v",
 			leaf, partIdx, total, attempt, attempts, delay, err)
@@ -4258,17 +4263,21 @@ func (f *Fs) putPartOnce(ctx context.Context, partIdx, total int, freader io.Rea
 		// Never let a stalled error page hold the retry loop: this helper
 		// closes the body after partErrorBodyTimeout. The upload body is
 		// not subject to this deadline.
-		body := readPartErrorBody(ctx, res.Body, 64<<10)
+		body, timedOut := readPartErrorBody(ctx, res.Body, 64<<10)
 		bodyText := redactPartBody(string(body), url)
 		err := fmt.Errorf("yun139: upload part %d/%d via %s -> %s: %s: %s",
 			partIdx, total, host, peerAddr, res.Status, truncate(bodyText, 500))
+		if timedOut && res.StatusCode == http.StatusBadRequest {
+			// The body never arrived, so the 400 code is unknown. Do not
+			// turn an unreadable transient response into a permanent one.
+			return fserrors.NoLowLevelRetryError(err)
+		}
 		if isTransientPartStatus(res.StatusCode, bodyText) {
 			if d := parseRetryAfter(res.Header.Get("Retry-After")); d > 0 {
-				serverAfter := d
 				if d > partRetryMaxServerDelay {
 					d = partRetryMaxServerDelay
 				}
-				return &partRetryAfterError{err: err, after: d, serverAfter: serverAfter}
+				return &partRetryAfterError{err: err, after: d}
 			}
 			return err
 		}
