@@ -415,6 +415,29 @@ func groupSensitiveSkipMessage(dir string) string {
 	return fmt.Sprintf("SKIP %s/: the server rejects a name in this path as a sensitive word (%s); skipping the subtree", dir, groupSensitiveWordErrorCode)
 }
 
+// groupDirSensitiveSkip turns the shared group's refusal of a blocked directory
+// name into a skipped file.
+//
+// The refusal arrives while a file's parent directories are being created, and
+// dirCache creates them without going through Mkdir, so it has to be recognised
+// here too. Every file under the refused name hits it, so the pattern is the
+// object's own parent rather than an ancestor: one line per failing directory,
+// which excludes exactly the files the server will never accept.
+//
+// An empty or "." parent is the remote root, which the server does not refuse.
+// The log line is withheld there: a caller turning it into an exclude pattern
+// would then drop every object in the remote, so only the no-retry marking is
+// applied.
+func (f *Fs) groupDirSensitiveSkip(err error, dir string) error {
+	if err == nil || f.space != spaceGroup || !isGroupSensitiveWordError(err) {
+		return err
+	}
+	if dir != "" && dir != "." {
+		fs.Logf(f, "%s", groupSensitiveSkipMessage(dir))
+	}
+	return fserrors.NoRetryError(err)
+}
+
 // memberLevelInfo is a detected member tier and its single-file upload limit.
 type memberLevelInfo struct {
 	maxFileSize int64  // 0 = unknown/no limit (fail-open)
@@ -3436,7 +3459,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	}
 	leafStd, dirID, err := f.dirCache.FindPath(ctx, src.Remote(), true)
 	if err != nil {
-		return nil, err
+		return nil, f.groupDirSensitiveSkip(err, path.Dir(src.Remote()))
 	}
 	if err := f.validateName(src.Remote()); err != nil {
 		return nil, err
@@ -4360,7 +4383,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 	leafStd, dirID, err := o.fs.dirCache.FindPath(ctx, o.remote, true)
 	if err != nil {
-		return err
+		return o.fs.groupDirSensitiveSkip(err, path.Dir(o.remote))
 	}
 	if err := o.fs.validateName(o.remote); err != nil {
 		return err
