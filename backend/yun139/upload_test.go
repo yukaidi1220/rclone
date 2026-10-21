@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,47 +21,52 @@ import (
 // CDN's S3 signature covers Content-Length, so an empty header makes it
 // reject the part with 403 SignatureDoesNotMatch (seen live).
 func TestPutPart_SetsContentLength(t *testing.T) {
-	var gotCL string
-	var gotReqCL int64
+	const size = 1 << 20
+	var gotCL []string
+	var gotReqCL []int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotCL = r.Header.Get("Content-Length")
-		gotReqCL = r.ContentLength
+		gotCL = append(gotCL, r.Header.Get("Content-Length"))
+		gotReqCL = append(gotReqCL, r.ContentLength)
+		_, _ = io.Copy(io.Discard, r.Body)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	f := &Fs{httpClient: srv.Client(), opt: Options{}}
-	err := f.putPart(context.Background(), 1, 1, newZeroReader(100*1024*1024), srv.URL, 100*1024*1024)
+	err := f.putPart(ctx, 1, 1, "x.bin", newZeroReaderAt(size), 0, size, srv.URL)
 	if err != nil {
 		t.Fatalf("putPart: %v", err)
 	}
-	if want := strconv.FormatInt(100*1024*1024, 10); gotCL != want {
-		t.Errorf("Content-Length header = %q, want %q", gotCL, want)
+	if len(gotCL) != 1 || len(gotReqCL) != 1 {
+		t.Fatalf("got %d/%d requests, want 1", len(gotCL), len(gotReqCL))
 	}
-	if gotReqCL != 100*1024*1024 {
-		t.Errorf("req.ContentLength = %d, want %d", gotReqCL, 100*1024*1024)
+	if want := strconv.FormatInt(size, 10); gotCL[0] != want {
+		t.Errorf("Content-Length header = %q, want %q", gotCL[0], want)
+	}
+	if gotReqCL[0] != size {
+		t.Errorf("req.ContentLength = %d, want %d", gotReqCL[0], size)
 	}
 }
 
-// newZeroReader returns a reader that yields n zero bytes.
-type zeroReader struct {
-	left int64
+// zeroReaderAt yields n zero bytes without allocating them.
+type zeroReaderAt struct {
+	size int64
 }
 
-func newZeroReader(n int64) *zeroReader { return &zeroReader{left: n} }
+func newZeroReaderAt(n int64) *zeroReaderAt { return &zeroReaderAt{size: n} }
 
-func (z *zeroReader) Read(p []byte) (int, error) {
-	if z.left <= 0 {
-		return 0, context.DeadlineExceeded // test will not read past the end
+func (z *zeroReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off >= z.size {
+		return 0, io.EOF
 	}
-	if int64(len(p)) > z.left {
-		p = p[:z.left]
+	n := int64(len(p))
+	if off+n > z.size {
+		n = z.size - off
 	}
-	for i := range p {
-		p[i] = 0
-	}
-	z.left -= int64(len(p))
-	return len(p), nil
+	clear(p[:n])
+	return int(n), nil
 }
 
 // TestCreateReqPayload_Mirrors139Strm verifies the /file/create JSON the

@@ -16,11 +16,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mathrand "math/rand/v2"
 	"net/http"
 	"net/http/httptrace"
 	neturl "net/url"
 	"os"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -3818,7 +3820,8 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 		return nil, noRetryOnQuotaRejection(&apiError{Code: resp.Code, Message: resp.Message})
 	}
 	if len(resp.Data.PartInfos) == 0 {
-		return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, errors.New("create returned no upload URL")
+		return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName},
+			fserrors.NoLowLevelRetryError(errors.New("create returned no upload URL"))
 	}
 	// PUT every part in parallel, in batches of maxPartsPerRequest.
 	// The first batch's URLs came from /file/create; the rest come from
@@ -3901,18 +3904,29 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(f.opt.UploadConcurrency)
 	for _, p := range parts {
+		// A part that exhausted its retries cancels gctx. Stop launching
+		// the rest: a 200 GiB file is thousands of parts and each launch
+		// would otherwise still issue a doomed request.
+		if gctx.Err() != nil {
+			break
+		}
 		p := p
 		g.Go(func() error {
 			url, ok := urlOfPart[int(p.index)]
 			if !ok {
-				return fmt.Errorf("yun139: no upload URL for part %d", p.index)
+				return fserrors.NoLowLevelRetryError(fmt.Errorf("yun139: no upload URL for part %d", p.index))
 			}
-			rdr := io.NewSectionReader(freader, p.offset, p.partSize)
-			return f.putPart(gctx, int(p.index), len(parts), rdr, url, p.partSize)
+			return f.putPart(gctx, int(p.index), len(parts), leaf, freader, p.offset, p.partSize, url)
 		})
 	}
 	if err := g.Wait(); err != nil {
 		return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, fmt.Errorf("put part: %w", err)
+	}
+	// The launch loop may have stopped before starting any part when the
+	// caller's context was cancelled. Do not go on to complete a file that
+	// was never uploaded.
+	if err := ctx.Err(); err != nil {
+		return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName}, err
 	}
 	// Finally, mark the file complete. Mirrors the official client:
 	// contentHash + contentHashAlgorithm + fileId + uploadId.
@@ -3948,22 +3962,266 @@ func (f *Fs) uploadFromRandom(ctx context.Context, freader io.ReaderAt, dirID, l
 	return &uploadResult{fileID: resp.Data.FileID, fileName: resp.Data.FileName, hashHex: hashHex}, nil
 }
 
-// putPart PUTs a single part to its pre-signed URL.
-func (f *Fs) putPart(ctx context.Context, partIdx, total int, r io.Reader, url string, size int64) error {
+// partRetryMaxServerDelay caps a server-supplied Retry-After. The point of
+// the part retry loop is to recover a flapping edge quickly, not to park a
+// transfer for minutes waiting for a rate limiter to clear.
+const partRetryMaxServerDelay = 30 * time.Second
+
+// partRetryDelay returns how long to wait before retrying a part PUT.
+// It is a variable so tests can remove the wait.
+var partRetryDelay = func(attempt, partIdx int) time.Duration {
+	const (
+		base     = 500 * time.Millisecond
+		maxDelay = 5 * time.Second
+	)
+	d := base
+	for i := 1; i < attempt && d < maxDelay; i++ {
+		d *= 2
+	}
+	if d > maxDelay {
+		d = maxDelay
+	}
+	// Stagger the parts of one file so a flapping edge does not see all
+	// of them come back at the same instant. partIdx is stable.
+	d += time.Duration(partIdx%5) * 100 * time.Millisecond
+	// Add jitter so parts of different files, which share part numbers,
+	// do not retry in lockstep either.
+	jitter := time.Duration(mathrand.Int64N(int64(d)/2+1)) - d/4
+	d += jitter
+	if d < time.Millisecond {
+		d = time.Millisecond
+	}
+	return d
+}
+
+// sleepCtx waits for d or until ctx is done.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// partSleep is a seam for tests that need to inspect the chosen delay.
+var partSleep = sleepCtx
+
+// partErrorBodyTimeout bounds how long we wait for a CDN error page. It
+// deliberately does not cover the upload body: a 32Mi part on a slow link
+// can take more than ten minutes and still make progress.
+var partErrorBodyTimeout = 5 * time.Second
+
+// readPartErrorBody reads a bounded error body, then closes it if the
+// server stalls. Closing from this goroutine unblocks the reader.
+func readPartErrorBody(ctx context.Context, body io.ReadCloser, limit int64) []byte {
+	type result struct{ b []byte }
+	ch := make(chan result, 1)
+	go func() {
+		b, _ := io.ReadAll(io.LimitReader(body, limit))
+		_, _ = io.Copy(io.Discard, io.LimitReader(body, 1<<20))
+		ch <- result{b: b}
+	}()
+	timer := time.NewTimer(partErrorBodyTimeout)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.b
+	case <-timer.C:
+		_ = body.Close()
+		return nil
+	case <-ctx.Done():
+		_ = body.Close()
+		return nil
+	}
+}
+
+// partRetryAfterError carries the server's Retry-After alongside a
+// retryable status error. after is capped for the in-loop sleep;
+// serverAfter keeps the full value for the command-level retry.
+type partRetryAfterError struct {
+	err         error
+	after       time.Duration
+	serverAfter time.Duration
+}
+
+func (e *partRetryAfterError) Error() string { return e.err.Error() }
+func (e *partRetryAfterError) Unwrap() error { return e.err }
+
+// partRetryAfterFinalError carries the last Retry-After through the
+// NoLowLevel wrapper so cmd's --retries sleep honors it without letting
+// copy.go re-upload the file.
+type partRetryAfterFinalError struct {
+	err error
+	at  time.Time
+}
+
+func (e *partRetryAfterFinalError) Error() string         { return e.err.Error() }
+func (e *partRetryAfterFinalError) Unwrap() error         { return e.err }
+func (e *partRetryAfterFinalError) RetryAfter() time.Time { return e.at }
+
+// parseRetryAfter understands both forms in RFC 9110: delay-seconds and
+// an HTTP-date. It returns 0 when the header is absent or unusable.
+func parseRetryAfter(header string) time.Duration {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(header); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(header); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+// isTransientPartStatus reports whether the edge says "try again later".
+// S3-compatible stores use 400 RequestTimeout when the body stalls, so the
+// status alone is not enough.
+func isTransientPartStatus(status int, body string) bool {
+	switch {
+	case status == http.StatusRequestTimeout,
+		status == http.StatusTooManyRequests,
+		status >= 500:
+		return true
+	case status == http.StatusBadRequest:
+		return strings.Contains(body, "RequestTimeout") ||
+			strings.Contains(body, "SlowDown") ||
+			strings.Contains(body, "InternalError") ||
+			strings.Contains(body, "IncompleteBody")
+	}
+	return false
+}
+
+// isExpiredPartURLStatus reports a 400 that says the signed URL's
+// credentials expired. A fresh create can mint a new URL, so this must
+// not be permanent.
+func isExpiredPartURLStatus(status int, body string) bool {
+	if status != http.StatusBadRequest {
+		return false
+	}
+	return strings.Contains(body, "RequestExpired") ||
+		strings.Contains(body, "ExpiredToken") ||
+		strings.Contains(body, "AuthorizationQueryParametersError")
+}
+
+// signedPartQuery matches the credential-bearing query parameters that a
+// pre-signed part URL carries. CDN error pages sometimes echo the request
+// URI, and copy.log is uploaded as a build artifact. The second pattern
+// covers a body where the URL itself was percent-encoded.
+var (
+	signedPartQuery        = regexp.MustCompile(`(?i)(X-Amz-(?:Signature|Credential|Security-Token)=)[^&\s"']+`)
+	signedPartQueryEncoded = regexp.MustCompile(`(?i)(X-Amz-(?:Signature|Credential|Security-Token)%3D)[^%&\s"']+`)
+)
+
+func redactPartBody(body, url string) string {
+	if url != "" {
+		body = strings.ReplaceAll(body, url, "<part-url>")
+	}
+	body = signedPartQuery.ReplaceAllString(body, "${1}<redacted>")
+	return signedPartQueryEncoded.ReplaceAllString(body, "${1}<redacted>")
+}
+
+// partPermanentError stops both retry ladders: the copy engine must not
+// re-upload the file and --retries must not re-run the command. The
+// NoLowLevel marker is what stops ShouldRetry even when the response body
+// happens to contain a phrase from fserrors' retriable list.
+func partPermanentError(err error) error {
+	return fserrors.NoLowLevelRetryError(fserrors.NoRetryError(err))
+}
+
+// putPart PUTs a single part to its pre-signed URL, retrying this part
+// only. The URL is issued for one part and stays valid for the upload's
+// lifetime; the same URL accepts repeated PUTs of that part (confirmed
+// 2026-10-21), so a retry does not need a fresh getUploadUrl.
+//
+// Attempts are bounded by --low-level-retries. When they are exhausted
+// the error is marked NoLowLevelRetry, which stops the copy engine from
+// re-uploading the whole file while leaving --retries free to re-run the
+// sync with a fresh upload URL.
+func (f *Fs) putPart(ctx context.Context, partIdx, total int, leaf string, freader io.ReaderAt, offset, size int64, url string) error {
+	if url == "" {
+		// A fresh create may return a usable URL, so leave the command-level
+		// retry available.
+		return fserrors.NoLowLevelRetryError(fmt.Errorf(
+			"yun139: %s: upload part %d/%d: server returned an empty upload URL", leaf, partIdx, total))
+	}
+	attempts := max(fs.GetConfig(ctx).LowLevelRetries, 1)
+	var lastErr error
+	var retryAt time.Time
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := f.putPartOnce(ctx, partIdx, total, freader, offset, size, url)
+		if err == nil {
+			return nil
+		}
+		if fserrors.IsNoRetryError(err) || fserrors.IsNoLowLevelRetryError(err) {
+			return err
+		}
+		lastErr = err
+		retryAt = time.Time{}
+		var retryAfter *partRetryAfterError
+		if errors.As(err, &retryAfter) {
+			// Keep the whole remaining server delay for cmd's sleep even
+			// though the in-loop delay is capped.
+			retryAt = time.Now().Add(retryAfter.serverAfter)
+		}
+		if attempt == attempts {
+			break
+		}
+		delay := partRetryDelay(attempt, partIdx)
+		if !retryAt.IsZero() {
+			if d := time.Until(retryAt); d > delay {
+				delay = d
+			}
+		}
+		fs.Debugf(f, "yun139: %s: upload part %d/%d attempt %d/%d failed, retrying in %v: %v",
+			leaf, partIdx, total, attempt, attempts, delay, err)
+		if err := partSleep(ctx, delay); err != nil {
+			return err
+		}
+	}
+	final := fserrors.NoLowLevelRetryError(fmt.Errorf(
+		"yun139: %s: upload part %d/%d failed after %d attempts: %w", leaf, partIdx, total, attempts, lastErr))
+	if !retryAt.IsZero() {
+		// Keep --retries from hammering a rate limiter: Stats sees RetryAfter
+		// and cmd sleeps, while the NoLowLevel marker still stops copy.go
+		// from re-uploading the whole file.
+		return &partRetryAfterFinalError{err: final, at: retryAt}
+	}
+	return final
+}
+
+// putPartOnce issues one PUT for a part. Retryable failures come back as
+// plain errors so putPart can try again; permanent ones are wrapped here.
+func (f *Fs) putPartOnce(ctx context.Context, partIdx, total int, freader io.ReaderAt, offset, size int64, url string) error {
+	r := io.NewSectionReader(freader, offset, size)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, r)
 	if err != nil {
-		return err
+		// Do not echo the URL: the parse error would carry the signed query.
+		// A fresh create may mint a usable URL, so allow the command retry.
+		return fserrors.NoLowLevelRetryError(fmt.Errorf(
+			"yun139: upload part %d/%d: server returned an invalid upload URL", partIdx, total))
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Origin", yunBaseURL)
 	req.Header.Set("Referer", yunBaseURL+"/")
 	req.Header.Set("User-Agent", defaultUserAgent)
-	// Content-Length is part of the CDN's S3 signature: leaving it out
-	// makes the server reject the part with SignatureDoesNotMatch once
-	// it tries to verify the body. The caller must know the part size.
+	// ContentLength makes the Transport write the Content-Length header the
+	// CDN's signature covers. Every attempt needs a fresh reader because the
+	// transport consumes the body of a failed attempt.
 	if size > 0 {
 		req.ContentLength = size
-		req.Header.Set("Content-Length", strconv.FormatInt(size, 10))
 	}
 	// Capture which endpoint + peer IP actually served this part: the
 	// pre-signed URL's host is one thing, the connection may land on a
@@ -3984,27 +4242,86 @@ func (f *Fs) putPart(ctx context.Context, partIdx, total int, r io.Reader, url s
 		},
 	}))
 	t0 := time.Now()
-	res, err := f.httpClient.Do(req)
+	client := *f.httpClient
+	// The URL is pre-signed for this exact host and method. Following a
+	// redirect would turn a 301/302 into a bodyless GET or replay the
+	// signature against another host, so surface the 3xx instead.
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	res, err := client.Do(req)
 	if err != nil {
-		return err
+		return f.partTransportError(partIdx, total, host, peerAddr, err)
 	}
 	defer func() { _ = res.Body.Close() }()
-	if res.StatusCode >= 300 {
-		body, _ := io.ReadAll(res.Body)
-		// 5xx and 4xx are both treated as business errors; the part URL
-		// is single-use so a retry on a transient 5xx would just hit the
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		// Never let a stalled error page hold the retry loop: this helper
+		// closes the body after partErrorBodyTimeout. The upload body is
+		// not subject to this deadline.
+		body := readPartErrorBody(ctx, res.Body, 64<<10)
+		bodyText := redactPartBody(string(body), url)
 		err := fmt.Errorf("yun139: upload part %d/%d via %s -> %s: %s: %s",
-			partIdx, total, host, peerAddr, res.Status, truncate(string(body), 500))
-		if res.StatusCode >= 400 && res.StatusCode < 500 {
-			return fserrors.NoRetryError(err)
+			partIdx, total, host, peerAddr, res.Status, truncate(bodyText, 500))
+		if isTransientPartStatus(res.StatusCode, bodyText) {
+			if d := parseRetryAfter(res.Header.Get("Retry-After")); d > 0 {
+				serverAfter := d
+				if d > partRetryMaxServerDelay {
+					d = partRetryMaxServerDelay
+				}
+				return &partRetryAfterError{err: err, after: d, serverAfter: serverAfter}
+			}
+			return err
 		}
-		return err
+		switch {
+		case res.StatusCode >= 300 && res.StatusCode < 400,
+			res.StatusCode == http.StatusUnauthorized,
+			res.StatusCode == http.StatusForbidden,
+			res.StatusCode == http.StatusNotFound,
+			res.StatusCode == http.StatusConflict,
+			res.StatusCode == http.StatusGone,
+			isExpiredPartURLStatus(res.StatusCode, bodyText):
+			// Do not replay this URL, but let --retries re-run the command:
+			// a fresh create may mint a URL that works.
+			return fserrors.NoLowLevelRetryError(err)
+		default:
+			// A malformed request, bad credentials or an oversized part:
+			// retrying it, even with a new URL, cannot succeed.
+			return partPermanentError(err)
+		}
 	}
 	elapsed := time.Since(t0)
 	fs.Debugf(f, "yun139: uploaded part %d/%d (%v) via %s -> %s (reused=%v) in %v (%s)",
 		partIdx, total, fs.SizeSuffix(size), host, peerAddr, reusedConn,
 		elapsed.Round(time.Millisecond), fs.SizeSuffix(float64(size)/elapsed.Seconds()).ByteRateUnit())
 	return nil
+}
+
+// partTransportError strips the *url.Error layers added by http.Client.
+// Their Error() strings contain the full pre-signed URL, including
+// X-Amz-Signature, and copy.log is uploaded as a build artifact. The
+// underlying error keeps its Timeout/Temporary methods so ShouldRetry can
+// still classify it.
+func (f *Fs) partTransportError(partIdx, total int, host, peerAddr string, err error) error {
+	for {
+		var ue *neturl.Error
+		if !errors.As(err, &ue) {
+			break
+		}
+		if ue.Err == nil {
+			return fserrors.NoLowLevelRetryError(fmt.Errorf(
+				"yun139: upload part %d/%d via %s -> %s: transport error", partIdx, total, host, peerAddr))
+		}
+		err = ue.Err
+	}
+	wrapped := fmt.Errorf("yun139: upload part %d/%d via %s -> %s: %w",
+		partIdx, total, host, peerAddr, err)
+	if !fserrors.ShouldRetry(err) {
+		// A certificate error, a DNS failure or another permanent transport
+		// error will not improve by replaying the same URL. Leave the
+		// command-level retry available for a fresh create.
+		return fserrors.NoLowLevelRetryError(wrapped)
+	}
+	return wrapped
 }
 
 // restoreOldName puts the old object back under the requested leaf after a

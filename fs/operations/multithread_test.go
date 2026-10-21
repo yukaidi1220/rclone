@@ -403,3 +403,46 @@ func TestMultithreadCopyWriterAtErrors(t *testing.T) {
 		}
 	}
 }
+
+type closeErrorChunkWriter struct {
+	closeErr error
+	aborted  bool
+}
+
+func (w *closeErrorChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
+	return io.Copy(io.Discard, reader)
+}
+
+func (w *closeErrorChunkWriter) Close(ctx context.Context) error { return w.closeErr }
+
+func (w *closeErrorChunkWriter) Abort(ctx context.Context) error {
+	w.aborted = true
+	return nil
+}
+
+// Classification belongs to the backend; this checks that multiThreadCopy's
+// own %w wrapper does not drop a NoLowLevel marker from ChunkWriter.Close.
+func TestMultithreadCopyChunkWriterCloseNoLowLevel(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.MultiThreadChunkSize = 4
+	ci.MultiThreadStreams = 2
+	ci.MultiThreadSet = true
+	f, err := mockfs.NewFs(ctx, "destination", "", nil)
+	require.NoError(t, err)
+	src := mockobject.New("file.txt").WithContent([]byte("0123456789abcdef"), mockobject.SeekModeNone)
+	srcFs, err := mockfs.NewFs(ctx, "source", "", nil)
+	require.NoError(t, err)
+	src.SetFs(srcFs)
+	cause := errors.New("part retries exhausted")
+	writer := &closeErrorChunkWriter{closeErr: fserrors.NoLowLevelRetryError(cause)}
+	f.Features().OpenChunkWriter = func(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (fs.ChunkWriterInfo, fs.ChunkWriter, error) {
+		return fs.ChunkWriterInfo{ChunkSize: 4, Concurrency: 2}, writer, nil
+	}
+	tr := accounting.GlobalStats().NewTransfer(src, nil)
+	_, err = multiThreadCopy(ctx, f, src.Remote(), src, 2, tr)
+	tr.Done(ctx, err)
+	require.ErrorIs(t, err, cause)
+	assert.True(t, fserrors.IsNoLowLevelRetryError(err))
+	assert.False(t, fserrors.ShouldRetry(err))
+	assert.True(t, writer.aborted)
+}
