@@ -3985,8 +3985,10 @@ func TestUnitDirRejectCacheClearedByDirCacheFlush(t *testing.T) {
 }
 
 // TestUnitDirRejectCacheEntryCap: --backup-dir style use adds a fresh
-// timestamped directory every round, so the table needs a ceiling. Past it the
-// table is dropped instead of growing for the life of an rcd.
+// timestamped directory every round, so the table needs a ceiling. At the
+// ceiling NEW keys stop being remembered; the table is never wiped, because
+// wiping would hand every known-bad directory a fresh probe budget, and right at
+// the ceiling a new key on every call would clear it again and again.
 func TestUnitDirRejectCacheEntryCap(t *testing.T) {
 	rc := newRejectCache()
 	now := time.Unix(0, 0)
@@ -3998,12 +4000,37 @@ func TestUnitDirRejectCacheEntryCap(t *testing.T) {
 	assert.Equal(t, dirRejectMaxEntries, len(rc.entries), "the table fills to the ceiling")
 
 	rc.record(dirKey{"overflow", "x"}, &apiError{Code: "9999"})
-	assert.Equal(t, 1, len(rc.entries), "recording past the ceiling drops the table")
+	assert.Equal(t, dirRejectMaxEntries, len(rc.entries), "a new key at the ceiling is refused, not stored")
+	held, _ := rc.held(dirKey{"overflow", "x"})
+	assert.False(t, held, "and therefore not replayed")
 
-	held, _ := rc.held(dirKey{"p0", "x"})
-	assert.False(t, held, "a dropped entry stops being replayed")
-	held, _ = rc.held(dirKey{"overflow", "x"})
-	assert.True(t, held, "the entry that triggered the reset is still remembered")
+	// Known keys keep working, including their probe counting.
+	rc.record(dirKey{"p0", "x"}, &apiError{Code: "9999"})
+	assert.Equal(t, dirRejectMaxEntries, len(rc.entries), "updating an existing key does not grow the table")
+	held, err := rc.held(dirKey{"p0", "x"})
+	assert.True(t, held, "an established refusal stays held")
+	var ae *apiError
+	assert.True(t, asAPIError(err, &ae), "the replayed error still carries its code: %v", err)
+	assert.Equal(t, "9999", ae.Code)
+	assert.Equal(t, 2, rc.entries[dirKey{"p0", "x"}].probes, "the probe count keeps accumulating")
+}
+
+// TestUnitDirMoveCleanPathPaysNoExtraListing: the ungated destination re-check
+// exists to defeat a held refusal, so it must not fire when nothing is held.
+// dircache's own check already paged the parent in that case, and re-paging it
+// would double the cost of every ordinary directory move.
+func TestUnitDirMoveCleanPathPaysNoExtraListing(t *testing.T) {
+	ctx := context.Background()
+	tr := newDirTransport()
+	tr.create = func(*dirRejectTransport, string, string) (string, string) {
+		return "", "dir-landed"
+	}
+	tr.dirs[dirKeyOf("root-id", "moved")] = "dir-m"
+	f := newUnitTestFs(tr)
+
+	require.NoError(t, f.DirMove(ctx, f, "moved", "elsewhere"))
+	assert.Equal(t, 1, tr.renames, "the move itself happened")
+	assert.Equal(t, 3, tr.lists, "dircache's own lookups and nothing else")
 }
 
 // TestUnitDirRejectCacheClearedByPurge: purging frees names and empties the
