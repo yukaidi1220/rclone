@@ -441,6 +441,12 @@ file, the phase or the round.
   one is a listing, so it does not spend the probe budget.
 - `rclone purge`, `rclone rmdir` and a directory move drop the whole memory,
   because the tree they describe has changed.
+- The memory holds at most 4096 refusals, so a long `rclone rcd` that meets a
+  fresh refused directory every round - `--backup-dir` style - cannot grow
+  without limit. Past that ceiling a new refusal is not remembered, and that
+  directory costs one pair of requests per file again, as it did before this
+  existed. Nothing already remembered is dropped to make room: wiping the table
+  would hand every known-bad directory a fresh probe budget all over again.
 
 The error lines do not decrease - rclone reports the failure per file whether
 or not a request went out; the requests are what fall. A name you free in the

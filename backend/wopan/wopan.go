@@ -2094,8 +2094,13 @@ const (
 	dirRejectReopen = 30 * time.Minute
 	// dirRejectMaxEntries bounds the table. Everything else here is a per-run
 	// quantity, but --backup-dir style use adds a fresh timestamped directory
-	// every round, so the map itself needs a ceiling; past it the table is
-	// dropped and refills, which costs one probe per directory again.
+	// every round, so the map itself needs a ceiling. At the ceiling new keys
+	// stop being remembered and the table is never wiped: wiping would hand every
+	// known-bad directory a fresh probe budget, and right at the ceiling a new key
+	// on every call would clear it again and again. A directory that never got a
+	// slot is still answered honestly - one listing plus one CreateDirectory per
+	// file, which is the pre-cache cost - so the ceiling trades the saving away,
+	// it does not trade correctness.
 	dirRejectMaxEntries = 4096
 )
 
@@ -2267,8 +2272,10 @@ func (f *Fs) findDirID(ctx context.Context, pathID, leaf string) (string, error)
 // anything. That would cost rclone its fs.ErrorDirExists answer for a move onto
 // a directory that really is there, along with the copy+purge fallback that
 // depends on it. This is the one question that needs the truth rather than the
-// cheap answer, and the listing it costs is the one the uncached path did
-// anyway.
+// cheap answer, so it is asked on every move: two requests per directory move,
+// never per file. Gating it on "is the refusal still held" would make one call
+// ask a clock twice with real requests in between, and the second answer is the
+// one that would decide whether to look.
 func (f *Fs) dirPresentUngated(ctx context.Context, parentID, leaf string) (bool, error) {
 	return f.listAll(ctx, parentID, func(item *api.File) bool {
 		return item.Type == fileTypeDir && strings.EqualFold(item.Name, leaf)
@@ -4535,18 +4542,21 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return err
 	}
 
-	// Ask the server, not the cache, whether the destination name is taken - but
-	// only when the cache is the one that answered. dircache already asked
-	// FindLeaf, and an unhinged FindLeaf pages the parent itself, so a second
-	// listing would just double the cost of every clean move.
-	if held, _ := f.dirRejects.held(dirKey{dstDirectoryID, dstLeaf}); held {
-		exists, err := f.dirPresentUngated(ctx, dstDirectoryID, dstLeaf)
-		if err != nil {
-			return err
-		}
-		if exists {
-			return fs.ErrorDirExists
-		}
+	// Ask the server, not the cache, whether the destination name is taken. The
+	// helper above answered that question through FindLeaf, which can answer it
+	// from the refusal cache without sending anything, so a move onto a real
+	// directory would otherwise report success. This runs on every move rather
+	// than only when a refusal is "still held": holding is a clock predicate, the
+	// source resolution in between really does go to the server, and re-asking
+	// the cache later in the same call can read a different answer - the one
+	// direction that is never allowed is skipping this check. The cost is two
+	// requests per directory move, not per file.
+	exists, err := f.dirPresentUngated(ctx, dstDirectoryID, dstLeaf)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fs.ErrorDirExists
 	}
 
 	moved := false

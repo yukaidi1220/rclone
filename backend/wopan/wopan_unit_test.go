@@ -3656,11 +3656,17 @@ type dirRejectTransport struct {
 	// listFails makes the next that many listings answer a business error - the
 	// eventual-consistency or outage shape the recovery lookup can hit.
 	listFails int
-	creates   int
-	lists     int
-	deletes   int
-	moves     int
-	renames   int
+	// tick, when non-zero, moves clk forward by that much on every request that
+	// reaches the model. It is how a test closes a 60 second trust window in the
+	// middle of ONE DirMove call: the cache is consulted at the top of that call
+	// and any later consultation has to survive the requests in between.
+	tick    time.Duration
+	clk     time.Time
+	creates int
+	lists   int
+	deletes int
+	moves   int
+	renames int
 }
 
 func newDirTransport() *dirRejectTransport {
@@ -3684,6 +3690,9 @@ func dirEnvErr(code string) string {
 }
 
 func (t *dirRejectTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if t.tick != 0 {
+		t.clk = t.clk.Add(t.tick)
+	}
 	raw, _ := io.ReadAll(r.Body)
 	var req struct {
 		Header struct {
@@ -4015,11 +4024,11 @@ func TestUnitDirRejectCacheEntryCap(t *testing.T) {
 	assert.Equal(t, 2, rc.entries[dirKey{"p0", "x"}].probes, "the probe count keeps accumulating")
 }
 
-// TestUnitDirMoveCleanPathPaysNoExtraListing: the ungated destination re-check
-// exists to defeat a held refusal, so it must not fire when nothing is held.
-// dircache's own check already paged the parent in that case, and re-paging it
-// would double the cost of every ordinary directory move.
-func TestUnitDirMoveCleanPathPaysNoExtraListing(t *testing.T) {
+// TestUnitDirMovePaysOneTruthCheckPerMove records the price of never gating
+// that check on the cache: an ordinary move costs two listings more than
+// dircache alone spends, because one listing is page 0 plus the empty page that
+// stops it. Per move, never per file - which is the trade this feature is for.
+func TestUnitDirMovePaysOneTruthCheckPerMove(t *testing.T) {
 	ctx := context.Background()
 	tr := newDirTransport()
 	tr.create = func(*dirRejectTransport, string, string) (string, string) {
@@ -4030,7 +4039,43 @@ func TestUnitDirMoveCleanPathPaysNoExtraListing(t *testing.T) {
 
 	require.NoError(t, f.DirMove(ctx, f, "moved", "elsewhere"))
 	assert.Equal(t, 1, tr.renames, "the move itself happened")
-	assert.Equal(t, 3, tr.lists, "dircache's own lookups and nothing else")
+	assert.Equal(t, 5, tr.lists, "dircache's own lookups plus one truth check")
+}
+
+// TestUnitDirMoveTruthCheckOutlivesTheWindow is the clock shape that makes
+// asking the cache twice inside one DirMove unsafe. The refusal is held while
+// dircache asks "does the destination exist"; the source resolution after that
+// really does page the server, and the 60 second window closes during those
+// requests. A re-check gated on a second held() call then reads "nothing held",
+// skips the listing, and lets a rename land on a directory that exists.
+func TestUnitDirMoveTruthCheckOutlivesTheWindow(t *testing.T) {
+	ctx := context.Background()
+	tr := newDirTransport()
+	tr.clk = time.Unix(0, 0)
+	tr.create = func(t *dirRejectTransport, parent, name string) (string, string) {
+		if name == "photos" {
+			// Really there from now on, answered like a transient failure - the
+			// only way a wrong "absent" gets into the cache.
+			t.dirs[dirKeyOf(parent, name)] = "dir-photos"
+			return "9999", ""
+		}
+		return "", "dir-" + name
+	}
+	tr.dirs[dirKeyOf("root-id", "moved")] = "dir-m"
+	f := newUnitTestFs(tr)
+	f.dirRejects.now = func() time.Time { return tr.clk }
+
+	require.Error(t, f.Mkdir(ctx, "photos"))
+	require.Equal(t, 1, tr.creates, "one refusal recorded for (root, photos)")
+
+	// Start the clock only now, so the window is closed by requests made inside
+	// DirMove and not by however much traffic the Mkdir above happened to spend.
+	tr.tick = dirRejectTTL + time.Second
+	err := f.DirMove(ctx, f, "moved", "photos")
+	require.Error(t, err, "a window that closes mid-call must not turn the move into a success")
+	assert.Equal(t, fs.ErrorDirExists, err, "and the answer must be the honest one")
+	assert.Equal(t, 0, tr.moves, "no MoveFile may go out")
+	assert.Equal(t, 0, tr.renames, "no RenameFileOrDirectory either")
 }
 
 // TestUnitDirRejectCacheClearedByPurge: purging frees names and empties the
