@@ -297,6 +297,7 @@ func NewTransportCustom(ctx context.Context, customize func(*http.Transport)) *T
 	}
 
 	// Wrap that http.Transport in our own transport
+	registerTransport(t)
 	return newTransport(ci, t)
 }
 

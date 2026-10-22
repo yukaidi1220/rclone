@@ -138,6 +138,16 @@ var ConfigOptionsInfo = Options{{
 	Help:    "IO idle timeout",
 	Groups:  "Networking",
 }, {
+	Name:    "connect_family",
+	Default: "",
+	Help:    "Address family to dial with: \"\" (default, Go's Happy Eyeballs), \"prefer-v4\", \"prefer-v6\", \"v4\" or \"v6\"",
+	Groups:  "Networking",
+}, {
+	Name:    "connect_family_cooldown",
+	Default: 5 * time.Minute,
+	Help:    "How long to avoid a host's address family after it fails. Only used when --connect-family is set; 0 disables",
+	Groups:  "Networking",
+}, {
 	Name:    "expect_continue_timeout",
 	Default: 1 * time.Second,
 	Help:    "Timeout when using expect / 100-continue in HTTP",
@@ -602,6 +612,8 @@ type ConfigInfo struct {
 	Transfers                  int               `config:"transfers"`
 	ConnectTimeout             Duration          `config:"contimeout"` // Connect timeout
 	Timeout                    Duration          `config:"timeout"`    // Data channel timeout
+	ConnectFamily              string            `config:"connect_family"`
+	ConnectFamilyCooldown      Duration          `config:"connect_family_cooldown"`
 	ExpectContinueTimeout      Duration          `config:"expect_continue_timeout"`
 	Dump                       DumpFlags         `config:"dump"`
 	InsecureSkipVerify         bool              `config:"no_check_certificate"` // Skip server certificate verification
