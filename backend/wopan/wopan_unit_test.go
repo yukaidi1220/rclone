@@ -3656,6 +3656,7 @@ type dirRejectTransport struct {
 	lists     int
 	deletes   int
 	moves     int
+	renames   int
 }
 
 func newDirTransport() *dirRejectTransport {
@@ -3740,6 +3741,9 @@ func (t *dirRejectTransport) RoundTrip(r *http.Request) (*http.Response, error) 
 		// The model does not relocate the entry: this test measures whether the
 		// cache was dropped after a move the server accepted, not the move.
 		t.moves++
+		return okResp(dirEnvOK("null")), nil
+	case "RenameFileOrDirectory":
+		t.renames++
 		return okResp(dirEnvOK("null")), nil
 	}
 	return okResp(dirEnvOK("null")), nil
@@ -3858,6 +3862,92 @@ func TestUnitDirRejectBudgetConstants(t *testing.T) {
 	assert.Equal(t, 60*time.Second, dirRejectTTL)
 	assert.Equal(t, 3, dirRejectProbes)
 	assert.Equal(t, 30*time.Minute, dirRejectReopen)
+	assert.Equal(t, 4096, dirRejectMaxEntries)
+}
+
+// TestUnitDirRejectCacheNameRejectionReopensToo is the policy the first
+// pre-release review forced out: an explicit name rejection is NOT remembered
+// for the life of the process. The refusal cache sits on the read side too
+// (List, Rmdir, Purge and dircache's destination check all reach FindLeaf), so a
+// verdict that is ever wrong would hide a directory that really exists and,
+// because a held key sends no request, would never find out. rcd and mount live
+// for days. This test is what gives the rule teeth: reintroducing a permanent
+// class turns the reopen step red.
+func TestUnitDirRejectCacheNameRejectionReopensToo(t *testing.T) {
+	ctx := context.Background()
+	tr := newDirTransport()
+	tr.create = func(*dirRejectTransport, string, string) (string, string) {
+		return codeSensitiveWord, ""
+	}
+	f := newUnitTestFs(tr)
+	clk := time.Unix(0, 0)
+	f.dirRejects.now = func() time.Time { return clk }
+
+	for step := 1; step <= 3; step++ {
+		require.Error(t, f.Mkdir(ctx, "blocked-name"))
+		assert.Equal(t, step, tr.creates, "a 4444 pays for the same three probes as any other code")
+		clk = clk.Add(31 * time.Minute)
+	}
+	require.Error(t, f.Mkdir(ctx, "blocked-name"))
+	assert.Equal(t, 4, tr.creates, "and it reopens on the same schedule, not never")
+}
+
+// TestUnitDirMoveNeverReportsSuccessOntoAHeldDirectory is the other thing that
+// review found: dircache.DirMove asks "does the destination exist" through
+// FindLeaf, so a held refusal must not turn a move onto a real directory into a
+// reported success. Whatever the error text, the move must not go out.
+func TestUnitDirMoveNeverReportsSuccessOntoAHeldDirectory(t *testing.T) {
+	ctx := context.Background()
+	tr := newDirTransport()
+	tr.create = func(t *dirRejectTransport, parent, name string) (string, string) {
+		if name == "photos" {
+			// The directory is really there from now on, but this attempt is
+			// answered like a transient failure - that is what puts a wrong
+			// "absent" into the cache.
+			t.dirs[dirKeyOf(parent, name)] = "dir-photos"
+			return "9999", ""
+		}
+		return "", "dir-" + name
+	}
+	tr.dirs[dirKeyOf("root-id", "moved")] = "dir-m"
+	f := newUnitTestFs(tr)
+	clk := time.Unix(0, 0)
+	f.dirRejects.now = func() time.Time { return clk }
+
+	require.Error(t, f.Mkdir(ctx, "photos"))
+	require.Equal(t, 1, tr.creates, "one refusal recorded for (root, photos)")
+
+	err := f.DirMove(ctx, f, "moved", "photos")
+	require.Error(t, err, "a move onto a directory the cache believes absent must not report success")
+	assert.Equal(t, 0, tr.moves, "and no MoveFile may go out")
+	assert.Equal(t, 0, tr.renames, "and no RenameFileOrDirectory either")
+
+	// Once the window closes, the answer must become rclone's real contract.
+	clk = clk.Add(61 * time.Second)
+	assert.Equal(t, fs.ErrorDirExists, f.DirMove(ctx, f, "moved", "photos"),
+		"with the cache out of the way dircache must see the existing directory")
+}
+
+// TestUnitDirRejectCacheEntryCap: --backup-dir style use adds a fresh
+// timestamped directory every round, so the table needs a ceiling. Past it the
+// table is dropped instead of growing for the life of an rcd.
+func TestUnitDirRejectCacheEntryCap(t *testing.T) {
+	rc := newRejectCache()
+	now := time.Unix(0, 0)
+	rc.now = func() time.Time { return now }
+
+	for i := range dirRejectMaxEntries {
+		rc.record(dirKey{fmt.Sprintf("p%d", i), "x"}, &apiError{Code: "9999"})
+	}
+	assert.Equal(t, dirRejectMaxEntries, len(rc.entries), "the table fills to the ceiling")
+
+	rc.record(dirKey{"overflow", "x"}, &apiError{Code: "9999"})
+	assert.Equal(t, 1, len(rc.entries), "recording past the ceiling drops the table")
+
+	held, _ := rc.held(dirKey{"p0", "x"})
+	assert.False(t, held, "a dropped entry stops being replayed")
+	held, _ = rc.held(dirKey{"overflow", "x"})
+	assert.True(t, held, "the entry that triggered the reset is still remembered")
 }
 
 // TestUnitDirRejectCacheClearedByPurge: purging frees names and empties the
