@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -145,10 +146,23 @@ func (h *familyHealth) noteDialSuccess(host string, v6 bool) {
 // to the address family we just gave up on.
 var transports sync.Map // closer -> struct{}
 
+const maxTransports = 256
+
+var transportCount int32
+
 func registerTransport(t interface{ CloseIdleConnections() }) {
-	if t != nil {
-		transports.Store(t, struct{}{})
+	if t == nil {
+		return
 	}
+	if atomic.AddInt32(&transportCount, 1) > maxTransports {
+		// Only reachable in long lived processes which keep building clients.
+		// Forget the old transports rather than growing without bound; the
+		// only cost is that a demotion no longer closes their idle
+		// connections.
+		transports.Clear()
+		atomic.StoreInt32(&transportCount, 1)
+	}
+	transports.Store(t, struct{}{})
 }
 
 // closeIdleConnections drops the idle connections of every transport we made.

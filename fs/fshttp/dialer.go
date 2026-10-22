@@ -175,15 +175,17 @@ func (d *Dialer) dialFamily(ctx context.Context, address string) (c net.Conn, er
 	if h == nil {
 		h = health
 	}
-	// The whole family walk shares one connect budget, like net.Dialer does for
-	// a single dial: otherwise a dark IPv6 would cost --contimeout per address.
-	lookupCtx := ctx
-	if d.Dialer.Timeout > 0 {
-		var cancel context.CancelFunc
-		lookupCtx, cancel = context.WithTimeout(ctx, d.Dialer.Timeout)
-		defer cancel()
+	// Bound the lookup and every address attempt on its own. A timeout on one
+	// family must not eat the budget of the other: with a shared budget a dark
+	// IPv6 would make the IPv4 fallback fail instantly and then get blamed as
+	// well, blocking both families after two rounds.
+	attemptTimeout := d.Dialer.Timeout
+	if attemptTimeout <= 0 || attemptTimeout > 10*time.Second {
+		attemptTimeout = 10 * time.Second
 	}
+	lookupCtx, lookupCancel := context.WithTimeout(ctx, attemptTimeout)
 	addrs, lookupErr := lookupIPAddr(lookupCtx, host)
+	lookupCancel()
 	if lookupErr != nil || len(addrs) == 0 {
 		return nil, nil, false
 	}
@@ -242,9 +244,15 @@ func (d *Dialer) dialFamily(ctx context.Context, address string) (c net.Conn, er
 		}
 		// Use the full IPAddr so an IPv6 zone survives the join.
 		target := net.JoinHostPort(cand.addr.String(), port)
-		conn, dialErr := d.Dialer.DialContext(lookupCtx, network, target)
+		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+		conn, dialErr := d.Dialer.DialContext(attemptCtx, network, target)
+		cancel()
 		if dialErr != nil {
 			lastErr = dialErr
+			if ctx.Err() != nil {
+				// The caller gave up; this says nothing about the family.
+				return nil, dialErr, true
+			}
 			if h.noteDialFailure(host, cand.v6, d.cooldown) {
 				fs.Logf(nil, "fshttp: %s: IPv%d failed %d times in a row (%v), avoiding that family for %v",
 					host, familyNum(cand.v6), h.dialThreshold, dialErr,
