@@ -419,18 +419,23 @@ produced 733 `failed to make directory` errors - a parent listing plus a
 rounds.
 
 The backend now remembers refusals, keyed by parent directory id and name, so a
-refused directory costs one probe instead of one pair of requests per file:
+refused directory costs one probe instead of one pair of requests per file.
+Every refusal - `1009`, `4444` and any other business code alike - is trusted
+for 60 seconds and re-probed at most 3 times, after which the memory goes quiet
+for 30 minutes.
 
-- An explicit name rejection - `1009` illegal character, `4444` sensitive word -
-  is kept for the whole run.
-- Any other refusal is trusted for 60 seconds, and re-probed at most 3 times
-  before the memory goes quiet for 30 minutes. A code like `9999 系统异常` has
-  never been shown to be a name verdict - the same refused directory answered
-  `4444` for some of its files and `9999` for others, and which one a file got
-  did not depend on the file, the phase or the round. The 60 second window alone
-  would be useless, because a round can run for half an hour, and a bare cap
-  would be a life sentence: a full account or a service outage would keep
-  reporting the directory as absent even after it recovers.
+Nothing is held for the life of the process, not even the explicit name
+rejections. The memory is consulted on the read side too: listing a directory,
+`rclone rmdir`, `rclone purge` and the destination check inside a server-side
+directory move all ask the same question, and a held entry sends no request. A
+verdict that was ever wrong would therefore hide a directory that really exists
+without ever finding out, and `rclone rcd` and `rclone mount` run for days.
+Measurement also says permanence bought nothing: the savings come from the cap,
+and one reopen costs 2 requests per bad directory per half hour. And the codes
+are not as tidy as it looks - one refused directory answered `4444` for some of
+its files and `9999` for others, and which one a file got did not depend on the
+file, the phase or the round.
+
 - A network failure is never remembered, because it says nothing about the name.
   Neither is a failure of the lookup that follows a "name taken" answer: that
   one is a listing, so it does not spend the probe budget.
@@ -438,11 +443,8 @@ refused directory costs one probe instead of one pair of requests per file:
   because the tree they describe has changed.
 
 The error lines do not decrease - rclone reports the failure per file whether
-or not a request went out; the requests are what fall. A name refused as
-illegal or sensitive stays refused for the rest of the run, so freeing one in
-the app does not take effect until the command restarts. A directory that only
-ever answered an unclassified code is offered to the server again every half
-hour.
+or not a request went out; the requests are what fall. A name you free in the
+app during a long run is picked up again within about half an hour.
 
 ## Restrictions
 

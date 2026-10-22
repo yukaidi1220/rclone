@@ -2067,19 +2067,30 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 const (
 	// dirRejectTTL bounds how long a replayed directory-creation failure is
-	// trusted for a code that is not an explicit name rejection.
+	// trusted before the directory is offered to the server again.
 	dirRejectTTL = 60 * time.Second
-	// dirRejectProbes caps how many times one directory is offered to the
-	// server inside a single window sequence. It bounds the cost of being wrong
-	// about a code whose determinism is not established.
+	// dirRejectProbes caps how many consecutive refusals one directory is
+	// allowed to pay for. Without it a 60 second window turns a half hour round
+	// into 30 probes per bad directory.
 	dirRejectProbes = 3
 	// dirRejectReopen is how long an exhausted probe budget holds before the
-	// directory is offered again. Without it the budget would be a life sentence
-	// for the process: an account that fills up, a service outage, or a
-	// directory another client created would stay invisible for the rest of a
-	// long-lived rcd or mount. Half an hour keeps that cost to one extra probe
-	// per bad directory per hour while staying far inside a round's runtime.
+	// directory is offered again.
+	//
+	// Nothing is ever remembered for the life of the process, not even the
+	// explicit name rejections (1009, 4444). The refusal cache is consulted on
+	// the read side too - List, Rmdir, Purge and dircache's "destination does
+	// not exist" check in DirMove all reach FindLeaf - so a wrong verdict would
+	// hide a directory that really exists and, because a held key sends no
+	// request, would never learn otherwise. rcd and mount live for days, so
+	// "never" is unbounded there. Measurement says permanence buys nothing: the
+	// savings come from the cap, and one reopen costs 2 requests per bad
+	// directory per half hour.
 	dirRejectReopen = 30 * time.Minute
+	// dirRejectMaxEntries bounds the table. Everything else here is a per-run
+	// quantity, but --backup-dir style use adds a fresh timestamped directory
+	// every round, so the map itself needs a ceiling; past it the table is
+	// dropped and refills, which costs one probe per directory again.
+	dirRejectMaxEntries = 4096
 )
 
 // dirKey identifies one directory creation attempt: the leaf name inside a
@@ -2092,10 +2103,9 @@ type dirKey struct {
 
 // rejectedDir is one remembered CreateDirectory refusal.
 type rejectedDir struct {
-	err       error     // replayed unchanged, so the caller sees the same error it saw first
-	permanent bool      // explicit name rejections never expire
-	probes    int       // CreateDirectory calls made for this key so far
-	expiry    time.Time // when the last answer stops being trusted
+	err    error     // replayed unchanged, so the caller sees the same error it saw first
+	probes int       // refusals recorded for this key so far
+	expiry time.Time // when the last answer stops being trusted
 }
 
 // rejectCache remembers directory creations the server refused.
@@ -2143,7 +2153,6 @@ func (rc *rejectCache) held(key dirKey) (bool, error) {
 		return false, nil
 	}
 	switch {
-	case e.permanent:
 	case rc.now().Before(e.expiry):
 	case e.probes >= dirRejectProbes && rc.now().Before(e.expiry.Add(dirRejectReopen)):
 	default:
@@ -2152,9 +2161,22 @@ func (rc *rejectCache) held(key dirKey) (bool, error) {
 	return true, e.err
 }
 
+// forget drops the key on positive evidence that the directory exists. The
+// lookup in DirMove's destination check does this: only a listing that actually
+// shows the name counts as evidence, and it is the one place that asks the
+// server without going through the cache.
+func (rc *rejectCache) forget(key dirKey) {
+	if rc == nil {
+		return
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	delete(rc.entries, key)
+}
+
 // record remembers the failure. Only server business errors belong here: a
 // transport error says nothing about the name, and caching one would turn a
-// network blip into a permanent refusal.
+// network blip into a refusal that outlives it.
 func (rc *rejectCache) record(key dirKey, err error) {
 	if rc == nil {
 		return
@@ -2165,13 +2187,13 @@ func (rc *rejectCache) record(key dirKey, err error) {
 	}
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	e := rejectedDir{
-		err:       err,
-		permanent: ae.Code == codeIllegalName || ae.Code == codeSensitiveWord,
-		probes:    rc.entries[key].probes + 1,
+	if len(rc.entries) >= dirRejectMaxEntries {
+		rc.entries = make(map[dirKey]rejectedDir)
 	}
-	if !e.permanent {
-		e.expiry = rc.now().Add(dirRejectTTL)
+	e := rejectedDir{
+		err:    err,
+		probes: rc.entries[key].probes + 1,
+		expiry: rc.now().Add(dirRejectTTL),
 	}
 	rc.entries[key] = e
 }
@@ -2237,6 +2259,23 @@ func (f *Fs) findDirID(ctx context.Context, pathID, leaf string) (string, error)
 		return "", fs.ErrorDirNotFound
 	}
 	return id, nil
+}
+
+// dirPresentUngated reports whether a directory called leaf sits directly
+// inside parentID, by paging the parent itself instead of consulting the
+// refusal cache.
+//
+// dircache.DirMove asks "does the destination exist" through FindDir, which
+// reaches FindLeaf - and a held refusal answers "absent" without sending
+// anything. That would cost rclone its fs.ErrorDirExists answer for a move onto
+// a directory that really is there, along with the copy+purge fallback that
+// depends on it. This is the one question that needs the truth rather than the
+// cheap answer, and the listing it costs is the one the uncached path did
+// anyway.
+func (f *Fs) dirPresentUngated(ctx context.Context, parentID, leaf string) (bool, error) {
+	return f.listAll(ctx, parentID, func(item *api.File) bool {
+		return item.Type == fileTypeDir && strings.EqualFold(item.Name, leaf)
+	})
 }
 
 // CreateDir makes a directory with pathID as parent and name leaf
@@ -4497,6 +4536,18 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
 	if err != nil {
 		return err
+	}
+
+	// Ask the server, not the cache, whether the destination name is taken.
+	// dircache already checked this through FindLeaf, which replays a held
+	// refusal as "absent" for free.
+	exists, err := f.dirPresentUngated(ctx, dstDirectoryID, dstLeaf)
+	if err != nil {
+		return err
+	}
+	if exists {
+		f.dirRejects.forget(dirKey{dstDirectoryID, dstLeaf})
+		return fs.ErrorDirExists
 	}
 
 	moved := false
