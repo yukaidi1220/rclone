@@ -2167,19 +2167,6 @@ func (rc *rejectCache) held(key dirKey) (bool, error) {
 	return true, e.err
 }
 
-// forget drops the key on positive evidence that the directory exists. The
-// lookup in DirMove's destination check does this: only a listing that actually
-// shows the name counts as evidence, and it is the one place that asks the
-// server without going through the cache.
-func (rc *rejectCache) forget(key dirKey) {
-	if rc == nil {
-		return
-	}
-	rc.mu.Lock()
-	defer rc.mu.Unlock()
-	delete(rc.entries, key)
-}
-
 // record remembers the failure. Only server business errors belong here: a
 // transport error says nothing about the name, and caching one would turn a
 // network blip into a refusal that outlives it.
@@ -2193,8 +2180,12 @@ func (rc *rejectCache) record(key dirKey, err error) {
 	}
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	if len(rc.entries) >= dirRejectMaxEntries {
-		rc.entries = make(map[dirKey]rejectedDir)
+	if _, known := rc.entries[key]; !known && len(rc.entries) >= dirRejectMaxEntries {
+		// Full. Stop recording rather than dropping the table: wiping it would
+		// hand every known-bad directory a fresh probe budget, and at exactly the
+		// ceiling a new key on every call would clear it again and again, which
+		// is the pre-cache cost profile wearing a cache's clothes.
+		return
 	}
 	e := rejectedDir{
 		err:    err,
@@ -4544,16 +4535,18 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return err
 	}
 
-	// Ask the server, not the cache, whether the destination name is taken.
-	// dircache already checked this through FindLeaf, which replays a held
-	// refusal as "absent" for free.
-	exists, err := f.dirPresentUngated(ctx, dstDirectoryID, dstLeaf)
-	if err != nil {
-		return err
-	}
-	if exists {
-		f.dirRejects.forget(dirKey{dstDirectoryID, dstLeaf})
-		return fs.ErrorDirExists
+	// Ask the server, not the cache, whether the destination name is taken - but
+	// only when the cache is the one that answered. dircache already asked
+	// FindLeaf, and an unhinged FindLeaf pages the parent itself, so a second
+	// listing would just double the cost of every clean move.
+	if held, _ := f.dirRejects.held(dirKey{dstDirectoryID, dstLeaf}); held {
+		exists, err := f.dirPresentUngated(ctx, dstDirectoryID, dstLeaf)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return fs.ErrorDirExists
+		}
 	}
 
 	moved := false
