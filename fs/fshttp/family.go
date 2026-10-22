@@ -96,13 +96,6 @@ func (h *familyHealth) blocked(host string, v6 bool) bool {
 	return true
 }
 
-// cooldownLeft returns how long the pair stays blocked.
-func (h *familyHealth) cooldownLeft(host string, v6 bool) time.Duration {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.blockedTo[familyKey{host, v6}].Sub(h.now())
-}
-
 // noteDialFailure records one failed connection attempt. It returns true when
 // this failure demoted the pair, so the caller can log and drop pooled
 // connections to it.
@@ -132,7 +125,11 @@ func (h *familyHealth) noteStall(host string, v6 bool, cooldown time.Duration) b
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.dialFails, key)
-	h.blockedTo[key] = h.now().Add(cooldown)
+	until := h.now().Add(cooldown)
+	if cur, ok := h.blockedTo[key]; ok && cur.After(until) {
+		until = cur
+	}
+	h.blockedTo[key] = until
 	return true
 }
 

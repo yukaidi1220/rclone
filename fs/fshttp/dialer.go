@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -31,7 +32,11 @@ type Dialer struct {
 // applies to the next one (a new Dialer is made for every dial).
 var health = newFamilyHealth(time.Now, 2)
 
-var familyWarnOnce sync.Once
+var (
+	familyWarnOnce sync.Once
+	bindWarnOnce   sync.Once
+	proxyWarnOnce  sync.Once
+)
 
 // NewDialer creates a Dialer structure with Timeout, Keepalive,
 // LocalAddr and DSCP set from rclone flags.
@@ -57,6 +62,16 @@ func NewDialer(ctx context.Context) *Dialer {
 	dialer.family = mode
 	if ci.BindAddr != nil {
 		dialer.Dialer.LocalAddr = &net.TCPAddr{IP: ci.BindAddr}
+		if mode != familyAuto {
+			bindWarnOnce.Do(func() {
+				fs.Logf(nil, "fshttp: --bind pins the address family, so --connect-family is ignored")
+			})
+		}
+	}
+	if mode != familyAuto && ci.HTTPProxy != "" {
+		proxyWarnOnce.Do(func() {
+			fs.Logf(nil, "fshttp: --http-proxy is set, so --connect-family only chooses the family used to reach the proxy")
+		})
 	}
 	return dialer
 }
@@ -131,44 +146,65 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 // dialFamily dials address trying the resolved addresses in the order chosen by
 // --connect-family, skipping any host/family pair that is cooling down.
 //
-// handled is false when the caller should use the standard dialler instead:
-// the address is already an IP literal, or the lookup failed (in which case the
-// standard path will surface the same error).
+// handled is false when the caller should use the standard dialler instead: the
+// address is already an IP literal of an allowed family, or the lookup failed
+// (in which case the standard path will surface the same error).
 func (d *Dialer) dialFamily(ctx context.Context, address string) (c net.Conn, err error, handled bool) {
 	host, port, splitErr := net.SplitHostPort(address)
 	if splitErr != nil {
 		return nil, nil, false
 	}
-	if net.ParseIP(host) != nil {
-		// A literal has a fixed family: nothing to choose, and nothing to learn.
+	// Host names are case insensitive and may carry a trailing dot.
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+
+	// An IP literal has a fixed family. Honour an "only" pin by refusing the
+	// wrong one, but leave prefer-* modes alone: there is nothing to choose.
+	if ip := net.ParseIP(host); ip != nil {
+		v6 := ip.To4() == nil
+		switch d.family {
+		case familyOnlyV4, familyOnlyV6:
+			want := familyOnlyV6 == d.family
+			if v6 != want {
+				return nil, fmt.Errorf("--connect-family=%s but %s is an IPv%d address", d.familyName(), host, familyNum(v6)), true
+			}
+		}
 		return nil, nil, false
 	}
+
 	h := d.health
 	if h == nil {
 		h = health
 	}
-	addrs, lookupErr := lookupIPAddr(ctx, host)
+	// The whole family walk shares one connect budget, like net.Dialer does for
+	// a single dial: otherwise a dark IPv6 would cost --contimeout per address.
+	lookupCtx := ctx
+	if d.Dialer.Timeout > 0 {
+		var cancel context.CancelFunc
+		lookupCtx, cancel = context.WithTimeout(ctx, d.Dialer.Timeout)
+		defer cancel()
+	}
+	addrs, lookupErr := lookupIPAddr(lookupCtx, host)
 	if lookupErr != nil || len(addrs) == 0 {
 		return nil, nil, false
 	}
 	v4, v6, splitErr := splitCandidates(d.family, addrs)
 	if splitErr != nil {
-		return nil, nil, false
+		// An "only" mode with no address of that family is a hard failure; a
+		// silent fallback would make the pin a lie.
+		return nil, fmt.Errorf("--connect-family=%s: %w", d.familyName(), splitErr), true
 	}
 
 	// Order the families, then drop the ones cooling down. If that would leave
 	// nothing to try, ignore the cooldown: refusing to dial would deadlock a
 	// host whose only address just failed.
-	var order []struct {
-		ip net.IP
-		v6 bool
+	type candidate struct {
+		addr *net.IPAddr
+		v6   bool
 	}
+	var order []candidate
 	add := func(list []net.IPAddr, isV6 bool) {
-		for _, a := range list {
-			order = append(order, struct {
-				ip net.IP
-				v6 bool
-			}{a.IP, isV6})
+		for i := range list {
+			order = append(order, candidate{&list[i], isV6})
 		}
 	}
 	switch d.family {
@@ -204,13 +240,14 @@ func (d *Dialer) dialFamily(ctx context.Context, address string) (c net.Conn, er
 		if cand.v6 {
 			network = "tcp6"
 		}
-		target := net.JoinHostPort(cand.ip.String(), port)
-		conn, dialErr := d.Dialer.DialContext(ctx, network, target)
+		// Use the full IPAddr so an IPv6 zone survives the join.
+		target := net.JoinHostPort(cand.addr.String(), port)
+		conn, dialErr := d.Dialer.DialContext(lookupCtx, network, target)
 		if dialErr != nil {
 			lastErr = dialErr
 			if h.noteDialFailure(host, cand.v6, d.cooldown) {
 				fs.Logf(nil, "fshttp: %s: IPv%d failed %d times in a row (%v), avoiding that family for %v",
-					host, familyNum(cand.v6), health.dialThreshold, dialErr,
+					host, familyNum(cand.v6), h.dialThreshold, dialErr,
 					d.cooldown.Round(time.Second))
 				closeIdleConnections()
 			}
@@ -237,6 +274,21 @@ func (d *Dialer) dialFamily(ctx context.Context, address string) (c net.Conn, er
 		lastErr = fmt.Errorf("no address family left to try for %s", host)
 	}
 	return nil, lastErr, true
+}
+
+// familyName is the flag value for logging.
+func (d *Dialer) familyName() string {
+	switch d.family {
+	case familyPreferV4:
+		return "prefer-v4"
+	case familyPreferV6:
+		return "prefer-v6"
+	case familyOnlyV4:
+		return "v4"
+	case familyOnlyV6:
+		return "v6"
+	}
+	return "auto"
 }
 
 // A net.Conn that sets deadline for every Read/Write operation
@@ -310,7 +362,10 @@ func (c *familyConn) Write(b []byte) (int, error) {
 // A pooled connection whose deadline expired while it was idle fails instantly
 // when it is used again; blockedFor is then tiny and nothing is recorded.
 func (c *familyConn) noteError(err error, blockedFor time.Duration) {
-	if c.health == nil || err == nil || errors.Is(err, io.EOF) {
+	if c.health == nil || err == nil {
+		return
+	}
+	if errors.Is(err, io.EOF) || !errors.Is(err, os.ErrDeadlineExceeded) {
 		return
 	}
 	if blockedFor < time.Second {
