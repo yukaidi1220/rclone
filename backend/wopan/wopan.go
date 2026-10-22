@@ -963,6 +963,11 @@ type Fs struct {
 	zoneURL    string      // upload endpoint from GetZoneInfo, lazily discovered
 	zoneLoaded bool        // whether zoneURL has been fetched successfully
 
+	// dirRejects remembers directory creations the server refused, so a
+	// rejected subtree costs probes rather than one listing plus one create per
+	// file per round. Pointer for the same reason as zoneMu.
+	dirRejects *rejectCache
+
 	// renameDeadlineOverride shortens renameWithBackoff's deadline; tests set
 	// it so a persistently failing rename does not sleep for the full budget.
 	renameDeadlineOverride time.Duration
@@ -1815,6 +1820,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		httpClient: newHTTPClient(ctx, opt),
 		spaceType:  spacePersonal,
 		zoneMu:     new(sync.Mutex),
+		dirRejects: newRejectCache(),
 	}
 	if opt.FamilyID != "" {
 		f.spaceType = spaceFamily
@@ -2059,8 +2065,137 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 // ------------------------------------------------------------ dir cache ----
 
+const (
+	// dirRejectTTL bounds how long a replayed directory-creation failure is
+	// trusted for a code that is not an explicit name rejection.
+	dirRejectTTL = 60 * time.Second
+	// dirRejectProbes caps how many times one directory is offered to the
+	// server inside a single window sequence. It bounds the cost of being wrong
+	// about a code whose determinism is not established.
+	dirRejectProbes = 3
+	// dirRejectReopen is how long an exhausted probe budget holds before the
+	// directory is offered again. Without it the budget would be a life sentence
+	// for the process: an account that fills up, a service outage, or a
+	// directory another client created would stay invisible for the rest of a
+	// long-lived rcd or mount. Half an hour keeps that cost to one extra probe
+	// per bad directory per hour while staying far inside a round's runtime.
+	dirRejectReopen = 30 * time.Minute
+)
+
+// dirKey identifies one directory creation attempt: the leaf name inside a
+// specific parent id. The parent id, not the parent path, is what the server
+// judges, so a recreated parent gets its own entry.
+type dirKey struct {
+	pathID string
+	leaf   string
+}
+
+// rejectedDir is one remembered CreateDirectory refusal.
+type rejectedDir struct {
+	err       error     // replayed unchanged, so the caller sees the same error it saw first
+	permanent bool      // explicit name rejections never expire
+	probes    int       // CreateDirectory calls made for this key so far
+	expiry    time.Time // when the last answer stops being trusted
+}
+
+// rejectCache remembers directory creations the server refused.
+//
+// dircache only caches successes (lib/dircache/dircache.go _findDir Puts the id
+// after CreateDir returns), so without this a rejected subtree costs one
+// listing plus one CreateDirectory per file per round. Run 801 measured 733 of
+// those lines for 3 directories.
+//
+// It hangs off the Fs as a pointer because NewFs copies the struct (tempF := *f)
+// while walking a root that turns out to be a file; a value-typed map would give
+// the copy its own cache and the mutex would be copied while held.
+//
+// A nil *rejectCache means "no caching". NewFs always installs one; the unit
+// tests that build an Fs literal without it get the uncached behaviour.
+//
+// Two goroutines can never race into one probe for the same key only because
+// every FindLeaf/CreateDir pair runs under dircache's single cache-wide lock
+// (lib/dircache/dircache.go FindDir). held() and record() are not atomic
+// together; anything that calls them off that lock would start double-sending
+// refused directories.
+type rejectCache struct {
+	mu      sync.Mutex
+	entries map[dirKey]rejectedDir
+	now     func() time.Time // tests substitute a clock
+}
+
+func newRejectCache() *rejectCache {
+	return &rejectCache{
+		entries: make(map[dirKey]rejectedDir),
+		now:     time.Now,
+	}
+}
+
+// held reports whether key must not be sent to the server, and the error to
+// replay when it must not.
+func (rc *rejectCache) held(key dirKey) (bool, error) {
+	if rc == nil {
+		return false, nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	e, ok := rc.entries[key]
+	if !ok {
+		return false, nil
+	}
+	switch {
+	case e.permanent:
+	case rc.now().Before(e.expiry):
+	case e.probes >= dirRejectProbes && rc.now().Before(e.expiry.Add(dirRejectReopen)):
+	default:
+		return false, nil
+	}
+	return true, e.err
+}
+
+// record remembers the failure. Only server business errors belong here: a
+// transport error says nothing about the name, and caching one would turn a
+// network blip into a permanent refusal.
+func (rc *rejectCache) record(key dirKey, err error) {
+	if rc == nil {
+		return
+	}
+	var ae *apiError
+	if !asAPIError(err, &ae) {
+		return
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	e := rejectedDir{
+		err:       err,
+		permanent: ae.Code == codeIllegalName || ae.Code == codeSensitiveWord,
+		probes:    rc.entries[key].probes + 1,
+	}
+	if !e.permanent {
+		e.expiry = rc.now().Add(dirRejectTTL)
+	}
+	rc.entries[key] = e
+}
+
+// clear drops every remembered refusal. A directory move changes the full path
+// of everything beneath it, and a purge can free a name, so neither answer is
+// safe to keep. Both are rare and the cache refills itself.
+func (rc *rejectCache) clear() {
+	if rc == nil {
+		return
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	rc.entries = make(map[dirKey]rejectedDir)
+}
+
 // FindLeaf finds a directory of name leaf in the folder with ID pathID
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut string, found bool, err error) {
+	// A directory the server refused to create is not in the parent listing, so
+	// page through the parent only to conclude that. Report "not found" without
+	// the query; dircache then calls CreateDir, which replays the refusal.
+	if held, _ := f.dirRejects.held(dirKey{pathID, leaf}); held {
+		return "", false, nil
+	}
 	// Names are matched case-insensitively because the server is.
 	found, err = f.listAll(ctx, pathID, func(item *api.File) bool {
 		if item.Type == fileTypeDir && strings.EqualFold(item.Name, leaf) {
@@ -2111,6 +2246,10 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	if err := f.validateName(leaf); err != nil {
 		return "", err
 	}
+	key := dirKey{pathID, leaf}
+	if held, cached := f.dirRejects.held(key); held {
+		return "", cached
+	}
 	p := f.spaceParams()
 	p["parentDirectoryId"] = pathID
 	p["directoryName"] = f.opt.Enc.FromStandardName(leaf)
@@ -2122,19 +2261,32 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	}
 
 	var resp api.CreateDirectoryResponse
+	// recoveryFailed marks a failure of the lookup that follows a "name taken"
+	// answer. That error came from QueryAllFiles, so it says nothing about
+	// whether the name is acceptable and must not be remembered as a refusal.
+	var recoveryFailed bool
 	err = f.pacer.Call(func() (bool, error) {
 		data, err := f.call(ctx, chanWoHome, "CreateDirectory", p, map[string]any{"secret": true})
 		if err != nil {
 			var ae *apiError
 			if asAPIError(err, &ae) && ae.Code == codeDirExists {
 				// The directory already exists - Mkdir must not report an error.
-				// But a just-created directory can be missing from its parent
+				// The lookup that follows is deliberately left alone by the
+				// refusal cache: this branch was only reached from a call that
+				// held() allowed, and the stored probe count rises only on
+				// failures, so the entry cannot have turned back into a hold
+				// during it. Forgetting it here would have no observable effect
+				// either - the recovery failure below is what has to be kept out
+				// of the budget, not re-labelled.
+				//
+				// A just-created directory can be missing from its parent
 				// listing for a few seconds, so look it up with a bounded
 				// retry across the visibility window.
 				id, ferr := retryFindDir(ctx, dirFindAttempts, dirFindDelay, func() (string, error) {
 					return f.findDirID(ctx, pathID, leaf)
 				})
 				if ferr != nil {
+					recoveryFailed = true
 					return false, ferr
 				}
 				resp.ID = id
@@ -2147,7 +2299,15 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 		}
 		return false, nil
 	})
+	// A remembered refusal is never dropped on the way out, here or in the
+	// name-taken branch above: every call that got this far was one held() said
+	// "probe" for, and the stored probe count rises only on failures, so an entry
+	// cannot have turned back into a hold during it. Mutation testing confirmed
+	// the forget() that used to sit in both places had no observable effect.
 	if err != nil {
+		if !recoveryFailed {
+			f.dirRejects.record(key, err)
+		}
 		return "", err
 	}
 	// 重要2 (fifth round): a 0000 response with empty DATA yields an empty id.
@@ -3755,6 +3915,9 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 		return err
 	}
 	f.dirCache.FlushDir(dir)
+	// The names under here are gone, so a refusal remembered for any of them is
+	// no longer evidence about the present tree.
+	f.dirRejects.clear()
 	if f.opt.HardDelete {
 		return f.purgeRecycle(ctx, snap, []string{id})
 	}
@@ -4341,6 +4504,11 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		if moved {
 			// The helper does not do this (its godoc defers it to the caller).
 			srcFs.dirCache.FlushDir(srcRemote)
+			// Everything below the moved directory now has a different full
+			// path, and the destination parent may have freed a name. Neither
+			// side's remembered refusals describe the tree any more.
+			srcFs.dirRejects.clear()
+			f.dirRejects.clear()
 		}
 	}()
 
