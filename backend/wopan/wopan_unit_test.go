@@ -853,6 +853,7 @@ func newUnitTestFs(transport http.RoundTripper) *Fs {
 		pacer:      fs.NewPacer(context.Background(), pacer.NewDefault(pacer.MinSleep(time.Millisecond))),
 		httpClient: &http.Client{Transport: transport},
 		zoneMu:     new(sync.Mutex),
+		dirRejects: newRejectCache(),
 	}
 	f.dirCache = dircache.New("", "root-id", f)
 	// Same feature set as a real remote, taken from the one function that builds
@@ -3630,4 +3631,395 @@ func TestUnitUploadNoSpaceFatalOption(t *testing.T) {
 			assert.Equal(t, 3, len(rec.parts), "parts 4+ must never be sent after the account-full answer")
 		})
 	}
+}
+
+// --------------------------------------------- directory rejection cache ---
+
+// dirRejectTransport is a modelled wohome directory server that counts requests.
+//
+// The counters are the measurement, not the log lines: dircache reports one
+// "failed to make directory" per file whether or not a request went out, so a
+// cache that worked perfectly would still print the 733 lines run 801 printed.
+type dirRejectTransport struct {
+	// create answers a CreateDirectory: a non-empty code is the RSP_CODE the
+	// server refuses with, an empty code means the directory now has newID.
+	create func(t *dirRejectTransport, parent, name string) (code, newID string)
+	// dirs is the modelled tree, keyed parent+NUL+name.
+	dirs map[string]string
+	// transportFails makes the next that many CreateDirectory round trips fail
+	// at the connection level instead of answering a business code.
+	transportFails int
+	// listFails makes the next that many listings answer a business error - the
+	// eventual-consistency or outage shape the recovery lookup can hit.
+	listFails int
+	creates   int
+	lists     int
+	deletes   int
+	moves     int
+}
+
+func newDirTransport() *dirRejectTransport {
+	return &dirRejectTransport{dirs: map[string]string{}}
+}
+
+// dirSep cannot appear in a directory name, so it is a safe key separator.
+const dirSep = "\x00"
+
+func dirKeyOf(parent, name string) string { return parent + dirSep + name }
+
+func dirEnvOK(data string) string {
+	return `{"STATUS":"200","MSG":"ok","LOGID":"L","RSP":{"RSP_CODE":"0000","RSP_DESC":"ok","DATA":` + data + `}}`
+}
+
+func dirEnvErr(code string) string {
+	return `{"STATUS":"200","MSG":"ok","LOGID":"L","RSP":{"RSP_CODE":"` + code + `","RSP_DESC":"modelled refusal","DATA":""}}`
+}
+
+func (t *dirRejectTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	raw, _ := io.ReadAll(r.Body)
+	var req struct {
+		Header struct {
+			Key string `json:"key"`
+		} `json:"header"`
+		Body map[string]any `json:"body"`
+	}
+	_ = json.Unmarshal(raw, &req)
+	// The parameters travel AES-encrypted in body.param, so the parent id and
+	// the directory name have to be decrypted before the model can act on them.
+	fields := map[string]any{}
+	if enc, ok := req.Body["param"].(string); ok && enc != "" {
+		if plain, err := aesDecrypt(enc, aesKeyFor(chanWoHome, testAccessToken)); err == nil {
+			_ = json.Unmarshal(plain, &fields)
+		}
+	}
+	fieldStr := func(k string) string { v, _ := fields[k].(string); return v }
+	parent := fieldStr("parentDirectoryId")
+
+	switch req.Header.Key {
+	case "QueryAllFiles":
+		t.lists++
+		if t.listFails > 0 {
+			t.listFails--
+			return okResp(dirEnvErr("9999")), nil
+		}
+		// Only page 0 carries entries: listAll pages until it sees an empty
+		// page, so repeating them would never terminate.
+		page := 0
+		if v, ok := fields["pageNum"].(float64); ok {
+			page = int(v)
+		}
+		files := []map[string]any{}
+		if page == 0 {
+			for k, id := range t.dirs {
+				p, name, _ := strings.Cut(k, dirSep)
+				if p != parent {
+					continue
+				}
+				files = append(files, map[string]any{"id": id, "name": name, "type": fileTypeDir})
+			}
+		}
+		payload, _ := json.Marshal(map[string]any{"files": files})
+		return okResp(dirEnvOK(string(payload))), nil
+	case "CreateDirectory":
+		t.creates++
+		if t.transportFails > 0 {
+			t.transportFails--
+			return nil, errors.New("modelled connection reset")
+		}
+		name := fieldStr("directoryName")
+		code, newID := t.create(t, parent, name)
+		if code != "" {
+			return okResp(dirEnvErr(code)), nil
+		}
+		t.dirs[dirKeyOf(parent, name)] = newID
+		return okResp(dirEnvOK(fmt.Sprintf(`{"id":%q}`, newID))), nil
+	case "DeleteFile":
+		t.deletes++
+		return okResp(dirEnvOK("null")), nil
+	case "MoveFile":
+		// The model does not relocate the entry: this test measures whether the
+		// cache was dropped after a move the server accepted, not the move.
+		t.moves++
+		return okResp(dirEnvOK("null")), nil
+	}
+	return okResp(dirEnvOK("null")), nil
+}
+
+// TestUnitDirRejectCacheCollapsesTheStorm is the regression lock for run 801:
+// 123 files under one refused directory produced 733 failed mkdirs, because
+// dircache caches only successes. The whole subtree has to cost one listing and
+// one CreateDirectory, not one pair per file.
+func TestUnitDirRejectCacheCollapsesTheStorm(t *testing.T) {
+	ctx := context.Background()
+	tr := newDirTransport()
+	tr.create = func(*dirRejectTransport, string, string) (string, string) {
+		return codeSensitiveWord, ""
+	}
+	f := newUnitTestFs(tr)
+
+	for range 20 {
+		err := f.Mkdir(ctx, "blocked-name/sub")
+		require.Error(t, err)
+		// The shape the transfer engine saw before must not change: the refusal is
+		// replayed through dircache's wrapper and stays marked no-retry.
+		assert.Contains(t, err.Error(), "failed to make directory")
+		assert.True(t, fserrors.IsNoRetryError(err), "replayed refusal must stay no-retry: %v", err)
+	}
+	assert.Equal(t, 1, tr.creates, "20 files under one refused directory must send one CreateDirectory")
+	// One listing, not twenty: listAll stops at the first empty page, and an
+	// empty root returns nothing on page 0.
+	assert.Equal(t, 1, tr.lists)
+}
+
+// TestUnitDirRejectCacheKeysOnParentAndLeaf locks the key granularity: a refusal
+// is per (parent id, name), so a second refused name and the same name under a
+// different parent each get their own probe.
+func TestUnitDirRejectCacheKeysOnParentAndLeaf(t *testing.T) {
+	ctx := context.Background()
+	tr := newDirTransport()
+	tr.create = func(*dirRejectTransport, string, string) (string, string) {
+		return codeIllegalName, ""
+	}
+	// "good" exists under the root, so a path through it resolves without a create.
+	tr.dirs[dirKeyOf("root-id", "good")] = "dir-1"
+	f := newUnitTestFs(tr)
+
+	require.Error(t, f.Mkdir(ctx, "blocked-a"))
+	require.Error(t, f.Mkdir(ctx, "blocked-a")) // cached
+	require.Error(t, f.Mkdir(ctx, "blocked-b")) // different leaf
+	require.Error(t, f.Mkdir(ctx, "good/blocked-a"))
+
+	assert.Equal(t, 3, tr.creates, "three distinct (parent, leaf) keys must get three probes")
+	// Six listings: the two root lookups each page past "good" (2 requests,
+	// because a non-empty page 0 is followed by the terminating empty page), and
+	// "good/blocked-a" stops early on the "good" match then pages the empty
+	// "good" directory (1 + 1). The repeat of blocked-a costs nothing.
+	assert.Equal(t, 6, tr.lists)
+}
+
+// TestUnitDirRejectCacheReprobesThenStops is the policy for a code that is not
+// an explicit name rejection: 9999 means "system error" and no measurement says
+// whether it is deterministic, so the answer is retrusted for a bounded window
+// and re-probed a bounded number of times. The window alone is useless (a round
+// can run for half an hour, which would make it 30 probes per directory), and a
+// bare cap would be a life sentence for the process, so the budget reopens
+// slowly. The expected counts below are literals on purpose: the constants are
+// pinned by TestUnitDirRejectBudgetConstants instead of being read into them.
+func TestUnitDirRejectCacheReprobesThenStops(t *testing.T) {
+	ctx := context.Background()
+	tr := newDirTransport()
+	tr.create = func(*dirRejectTransport, string, string) (string, string) {
+		return "9999", ""
+	}
+	f := newUnitTestFs(tr)
+	clk := time.Unix(0, 0)
+	f.dirRejects.now = func() time.Time { return clk }
+	step := 61 * time.Second
+
+	err := f.Mkdir(ctx, "blocked-name")
+	require.Error(t, err)
+	assert.False(t, fserrors.IsNoRetryError(err), "the cache must not promote 9999 to no-retry: %v", err)
+	assert.Equal(t, 1, tr.creates)
+
+	require.Error(t, f.Mkdir(ctx, "blocked-name"))
+	assert.Equal(t, 1, tr.creates, "inside the 60s window nothing goes out")
+
+	clk = clk.Add(step)
+	require.Error(t, f.Mkdir(ctx, "blocked-name"))
+	assert.Equal(t, 2, tr.creates, "an expired window allows exactly one more probe")
+
+	clk = clk.Add(step)
+	require.Error(t, f.Mkdir(ctx, "blocked-name"))
+	assert.Equal(t, 3, tr.creates, "the budget is three probes")
+
+	for range 5 {
+		clk = clk.Add(step)
+		require.Error(t, f.Mkdir(ctx, "blocked-name"))
+	}
+	assert.Equal(t, 3, tr.creates, "the exhausted budget holds, so a 30 minute round costs nothing more")
+
+	clk = clk.Add(30 * time.Minute)
+	require.Error(t, f.Mkdir(ctx, "blocked-name"))
+	assert.Equal(t, 4, tr.creates, "the budget must reopen, or a filled account blinds the directory forever")
+
+	clk = clk.Add(step)
+	require.Error(t, f.Mkdir(ctx, "blocked-name"))
+	assert.Equal(t, 4, tr.creates, "and it reopens once per interval, not once per window")
+
+	// One listing per probe and nothing during the holds, so the listing count
+	// tracks the probes instead of the number of files asking for this directory.
+	assert.Equal(t, 4, tr.lists)
+}
+
+// TestUnitDirRejectBudgetConstants pins the three knobs the counts above assume.
+// Without this the policy test would read the same constants it is checking,
+// which stays green when someone changes them.
+func TestUnitDirRejectBudgetConstants(t *testing.T) {
+	assert.Equal(t, 60*time.Second, dirRejectTTL)
+	assert.Equal(t, 3, dirRejectProbes)
+	assert.Equal(t, 30*time.Minute, dirRejectReopen)
+}
+
+// TestUnitDirRejectCacheClearedByPurge: purging frees names and empties the
+// tree, so a remembered refusal no longer describes the present state and the
+// next attempt has to go back to the server.
+func TestUnitDirRejectCacheClearedByPurge(t *testing.T) {
+	ctx := context.Background()
+	tr := newDirTransport()
+	tr.create = func(*dirRejectTransport, string, string) (string, string) {
+		return codeSensitiveWord, ""
+	}
+	tr.dirs[dirKeyOf("root-id", "good")] = "dir-1"
+	f := newUnitTestFs(tr)
+
+	require.Error(t, f.Mkdir(ctx, "blocked-name"))
+	require.Equal(t, 1, tr.creates)
+
+	require.NoError(t, f.Purge(ctx, "good"))
+	assert.Equal(t, 1, tr.deletes, "the purge must reach the server")
+	require.Error(t, f.Mkdir(ctx, "blocked-name"))
+	assert.Equal(t, 2, tr.creates, "a purge must drop every remembered refusal")
+}
+
+// TestUnitDirRejectCacheYieldsWhenTheNameExists locks the recovery path through
+// the cache: a directory first answered 9999 and then answered name-taken really
+// exists, and the recovery lookup must reach the listing rather than the cached
+// "no". The gate cannot be what blocks it (an allowed call stays allowed), but
+// that is an argument, not an invariant - so it gets a test.
+func TestUnitDirRejectCacheYieldsWhenTheNameExists(t *testing.T) {
+	ctx := context.Background()
+	tr := newDirTransport()
+	probes := 0
+	tr.create = func(t *dirRejectTransport, parent, name string) (string, string) {
+		probes++
+		if probes == 1 {
+			return "9999", ""
+		}
+		// The name is in place now: answer the way a server whose create lost a
+		// race with an earlier one does.
+		t.dirs[dirKeyOf(parent, name)] = "dir-77"
+		return codeDirExists, ""
+	}
+	f := newUnitTestFs(tr)
+	clk := time.Unix(0, 0)
+	f.dirRejects.now = func() time.Time { return clk }
+
+	require.Error(t, f.Mkdir(ctx, "blocked-name"))
+	require.Error(t, f.Mkdir(ctx, "blocked-name"))
+	assert.Equal(t, 1, tr.creates)
+
+	clk = clk.Add(dirRejectTTL + time.Second)
+	require.NoError(t, f.Mkdir(ctx, "blocked-name"), "the name-taken answer must heal the cached no")
+	assert.Equal(t, 2, tr.creates)
+
+	// And the id has to be the server's, not a re-derivation.
+	id, err := f.dirCache.FindDir(ctx, "blocked-name", false)
+	require.NoError(t, err)
+	assert.Equal(t, "dir-77", id)
+}
+
+// TestUnitDirRejectCacheIgnoresTransportErrors: a connection failure says
+// nothing about the name. Caching one would turn a blip into a refusal that
+// outlives the blip, which is the opposite of what this cache is for.
+func TestUnitDirRejectCacheIgnoresTransportErrors(t *testing.T) {
+	withPartRetries(t, 1)
+	ctx := context.Background()
+	tr := newDirTransport()
+	tr.create = func(*dirRejectTransport, string, string) (string, string) {
+		return "", "dir-9"
+	}
+	tr.transportFails = 1
+	f := newUnitTestFs(tr)
+
+	require.Error(t, f.Mkdir(ctx, "blocked-name"))
+	assert.Equal(t, 1, tr.creates)
+
+	require.NoError(t, f.Mkdir(ctx, "blocked-name"))
+	assert.Equal(t, 2, tr.creates, "a transport error must not be remembered as a refusal")
+}
+
+// TestUnitDirRejectCacheDoesNotInheritAListingError is the P0 the adversarial
+// review found. A "name taken" answer is followed by a recovery lookup, and that
+// lookup is QueryAllFiles: its error says nothing about whether the name is
+// acceptable. Recording it anyway charges the probe budget for a listing outage,
+// and once the budget is spent the directory is reported as absent for the whole
+// reopen interval - including directories that really exist, because 130007 is
+// the server saying the name is taken.
+func TestUnitDirRejectCacheDoesNotInheritAListingError(t *testing.T) {
+	ctx := context.Background()
+	tr := newDirTransport()
+	attempt := 0
+	tr.create = func(t *dirRejectTransport, parent, name string) (string, string) {
+		attempt++
+		if attempt <= 2 {
+			return "9999", ""
+		}
+		// Third try: the name is in place, but the recovery lookup hits the
+		// outage shape - a business error returns immediately, with no retry.
+		t.listFails = 1
+		return codeDirExists, ""
+	}
+	f := newUnitTestFs(tr)
+	clk := time.Unix(0, 0)
+	f.dirRejects.now = func() time.Time { return clk }
+
+	require.Error(t, f.Mkdir(ctx, "blocked-name"))
+	assert.Equal(t, 1, tr.creates)
+
+	clk = clk.Add(61 * time.Second)
+	require.Error(t, f.Mkdir(ctx, "blocked-name"))
+	assert.Equal(t, 2, tr.creates, "two recorded probes")
+
+	for step := 3; step <= 5; step++ {
+		clk = clk.Add(61 * time.Second)
+		err := f.Mkdir(ctx, "blocked-name")
+		require.Error(t, err)
+		assert.False(t, fserrors.IsNoRetryError(err), "the failure is a listing outage, not a name verdict: %v", err)
+		assert.Equal(t, step, tr.creates,
+			"a listing outage must not spend the probe budget (step %d)", step)
+	}
+}
+
+// TestUnitFindLeafHeldIsNotFoundNotError pins the half of the design that saves
+// the listing: FindLeaf reports "absent" rather than the cached error, so
+// dircache still routes through CreateDir and the caller still sees the
+// "failed to make directory" wrapper it saw before.
+func TestUnitFindLeafHeldIsNotFoundNotError(t *testing.T) {
+	ctx := context.Background()
+	tr := newDirTransport()
+	tr.create = func(*dirRejectTransport, string, string) (string, string) {
+		return codeSensitiveWord, ""
+	}
+	f := newUnitTestFs(tr)
+	require.Error(t, f.Mkdir(ctx, "blocked-name"))
+
+	id, found, err := f.FindLeaf(ctx, "root-id", "blocked-name")
+	require.NoError(t, err, "a held key must not surface as an error from FindLeaf")
+	assert.False(t, found)
+	assert.Equal(t, "", id)
+	assert.Equal(t, 1, tr.lists, "the held answer must not page the parent again")
+}
+
+// TestUnitDirRejectCacheClearedByDirMove: a directory move rewrites the full
+// path of everything beneath it, so a refusal remembered on either side no
+// longer describes the tree and both caches have to be dropped.
+func TestUnitDirRejectCacheClearedByDirMove(t *testing.T) {
+	ctx := context.Background()
+	tr := newDirTransport()
+	tr.create = func(*dirRejectTransport, string, string) (string, string) {
+		return codeSensitiveWord, ""
+	}
+	tr.dirs[dirKeyOf("root-id", "moved")] = "dir-m"
+	tr.dirs[dirKeyOf("root-id", "into")] = "dir-into"
+	src := newUnitTestFs(tr)
+	dst := newUnitTestFs(tr)
+
+	require.Error(t, src.Mkdir(ctx, "blocked-name"))
+	require.Equal(t, 1, tr.creates)
+
+	require.NoError(t, dst.DirMove(ctx, src, "moved", "into/moved"))
+	assert.Equal(t, 1, tr.moves, "the move itself must reach the server")
+
+	require.Error(t, src.Mkdir(ctx, "blocked-name"))
+	assert.Equal(t, 2, tr.creates, "a directory move must drop every remembered refusal")
 }

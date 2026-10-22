@@ -405,6 +405,45 @@ linked: `rclone link` returns `fs.ErrorCantShareDirectories`.
 
 For longer-lived or revocable sharing, use the wopan app or web client.
 
+## Rejected directory names
+
+The service refuses some directory names: the sensitive-word filter answers
+`RSP_CODE 4444`, an illegal character answers `1009`. rclone reports both as a
+non-retryable error for the file, so no flag makes them pass.
+
+The refusal is per directory, but rclone resolves a tree one file at a time and
+the directory cache stores only successes. That used to scale badly: in a
+measured run on 2026-10-21 one refused directory with 123 files beneath it
+produced 733 `failed to make directory` errors - a parent listing plus a
+`CreateDirectory` per file, times two transfer phases, times three `--retries`
+rounds.
+
+The backend now remembers refusals, keyed by parent directory id and name, so a
+refused directory costs one probe instead of one pair of requests per file:
+
+- An explicit name rejection - `1009` illegal character, `4444` sensitive word -
+  is kept for the whole run.
+- Any other refusal is trusted for 60 seconds, and re-probed at most 3 times
+  before the memory goes quiet for 30 minutes. A code like `9999 系统异常` has
+  never been shown to be a name verdict - the same refused directory answered
+  `4444` for some of its files and `9999` for others, and which one a file got
+  did not depend on the file, the phase or the round. The 60 second window alone
+  would be useless, because a round can run for half an hour, and a bare cap
+  would be a life sentence: a full account or a service outage would keep
+  reporting the directory as absent even after it recovers.
+- A network failure is never remembered, because it says nothing about the name.
+  Neither is a failure of the lookup that follows a "name taken" answer: that
+  one is a listing, so it does not spend the probe budget.
+- `rclone purge`, `rclone rmdir` and a directory move drop the whole memory,
+  because the tree they describe has changed.
+
+The error lines do not decrease - rclone reports the failure per file whether
+or not a request went out; the requests are what fall. A name refused as
+illegal or sensitive stays refused for the rest of the run, so freeing one in
+the app does not take effect until the command restarts. A directory that only
+ever answered an unclassified code is offered to the server again every half
+hour.
+
 ## Restrictions
 
 - **Empty files are not supported.** The service rejects 0-byte files, so
