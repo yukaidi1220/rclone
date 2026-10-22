@@ -3646,6 +3646,10 @@ type dirRejectTransport struct {
 	create func(t *dirRejectTransport, parent, name string) (code, newID string)
 	// dirs is the modelled tree, keyed parent+NUL+name.
 	dirs map[string]string
+	// files plants FILE entries in the modelled listing, keyed the same way as
+	// dirs: it proves dirPresentUngated asks for a directory, not for any entry
+	// holding the name.
+	files map[string]string
 	// transportFails makes the next that many CreateDirectory round trips fail
 	// at the connection level instead of answering a business code.
 	transportFails int
@@ -3660,7 +3664,10 @@ type dirRejectTransport struct {
 }
 
 func newDirTransport() *dirRejectTransport {
-	return &dirRejectTransport{dirs: map[string]string{}}
+	return &dirRejectTransport{
+		dirs:  map[string]string{},
+		files: map[string]string{},
+	}
 }
 
 // dirSep cannot appear in a directory name, so it is a safe key separator.
@@ -3717,6 +3724,13 @@ func (t *dirRejectTransport) RoundTrip(r *http.Request) (*http.Response, error) 
 					continue
 				}
 				files = append(files, map[string]any{"id": id, "name": name, "type": fileTypeDir})
+			}
+			for k, id := range t.files {
+				p, name, _ := strings.Cut(k, dirSep)
+				if p != parent {
+					continue
+				}
+				files = append(files, map[string]any{"id": id, "name": name, "type": fileTypeFile})
 			}
 		}
 		payload, _ := json.Marshal(map[string]any{"files": files})
@@ -3926,6 +3940,48 @@ func TestUnitDirMoveNeverReportsSuccessOntoAHeldDirectory(t *testing.T) {
 	clk = clk.Add(61 * time.Second)
 	assert.Equal(t, fs.ErrorDirExists, f.DirMove(ctx, f, "moved", "photos"),
 		"with the cache out of the way dircache must see the existing directory")
+}
+
+// TestUnitDirMoveDestinationHeldOnlyByAFile pins the other half of
+// dirPresentUngated: it must look for a DIRECTORY, not for any entry with that
+// name. A destination occupied by a file is the server's call (it answers
+// name-occupied), not rclone's reason to refuse the move with ErrorDirExists.
+func TestUnitDirMoveDestinationHeldOnlyByAFile(t *testing.T) {
+	ctx := context.Background()
+	tr := newDirTransport()
+	tr.create = func(*dirRejectTransport, string, string) (string, string) {
+		return "", "dir-landed"
+	}
+	tr.dirs[dirKeyOf("root-id", "moved")] = "dir-m"
+	tr.files[dirKeyOf("root-id", "photos")] = "file-photos"
+	f := newUnitTestFs(tr)
+
+	require.NoError(t, f.DirMove(ctx, f, "moved", "photos"))
+	assert.Equal(t, 1, tr.renames, "the move goes through and lets the server decide")
+	assert.Equal(t, 0, tr.moves, "same parent, so only the rename leg runs")
+}
+
+// TestUnitDirRejectCacheClearedByDirCacheFlush: rclone dedupe resets the
+// directory cache mid-run through Features().DirCacheFlush. A refusal cache left
+// standing after that reset would answer "does this directory exist" from memory
+// instead of from a request, which is exactly how a real directory gets
+// reported as missing.
+func TestUnitDirRejectCacheClearedByDirCacheFlush(t *testing.T) {
+	ctx := context.Background()
+	tr := newDirTransport()
+	tr.create = func(*dirRejectTransport, string, string) (string, string) {
+		return codeSensitiveWord, ""
+	}
+	f := newUnitTestFs(tr)
+
+	require.Error(t, f.Mkdir(ctx, "blocked-name"))
+	require.Equal(t, 1, tr.creates)
+
+	require.NotNil(t, f.features.DirCacheFlush, "the hook rclone dedupe uses must be published")
+	f.features.DirCacheFlush()
+
+	require.Error(t, f.Mkdir(ctx, "blocked-name"))
+	assert.Equal(t, 2, tr.creates, "a directory-cache reset must drop the refusals with it")
 }
 
 // TestUnitDirRejectCacheEntryCap: --backup-dir style use adds a fresh

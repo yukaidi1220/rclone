@@ -1611,9 +1611,15 @@ func (f *Fs) Hashes() hash.Set {
 }
 
 // DirCacheFlush resets the directory cache - used in testing as an
-// optional interface
+// optional interface, and by rclone dedupe in a live run.
 func (f *Fs) DirCacheFlush() {
 	f.dirCache.ResetRoot()
+	// The refusal cache is the same class of knowledge: "what I think I know
+	// about directory ids". Left behind, a reset would send every path back
+	// through FindLeaf, where a remembered refusal - not a listing - decides the
+	// answer, so a directory that really exists would be reported absent without
+	// any request being made to discover otherwise.
+	f.dirRejects.clear()
 }
 
 // parsePath parses a remote path
