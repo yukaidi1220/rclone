@@ -1191,16 +1191,15 @@ func (f *Fs) rootID(ctx context.Context) (string, error) {
 	if f.opt.Space != spaceFamily {
 		return personalRoot, nil
 	}
-	if f.familyRootID != "" {
-		return f.familyRootID, nil
+	if f.familyRootID == "" {
+		if _, err := f.discoverFamilyRoot(ctx); err != nil {
+			fs.Logf(f, "cloud189: could not read the family drive's numeric root id (%v) - a top-level folder will be created without naming its parent, and tasks will name the alias", err)
+		}
 	}
-	id, err := f.discoverFamilyRoot(ctx)
-	if err != nil {
-		fs.Debugf(f, "cloud189: could not read the family root id (%v), falling back to the 0 alias - creating a directory directly in the root will not work", err)
-		return familyRootAlias, nil
-	}
-	f.familyRootID = id
-	return id, nil
+	// Always the alias: a listing addressed at the numeric id comes back empty,
+	// with no error, which reads as an empty drive. The numeric id lives in
+	// familyRootID for the request bodies that need it.
+	return familyRootAlias, nil
 }
 
 // discoverFamilyRoot reads the family drive's real root id off any entry in it.
@@ -1208,15 +1207,37 @@ func (f *Fs) rootID(ctx context.Context) (string, error) {
 // Every row carries its parent, so one child is enough; the listing that omits
 // folderId is the family root itself.
 func (f *Fs) discoverFamilyRoot(ctx context.Context) (string, error) {
-	// The family listing endpoint accepts the `0` alias and returns an empty page,
-	// with no error, for ids it does not recognise as listable - measured
-	// 2026-10-23: the alias listed seven entries while a row's parentId listed
-	// none. So the root is the alias, always. An earlier version stored a row's
-	// parentId here, which made every later listing come back empty: from the
-	// client's side the whole drive looked gone while its capacity never moved.
-	// Writes still name the real parent of the row they address, in the shape the
-	// captured DELETE and MOVE tasks use.
+	// Two ids are in play on a family drive. The listing endpoint answers the `0`
+	// alias and answers a row's parentId with an empty page and no error, so every
+	// listing is addressed at the alias. Request bodies - the folder a created
+	// directory goes into, a task's parent - want the numeric parent id the rows
+	// carry, which is what the captured client sends. This reads the numeric id
+	// into familyRootID and returns the alias.
+	var rootID string
+	err := f.listAll(ctx, familyRootAlias, func(row *api.Row) bool {
+		if p := row.ParentID.String(); p != "" && p != familyRootAlias {
+			rootID = p
+			return true
+		}
+		return false
+	})
+	if err != nil {
+		return "", err
+	}
+	if rootID == "" {
+		return "", errors.New("the family drive lists no entries to read a numeric root id from")
+	}
+	f.familyRootID = rootID
 	return familyRootAlias, nil
+}
+
+// realDirID is the id a request body has to name: the numeric root id wherever the
+// cache hands back the alias.
+func (f *Fs) realDirID(id string) string {
+	if id == familyRootAlias && f.opt.Space == spaceFamily && f.familyRootID != "" && f.familyRootID != familyRootAlias {
+		return f.familyRootID
+	}
+	return id
 }
 
 // resolveFamilyID fills in family_id when it was left blank.
@@ -1439,8 +1460,10 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	)
 	if f.family() {
 		// The family endpoint is a GET and calls its parent parentId, not
-		// parentFolderId. It also refuses the 0 alias, so a root whose real id
-		// could not be read cannot gain a child.
+		// parentFolderId. It also refuses the 0 alias, so the numeric root id is
+		// what a top-level folder names; when that id could not be read there is
+		// nothing to name.
+		pathID = f.realDirID(pathID)
 		if pathID == familyRootAlias {
 			return "", errors.New("cloud189: cannot create a directory in an empty family drive - its root id is not known, so give family_id a value that lets the root be listed")
 		}
@@ -1729,7 +1752,7 @@ func (f *Fs) copyTaskInfo(ctx context.Context, obj *Object, auth taskAuth) (task
 	if err != nil {
 		return info, err
 	}
-	info.ParentID, err = taskParentID(srcDirID)
+	info.ParentID, err = taskParentID(f.realDirID(srcDirID))
 	return info, err
 }
 
@@ -1759,7 +1782,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 	// The task names the object as the drive stores it.
 	srcLeaf := srcObj.fs.opt.Enc.FromStandardName(stdLeaf)
-	srcParentID, err := taskParentID(srcDirID)
+	srcParentID, err := taskParentID(f.realDirID(srcDirID))
 	if err != nil {
 		return nil, err
 	}
@@ -1809,7 +1832,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	if err != nil {
 		return err
 	}
-	parentID, err := taskParentID(srcDirectoryID)
+	parentID, err := taskParentID(f.realDirID(srcDirectoryID))
 	if err != nil {
 		return err
 	}
@@ -3079,7 +3102,7 @@ func (f *Fs) deleteRows(ctx context.Context, targets []deleteTarget) error {
 	}
 	infos := make([]taskInfo, 0, len(targets))
 	for _, t := range targets {
-		parent, err := taskParentID(t.row.ParentID.String())
+		parent, err := taskParentID(f.realDirID(t.row.ParentID.String()))
 		if err != nil {
 			return err
 		}
