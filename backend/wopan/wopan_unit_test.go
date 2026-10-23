@@ -3656,6 +3656,13 @@ type dirRejectTransport struct {
 	// listFails makes the next that many listings answer a business error - the
 	// eventual-consistency or outage shape the recovery lookup can hit.
 	listFails int
+	// listFailParent makes listings of ONE parent answer a business error from
+	// the listFailParentFrom-th such listing onwards. The destination truth
+	// check is also a listing, so a test needs to fail that one without failing
+	// dircache's earlier ones.
+	listFailParent     string
+	listFailParentFrom int
+	listFailParentSeen int
 	// tick, when non-zero, moves clk forward by that much on every request that
 	// reaches the model. It is how a test closes a 60 second trust window in the
 	// middle of ONE DirMove call: the cache is consulted at the top of that call
@@ -3718,6 +3725,12 @@ func (t *dirRejectTransport) RoundTrip(r *http.Request) (*http.Response, error) 
 		if t.listFails > 0 {
 			t.listFails--
 			return okResp(dirEnvErr("9999")), nil
+		}
+		if t.listFailParent != "" && parent == t.listFailParent {
+			t.listFailParentSeen++
+			if t.listFailParentSeen >= t.listFailParentFrom {
+				return okResp(dirEnvErr("9999")), nil
+			}
 		}
 		// Only page 0 carries entries: listAll pages until it sees an empty
 		// page, so repeating them would never terminate.
@@ -4022,6 +4035,34 @@ func TestUnitDirRejectCacheEntryCap(t *testing.T) {
 	assert.True(t, asAPIError(err, &ae), "the replayed error still carries its code: %v", err)
 	assert.Equal(t, "9999", ae.Code)
 	assert.Equal(t, 2, rc.entries[dirKey{"p0", "x"}].probes, "the probe count keeps accumulating")
+}
+
+// TestUnitDirMoveStopsWhenTheDestinationListingFails closes the hole review N1
+// found: the destination truth check is itself a listing, and a listing can
+// fail. Reading that failure as "not there, go ahead" would send a rename
+// whose destination state is unknown, and report success.
+func TestUnitDirMoveStopsWhenTheDestinationListingFails(t *testing.T) {
+	ctx := context.Background()
+	tr := newDirTransport()
+	tr.create = func(*dirRejectTransport, string, string) (string, string) {
+		return "", "dir-landed"
+	}
+	tr.dirs[dirKeyOf("root-id", "moved")] = "dir-m"
+	tr.dirs[dirKeyOf("root-id", "dest")] = "dir-dest"
+	// "dest" is listed once by dircache's own existence check and once by the
+	// truth check; fail from the second so only the truth check meets the outage.
+	tr.listFailParent = "dir-dest"
+	tr.listFailParentFrom = 2
+	f := newUnitTestFs(tr)
+
+	err := f.DirMove(ctx, f, "moved", "dest/elsewhere")
+	require.Error(t, err, "a failed destination listing must not be read as 'absent, go ahead'")
+	var ae *apiError
+	require.True(t, asAPIError(err, &ae), "the listing failure must surface unchanged, got %v", err)
+	assert.NotEqual(t, fs.ErrorDirExists, err, "a failed listing is not the answer 'the name is taken'")
+	assert.Equal(t, 2, tr.listFailParentSeen, "exactly two listings of the destination parent: dircache's, then ours")
+	assert.Equal(t, 0, tr.renames, "no rename may go out when the destination could not be listed")
+	assert.Equal(t, 0, tr.moves, "and no MoveFile either")
 }
 
 // TestUnitDirMovePaysOneTruthCheckPerMove records the price of never gating
