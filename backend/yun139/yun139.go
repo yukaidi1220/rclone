@@ -135,6 +135,7 @@ type Options struct {
 	DisableHTTP2      bool                 `config:"disable_http2"`
 	MaxFileSize       fs.SizeSuffix        `config:"max_file_size"`   // 单文件上传上限覆盖;0=按会员等级自动
 	NoMemberCheck     bool                 `config:"no_member_check"` // 跳过会员等级探测与单文件上限检查,任意大小直接上传
+	URLTypeHeader     bool                 `config:"url_type_header"` // 发送 x-yun-url-type: 3 请求头;默认不发送
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -272,6 +273,16 @@ func init() {
 				"(no-member 5G / silver 8G / gold 20G / diamond 500G). Set this to " +
 				"skip that probe and upload files of any size, letting the server " +
 				"reject an oversized file (04010319 权益不足) instead. Default false.",
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name: "url_type_header",
+			Help: "Send the x-yun-url-type: 3 request header.\n\n" +
+				"The official client pins this header on its download-signing calls, " +
+				"on every family-space call, and on the shared group's native-module " +
+				"calls. With it the signed link comes back on an *.eos.yun.139.com " +
+				"host; without it on a bare cmecloud EOS host, and the direct-link " +
+				"gateway's rules key on the host. Default false: the header is not sent.",
 			Default:  false,
 			Advanced: true,
 		}, {
@@ -1187,16 +1198,19 @@ func (f *Fs) groupHeaders(p, ts, randStr, sign string) map[string]string {
 		// Native module: short UA, x-DeviceInfo, x-huawei-channelSrc, and on the
 		// download-signing call x-MM-Source, x-deviceID, x-yun-svc-type: 2.
 		//
-		// x-yun-url-type: 3 belongs to this set and is the switch that makes the
-		// signed link come back on an *.eos.yun.139.com host rather than a bare
-		// cmecloud EOS host (measured both ways on 2026-10-19: without it the
-		// link is ykj-eos-wx2-01.eos-wuxi-3.cmecloud.cn, with it
+		// x-yun-url-type: 3 is the switch that makes the signed link come back
+		// on an *.eos.yun.139.com host rather than a bare cmecloud EOS host
+		// (measured both ways on 2026-10-19: without it the link is
+		// ykj-eos-wx2-01.eos-wuxi-3.cmecloud.cn, with it
 		// ykj-eos-*.eos.yun.139.com). Dropping it is not cosmetic - the direct
-		// link gateway's rules key on the host.
+		// link gateway's rules key on the host - so it is sent only when
+		// url_type_header is enabled.
 		h := pcHeaders(f.accessToken(), f.account, ts, randStr, sign, f.svcType)
 		h["x-DeviceInfo"] = f.deviceInfoHeader()
 		h["x-huawei-channelSrc"] = pcAppChannel
-		h["x-yun-url-type"] = "3"
+		if f.opt.URLTypeHeader {
+			h["x-yun-url-type"] = "3"
+		}
 		h["x-yun-uni"] = f.userDomainID
 		if strings.HasSuffix(p, "/getGroupFileDownLoadURLV2") {
 			h["x-MM-Source"] = "001"
@@ -1311,10 +1325,13 @@ func (f *Fs) call(ctx context.Context, url string, body any, out any) error {
 		p := strings.SplitN(url, "?", 2)[0]
 		headers = f.groupHeaders(p, ts, randStr, sign)
 	} else if host == "group.yun.139.com" {
-		// Family space: lean header set, short UA, x-yun-url-type:3 on
-		// every call (captured 2026-09-03, family cloud).
+		// Family space: lean header set, short UA. The client pins
+		// x-yun-url-type:3 on every call (captured 2026-09-03, family cloud);
+		// we send it only when url_type_header is enabled.
 		headers = pcHeaders(auth, f.account, ts, randStr, sign, f.svcType)
-		headers["x-yun-url-type"] = "3"
+		if f.opt.URLTypeHeader {
+			headers["x-yun-url-type"] = "3"
+		}
 		headers["Accept"] = "*/*"
 		headers["x-DeviceInfo"] = f.deviceInfoHeader()
 	} else {
@@ -1327,7 +1344,7 @@ func (f *Fs) call(ctx context.Context, url string, body any, out any) error {
 		if (strings.HasSuffix(p, "/hcy/file/create") && strings.Contains(string(payload), `"partInfos"`)) ||
 			strings.HasSuffix(p, "/hcy/file/getDownloadUrl") {
 			headers = pcHeaders(auth, f.account, ts, randStr, sign, f.svcType)
-			if strings.HasSuffix(p, "/hcy/file/getDownloadUrl") {
+			if f.opt.URLTypeHeader && strings.HasSuffix(p, "/hcy/file/getDownloadUrl") {
 				headers["x-yun-url-type"] = "3"
 			}
 		} else {
@@ -6083,9 +6100,9 @@ func (f *Fs) fetchDownloadURLExpire(ctx context.Context, o *Object, expireSec in
 		return "", fmt.Errorf("yun139: no download URL returned for %q", o.remote)
 	}
 	if u, perr := neturl.Parse(dl); perr == nil {
-		fs.Debugf(o, "yun139: download url-type=3 via %s", u.Host)
+		fs.Debugf(o, "yun139: download link host %s", u.Host)
 	} else {
-		fs.Debugf(o, "yun139: download url-type=3 (unparsed host): %.120s", dl)
+		fs.Debugf(o, "yun139: download link (unparsed): %.120s", dl)
 	}
 	return dl, nil
 }
