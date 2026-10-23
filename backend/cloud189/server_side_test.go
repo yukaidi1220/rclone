@@ -235,6 +235,36 @@ func TestCrossSpaceCopyUsesThePersonalSessionAndMarksTheDirection(t *testing.T) 
 		"the new object is looked for in the destination drive")
 }
 
+// TestDestructiveOperationsRefuseAnUnknownFamilyRoot: the root id is read from a
+// listing that can come back empty, and a purge aimed at the alias then deletes
+// whatever that alias names. Measured 2026-10-23: one run emptied a family drive
+// into its recycle bin. With no root id the destructive paths must refuse and send
+// nothing at all.
+func TestDestructiveOperationsRefuseAnUnknownFamilyRoot(t *testing.T) {
+	drive := &fakeDrive{t: t}
+	f := newFakeFs(t, drive)
+	f.opt.Space = spaceFamily
+	f.familyID = famID
+	f.familyRootID = ""
+	f.opt.RootFolderID = ""
+	f.dirCache = dircache.New("", famRoot, f)
+
+	for _, tc := range []struct {
+		what string
+		call func() error
+	}{
+		{"Purge of the root", func() error { return f.Purge(context.Background(), "") }},
+		{"Purge of a directory", func() error { return f.Purge(context.Background(), "sub") }},
+		{"Rmdir of a directory", func() error { return f.Rmdir(context.Background(), "sub") }},
+	} {
+		err := tc.call()
+		require.Error(t, err, tc.what)
+		require.Contains(t, err.Error(), "family root id", tc.what)
+		require.True(t, fserrors.IsNoRetryError(err), "%s cannot heal by trying again", tc.what)
+	}
+	require.Empty(t, sequenceOf(drive), "and not one request went out, let alone a delete task")
+}
+
 // TestDirMoveBetweenTwoRemotesIsRefused is why a directory move can never see two
 // remotes disagree about how to spell a name: taskAuthFor refuses a server-side
 // move between two remote instances of one account, so DirMove only ever runs with
