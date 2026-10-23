@@ -907,6 +907,7 @@ type Fs struct {
 	dirCache   *dircache.DirCache // map of directory path to directory id
 
 	familyID     string      // family drive id, when space is family
+	fsRootID     string      // the id the dircache was seeded with, i.e. this remote's own root
 	familyRootID string      // the family drive's real root id, once learned
 	apiBase      string      // base URL of the file API, which is apiHost for any remote a user configures
 	uploadBase   string      // where upload traffic goes: the server's host, or upload_zone
@@ -1142,6 +1143,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 	f.dirCache = dircache.New(f.root, rootID, f)
+	f.fsRootID = rootID
 
 	// Find the current root
 	err = f.dirCache.FindRoot(ctx, false)
@@ -3439,7 +3441,17 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 		// The remote's own root cannot be deleted, only emptied. The drive takes
 		// several objects in one task, so that is one request whatever the root
 		// holds.
-		dirID, err := f.rootID(ctx)
+		//
+		// The id comes from the dircache, which is the root this Fs was opened at,
+		// NOT rootID(): that one answers the space's top level, and using it here
+		// made `purge` of a remote opened at a subdirectory empty the whole drive.
+		// Measured 2026-10-23: the integration suite's teardown purge took a family
+		// drive's root with it, twice.
+		dirID := f.fsRootID
+		if dirID == "" {
+			return fserrors.NoRetryError(errors.New("cloud189: this remote has not been opened yet, so its root is unknown"))
+		}
+		err := error(nil)
 		if err != nil {
 			return err
 		}
