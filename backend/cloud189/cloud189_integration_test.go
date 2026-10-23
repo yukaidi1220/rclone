@@ -30,7 +30,7 @@ import (
 // off.
 func TestIntegration(t *testing.T) {
 	root := os.Getenv("RCLONE_TEST_CLOUD189_ROOT")
-	if root == "" {
+	if strings.Trim(root, "/ ") == "" {
 		t.Skip("RCLONE_TEST_CLOUD189_ROOT is unset: the suite purges the root it runs against, so it must be confined to a dedicated sub-directory")
 	}
 	remote := "TestCloud189:" + strings.Trim(root, "/")
