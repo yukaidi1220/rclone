@@ -235,6 +235,36 @@ func TestCrossSpaceCopyUsesThePersonalSessionAndMarksTheDirection(t *testing.T) 
 		"the new object is looked for in the destination drive")
 }
 
+// TestPurgeOfTheRootEmptiesOnlyThisRemotesRoot: the Fs may be opened at a
+// subdirectory, and a purge of "" then means that subdirectory, not the space's top
+// level. Getting this wrong emptied a whole family drive into its recycle bin when
+// the integration suite's teardown purged the directory it ran in.
+func TestPurgeEmptiesOnlyTheRootTheRemoteWasOpenedAt(t *testing.T) {
+	drive := &fakeDrive{t: t}
+	f := newFakeFs(t, drive)
+	const openedAt = "9000000000000007"
+	f.dirCache = dircache.New("rc-fstest", openedAt, f)
+	f.fsRootID = openedAt
+	drive.listingFn = newListingScript(map[string][]string{
+		openedAt: {listingJSON([]string{
+			fileJSON("900000000000000021", "keep.bin", openedAt),
+			fileJSON("900000000000000022", "gone.bin", openedAt),
+		}, nil)},
+		rootID: {listingJSON([]string{fileJSON("900000000000000031", "root.bin", rootID)}, nil)},
+	}).fn
+
+	require.NoError(t, f.Purge(context.Background(), ""))
+
+	require.Len(t, drive.tasks, 1, "one task")
+	var ids []string
+	for _, info := range drive.tasks[0].infos {
+		ids = append(ids, info.FileID)
+	}
+	require.ElementsMatch(t, []string{"900000000000000021", "900000000000000022"}, ids,
+		"the entries under the directory the remote was opened at, and nothing else")
+	require.NotContains(t, ids, "900000000000000031", "the space root's own entries are not this remote's to empty")
+}
+
 // TestDestructiveOperationsRefuseAnUnknownFamilyRoot: the root id is read from a
 // listing that can come back empty, and a purge aimed at the alias then deletes
 // whatever that alias names. Measured 2026-10-23: one run emptied a family drive
