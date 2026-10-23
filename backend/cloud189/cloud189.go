@@ -1485,6 +1485,9 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 // taking the children with it, so the listing is checked first and a non-empty
 // directory is refused rather than deleted recursively.
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	if err := f.requireKnownFamilyRoot("a directory removal"); err != nil {
+		return err
+	}
 	if dir == "" {
 		return fserrors.NoRetryError(errors.New("cloud189: the drive's own top level cannot be removed, only what is inside it"))
 	}
@@ -3409,6 +3412,22 @@ func (o *Object) Remove(ctx context.Context) error {
 	return o.fs.deleteRows(ctx, []deleteTarget{{row: fileRow(o.id, wireLeaf, dirID)}})
 }
 
+// requireKnownFamilyRoot refuses a destructive operation when this remote does not
+// know where its family root is.
+//
+// The root id is read from a listing of the alias, and that listing can come back
+// empty (measured 2026-10-23, with 24 GiB of entries still on the drive). The read
+// path tolerates the alias because a listing against it still works, but a purge or
+// a directory removal addressed at it may be aimed at something this remote never
+// chose - one such run emptied a family drive into its recycle bin. So the
+// destructive paths refuse rather than guess.
+func (f *Fs) requireKnownFamilyRoot(what string) error {
+	if f.opt.Space != spaceFamily || f.familyRootID != "" || f.opt.RootFolderID != "" {
+		return nil
+	}
+	return fserrors.NoRetryError(fmt.Errorf("cloud189: the family root id could not be read, so %s will not be sent - set family_id or root_folder_id", what))
+}
+
 // Purge removes a directory and everything under it.
 //
 // One DELETE task on a directory takes the whole tree with it: measured
@@ -3417,6 +3436,9 @@ func (o *Object) Remove(ctx context.Context) error {
 // itself. So there is no reason to walk the tree first, and a purge of a deep
 // directory costs one request rather than one per entry.
 func (f *Fs) Purge(ctx context.Context, dir string) error {
+	if err := f.requireKnownFamilyRoot("a purge"); err != nil {
+		return err
+	}
 	if dir == "" {
 		// The remote's own root cannot be deleted, only emptied. The drive takes
 		// several objects in one task, so that is one request whatever the root

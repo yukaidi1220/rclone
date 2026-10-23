@@ -370,6 +370,12 @@ failed step from removal. Both cases are refused locally.
 
 `DirMove` is a single `MOVE` task on the directory: measured with a directory of
 18 files, it moved the whole subtree in one task that reported one object done.
+A family remote whose root id could not be read refuses `Purge` and `Rmdir`
+outright: the id is learnt from a listing, that listing came back empty once on a
+drive that still held 24 GiB, and a purge aimed at the alias behind it deleted
+what the alias named. Nothing destructive is sent until `family_id` or
+`root_folder_id` names the drive.
+
 `Purge` of a directory is likewise a single recursive `DELETE`, so a deep tree
 costs one request rather than one per entry. `Purge` of a remote's own root
 empties it in one multi-object task, because the root itself cannot be deleted.
