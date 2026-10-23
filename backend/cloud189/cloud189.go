@@ -1145,7 +1145,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 	f.dirCache = dircache.New(f.root, rootID, f)
-	f.fsRootID = rootID
 
 	// Find the current root
 	err = f.dirCache.FindRoot(ctx, false)
@@ -1158,12 +1157,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		err = tempF.dirCache.FindRoot(ctx, false)
 		if err != nil {
 			// No root so return old f
+			f.fsRootID = ""
 			return f, nil
 		}
 		_, err := tempF.NewObject(ctx, remote)
 		if err != nil {
 			if err == fs.ErrorObjectNotFound {
 				// File doesn't exist so return old f
+				f.fsRootID = ""
 				return f, nil
 			}
 			return nil, err
@@ -1174,9 +1175,38 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		// https://github.com/rclone/rclone/issues/2182
 		f.dirCache = tempF.dirCache
 		f.root = tempF.root
+		// The anchor is now the file's directory, which the re-seeded walk
+		// above has resolved; see resolveAnchor.
+		if err := f.resolveAnchor(ctx); err != nil {
+			return nil, err
+		}
 		return f, fs.ErrorIsFile
 	}
+	// See resolveAnchor: the purge anchor is only known once the walk above has
+	// resolved the root, and a root that never resolved must not fall back to
+	// the space root - measured live 2026-10-23, a remote opened at a
+	// subdirectory carried the space root here, so `rclone purge remote:sub`
+	// listed the drive's top level and sent one DELETE task naming every entry
+	// of it, and a remote opened at a family subdirectory emptied the family
+	// root the same way before the server happened to refuse such a batch.
+	if err := f.resolveAnchor(ctx); err != nil {
+		return nil, err
+	}
 	return f, nil
+}
+
+// resolveAnchor reads back the id the dircache resolved for the root this remote
+// is opened at. The seed rootID() names the space's top level, which is the true
+// anchor only when root is empty; a remote opened at a subdirectory has to carry
+// the id the walk found, because Purge("") and the other whole-directory paths
+// address that directory.
+func (f *Fs) resolveAnchor(ctx context.Context) error {
+	id, err := f.dirCache.FindDir(ctx, "", false)
+	if err != nil {
+		return err
+	}
+	f.fsRootID = id
+	return nil
 }
 
 // rootID returns the id the path is anchored at.
@@ -1331,6 +1361,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, fn func(*api.Row) bool) 
 			}
 			seen[row.ID.String()] = struct{}{}
 			count++
+			f.stampParent(row, dirID)
 			if fn(row) {
 				stopped = true
 				break
@@ -1346,6 +1377,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, fn func(*api.Row) bool) 
 			}
 			seen[row.ID.String()] = struct{}{}
 			count++
+			f.stampParent(row, dirID)
 			if fn(row) {
 				stopped = true
 				break
@@ -1359,6 +1391,20 @@ func (f *Fs) listAll(ctx context.Context, dirID string, fn func(*api.Row) bool) 
 		}
 	}
 	return fmt.Errorf("cloud189: listing of %q did not terminate after %d pages, the server keeps returning data", dirID, maxListPages)
+}
+
+// stampParent fills in the parent a task body will need for this row.
+//
+// The personal endpoint answers file rows without a parentId: captured 2026-10-23,
+// only the folderList rows carry one. Tasks address an object by id and its
+// parent by number, so a file found by a listing has to take the parent from the
+// listing itself - the only place this client knows it from. A row the drive did
+// name a parent for is left alone, and the family alias is mapped back to the
+// real id by realDirID on the way out.
+func (f *Fs) stampParent(row *api.Row, dirID string) {
+	if row.ParentID == "" {
+		row.ParentID = api.FlexID(dirID)
+	}
 }
 
 // rowToEntry turns a listing row into the entry it describes, or nil when the
@@ -1491,7 +1537,25 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 		// on this directory would then target the root.
 		return "", errors.New("cloud189: createFolder returned no id")
 	}
-	return resp.ID.String(), nil
+	created := resp.ID.String()
+	// Read the created directory's id back from its parent's listing. Measured
+	// live 2026-10-23: creating a directory whose name was deleted moments
+	// before (the test suite's rmdir-then-mkdir of the same root) made the
+	// create answer an id that no listing could then find, and every operation
+	// through the cached id failed with FileNotFound. The parent's listing is
+	// immediately consistent - a created directory shows up in it at once,
+	// measured the same day - so the id it carries is the one the drive will
+	// answer to. The cost is one listing per created directory; where the
+	// read-back fails or does not show the name, the create's own answer stands.
+	rows, err := f.rowsIn(ctx, pathID)
+	if err == nil {
+		for _, row := range rows {
+			if row.Name == name && rowIsDir(row) {
+				return row.ID.String(), nil
+			}
+		}
+	}
+	return created, nil
 }
 
 // Mkdir makes the directory if it doesn't exist
@@ -1510,7 +1574,14 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return err
 	}
 	if dir == "" {
-		return fserrors.NoRetryError(errors.New("cloud189: the drive's own top level cannot be removed, only what is inside it"))
+		// The space root holds every other remote's parent, so removing it is
+		// refused. A remote opened below it owns the directory it was opened at:
+		// rmdir of that root is what `rclone rmdir remote:sub` means, and the
+		// test suite's teardown calls it on the Fs it is handed.
+		if f.root == "" {
+			return fserrors.NoRetryError(errors.New("cloud189: the drive's own top level cannot be removed, only what is inside it"))
+		}
+		return f.rmdirRoot(ctx)
 	}
 	parentDir, leaf := dircache.SplitPath(dir)
 	parentID, err := f.dirCache.FindDir(ctx, parentDir, false)
@@ -1544,6 +1615,51 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	// later Mkdir of the same name must create it again rather than trust the
 	// stale id.
 	f.dirCache.FlushDir(dir)
+	return nil
+}
+
+// rmdirRoot removes the directory this remote was opened at, when that is below
+// the space root - rmdir of "" on such a remote is what the test suite's
+// teardown and `rclone rmdir remote:sub` both mean.
+//
+// The row is looked up from the space root downwards, because a dircache rooted
+// at the remote cannot name the directories above it, and the delete task
+// addresses the object by id and its parent by number: the row found in its
+// parent's listing carries both. The walk is the same resolution NewFs did, and
+// a root one level down is found in the first listing.
+func (f *Fs) rmdirRoot(ctx context.Context) error {
+	dirID, err := f.rootID(ctx)
+	if err != nil {
+		return err
+	}
+	row := (*api.Row)(nil)
+	for _, leaf := range strings.Split(f.root, "/") {
+		r, err := f.findEntry(ctx, dirID, f.opt.Enc.FromStandardName(leaf))
+		if err == fs.ErrorObjectNotFound {
+			return fs.ErrorDirNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if !rowIsDir(r) {
+			return fs.ErrorDirNotFound
+		}
+		dirID = r.ID.String()
+		row = r
+	}
+	children, err := f.rowsIn(ctx, row.ID.String())
+	if err != nil {
+		return err
+	}
+	if len(children) > 0 {
+		return fs.ErrorDirectoryNotEmpty
+	}
+	if err := f.deleteRows(ctx, []deleteTarget{{row: row}}); err != nil {
+		return err
+	}
+	// The remote no longer exists on the drive, so nothing in its cache can be
+	// trusted, including the root's own id.
+	f.dirCache.Flush()
 	return nil
 }
 

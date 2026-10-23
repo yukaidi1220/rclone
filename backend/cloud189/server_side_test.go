@@ -447,12 +447,12 @@ func TestDirMoveIsOneRecursiveTask(t *testing.T) {
 	f := newFakeFs(t, drive)
 	subFolder := listingJSON(nil, []string{folderJSON("900000000000000007", "sub", rootID)})
 	drive.listingFn = newListingScript(map[string][]string{
-		// The root is listed twice: once while looking for the destination's
-		// parent, once for the source directory itself. The archive is listed
-		// twice as well: the destination must not exist, and the name the move
-		// arrives under must be free.
-		rootID:    {subFolder, subFolder},
-		archiveID: {emptyListing(), emptyListing()},
+		// root: the destination's parent lookup (archive missing), the create's
+		// read-back, and the source lookup. archive: the "moved" lookup, its
+		// read-back, the destination-must-not-exist check, and the clearName
+		// sweep of the destination directory.
+		rootID:    {emptyListing(), emptyListing(), subFolder},
+		archiveID: {emptyListing(), emptyListing(), emptyListing(), emptyListing()},
 	}).fn
 
 	require.NoError(t, f.DirMove(context.Background(), f, "sub", "archive/moved"))
@@ -696,6 +696,83 @@ func TestRmdirRefusesTheRoot(t *testing.T) {
 	require.Empty(t, sequenceOf(drive), "and the drive is not asked")
 }
 
+// TestRmdirOfTheRootTheRemoteWasOpenedAt is the other half: a remote opened
+// below the space root owns that directory, so rmdir of "" removes it - the
+// shape the suite's teardown and `rclone rmdir remote:sub` both mean. The row
+// is found in the space root's listing, which is where its parent number lives
+// (captured 2026-10-23 [15]: a top-level delete names srcParentId -11).
+func TestRmdirOfTheRootTheRemoteWasOpenedAt(t *testing.T) {
+	const subID = "900000000000000042"
+	drive := &fakeDrive{t: t}
+	f := newFakeFs(t, drive)
+	f.root = "sub"
+	f.fsRootID = subID
+	f.dirCache = dircache.New("sub", subID, f)
+	drive.listingFn = newListingScript(map[string][]string{
+		rootID: {listingJSON(nil, []string{folderJSON(subID, "sub", rootID)})},
+		subID:  {emptyListing()},
+	}).fn
+
+	require.NoError(t, f.Rmdir(context.Background(), ""))
+	require.Len(t, drive.tasks, 1)
+	require.Equal(t, taskDelete, drive.tasks[0].taskType)
+	require.Equal(t, subID, drive.tasks[0].infos[0].FileID, "the directory the remote was opened at is what goes")
+	require.EqualValues(t, -11, *drive.tasks[0].infos[0].ParentID, "its parent is named the way the drive spells the space root")
+}
+
+// TestPurgeAnchorIsTheDirectoryTheWalkResolved is the live lesson of 2026-10-23:
+// NewFs seeded the purge anchor from rootID(), which names the space's top level
+// whatever the remote is opened at. A remote opened at a subdirectory then
+// carried the space root as its anchor, and `rclone purge remote:sub` listed the
+// drive's top level and sent one DELETE task naming every entry of it - the
+// server refused that batch, and a remote opened at a family subdirectory
+// emptied the family root the same way before any refusal existed to save it.
+// The Fs here is built exactly as NewFs used to leave it: dircache seeded with
+// the space root, then resolved.
+func TestPurgeAnchorIsTheDirectoryTheWalkResolved(t *testing.T) {
+	const subID = "900000000000000043"
+	drive := &fakeDrive{t: t, listings: map[string]string{
+		rootID: listingJSON([]string{fileJSON("300000000000000009", "top.bin", rootID)},
+			[]string{folderJSON(subID, "sub", rootID)}),
+		// The personal endpoint answers file rows without a parentId; what the
+		// delete task names as the parent has to come from the listing itself.
+		subID: `{"res_code":0,"res_message":"成功","fileListAO":{"count":1,"fileList":[` +
+			`{"id":"300000000000000010","name":"inside.bin","size":10,"type":"1"}],"folderList":[]}}`,
+	}}
+	f := newFakeFs(t, drive)
+	f.root = "sub"
+	f.dirCache = dircache.New("sub", rootID, f)
+	f.fsRootID = rootID
+
+	require.NoError(t, f.resolveAnchor(context.Background()))
+	require.Equal(t, subID, f.fsRootID, "the anchor is the directory the walk resolved, not the space root")
+
+	require.NoError(t, f.Purge(context.Background(), ""))
+	require.Len(t, drive.tasks, 1)
+	require.Equal(t, taskDelete, drive.tasks[0].taskType)
+	require.Len(t, drive.tasks[0].infos, 1, "only what the opened directory holds is addressed")
+	require.Equal(t, "300000000000000010", drive.tasks[0].infos[0].FileID, "the top-level entry is not in the task")
+	require.EqualValues(t, 900000000000000043, *drive.tasks[0].infos[0].ParentID)
+}
+
+// TestPurgeRefusesWhenNothingWasResolved: a remote whose root the walk could not
+// resolve has no honest anchor, and the space root is not one - the anchor stays
+// empty and the destructive paths refuse rather than guess.
+func TestPurgeRefusesWhenNothingWasResolved(t *testing.T) {
+	drive := &fakeDrive{t: t, listings: map[string]string{
+		rootID: listingJSON([]string{fileJSON("300000000000000009", "top.bin", rootID)}, nil),
+	}}
+	f := newFakeFs(t, drive)
+	f.root = "missing"
+	f.dirCache = dircache.New("missing", rootID, f)
+	f.fsRootID = ""
+	require.Error(t, f.resolveAnchor(context.Background()), "nothing resolved, so there is no anchor to read back")
+
+	err := f.Purge(context.Background(), "")
+	require.Error(t, err)
+	require.Empty(t, drive.tasks, "the space root is never dressed up as the target")
+}
+
 // TestRmdirRefusesANonEmptyDirectory is the difference between Rmdir and Purge:
 // the drive cannot remove a directory that has children without taking the
 // children, so the listing is checked and the call is refused.
@@ -845,16 +922,18 @@ func TestMkdirCreatesTheDirectoryOnce(t *testing.T) {
 	drive := &fakeDrive{t: t, folders: map[string]string{"fresh": newID}}
 	f := newFakeFs(t, drive)
 	script := newListingScript(map[string][]string{
-		rootID: {emptyListing()},
+		// one walk for FindLeaf, one for the create's read-back
+		rootID: {emptyListing(), emptyListing()},
 	})
 	drive.listingFn = script.fn
 
 	require.NoError(t, f.Mkdir(context.Background(), "fresh"))
 	require.Equal(t, []string{"fresh"}, drive.mkdirs)
+	require.Equal(t, 2, script.walksOf(rootID), "the create reads the parent back once, to take the id from the listing")
 
 	require.NoError(t, f.Mkdir(context.Background(), "fresh"))
 	require.Equal(t, []string{"fresh"}, drive.mkdirs, "a directory the cache knows is not created twice")
-	require.Equal(t, 1, script.walksOf(rootID), "nor is the parent listed again")
+	require.Equal(t, 2, script.walksOf(rootID), "nor is the parent listed again")
 }
 
 // TestSetModTimeReportsItCannotBeDone pins both halves of that answer: the
