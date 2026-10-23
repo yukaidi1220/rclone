@@ -1206,21 +1206,15 @@ func (f *Fs) rootID(ctx context.Context) (string, error) {
 // Every row carries its parent, so one child is enough; the listing that omits
 // folderId is the family root itself.
 func (f *Fs) discoverFamilyRoot(ctx context.Context) (string, error) {
-	var rootID string
-	err := f.listAll(ctx, familyRootAlias, func(row *api.Row) bool {
-		if p := row.ParentID.String(); p != "" && p != familyRootAlias {
-			rootID = p
-			return true
-		}
-		return false
-	})
-	if err != nil {
-		return "", err
-	}
-	if rootID == "" {
-		return "", errors.New("the family drive lists no entries to read a root id from")
-	}
-	return rootID, nil
+	// The family listing endpoint accepts the `0` alias and returns an empty page,
+	// with no error, for ids it does not recognise as listable - measured
+	// 2026-10-23: the alias listed seven entries while a row's parentId listed
+	// none. So the root is the alias, always. An earlier version stored a row's
+	// parentId here, which made every later listing come back empty: from the
+	// client's side the whole drive looked gone while its capacity never moved.
+	// Writes still name the real parent of the row they address, in the shape the
+	// captured DELETE and MOVE tasks use.
+	return familyRootAlias, nil
 }
 
 // resolveFamilyID fills in family_id when it was left blank.
