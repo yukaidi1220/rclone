@@ -32,6 +32,64 @@ type Dialer struct {
 // applies to the next one (a new Dialer is made for every dial).
 var health = newFamilyHealth(time.Now, 2)
 
+// lookupShapes remembers whether each host's last lookup produced IPv4 and/or
+// IPv6 addresses, so a change is logged once instead of on every dial. The
+// shape itself is otherwise invisible: a name that resolves to AAAA only
+// produces no error and no demotion, it just silently dials IPv6 even under
+// --connect-family=prefer-v4.
+var lookupShapes sync.Map // host -> lookupShape
+
+// lookupShape is the presence (not the count) of each family: CDN answers
+// drift between, say, two and four addresses all day, and only the appearance
+// or disappearance of a family changes what the dialler can do.
+type lookupShape struct{ v4, v6 bool }
+
+// noteLookupShape reports whether this host's available families changed.
+func noteLookupShape(store *sync.Map, host string, n4, n6 int) bool {
+	shape := lookupShape{v4: n4 > 0, v6: n6 > 0}
+	actual, loaded := store.LoadOrStore(host, shape)
+	if !loaded {
+		return true
+	}
+	if actual.(lookupShape) == shape {
+		return false
+	}
+	store.Store(host, shape)
+	return true
+}
+
+// fallbackLogs rate-limits the fall-through line below: with 64 concurrent
+// dials a flapping host would otherwise print one entry per request.
+var fallbackLogs sync.Map // host -> time.Time
+
+// noteFallbackLog reports whether the fall-through may be logged now.
+func noteFallbackLog(store *sync.Map, host string, now time.Time, interval time.Duration) bool {
+	if prev, ok := store.Load(host); ok {
+		if t, ok := prev.(time.Time); ok && now.Sub(t) < interval {
+			return false
+		}
+	}
+	store.Store(host, now)
+	return true
+}
+
+// summarizeAddrs renders at most three addresses for a one-line log.
+func summarizeAddrs(list []net.IPAddr) string {
+	const max = 3
+	if len(list) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, max+1)
+	for i, a := range list {
+		if i == max {
+			parts = append(parts, fmt.Sprintf("+%d more", len(list)-max))
+			break
+		}
+		parts = append(parts, a.String())
+	}
+	return strings.Join(parts, ",")
+}
+
 var (
 	familyWarnOnce sync.Once
 	bindWarnOnce   sync.Once
@@ -195,6 +253,10 @@ func (d *Dialer) dialFamily(ctx context.Context, address string) (c net.Conn, er
 		// silent fallback would make the pin a lie.
 		return nil, fmt.Errorf("--connect-family=%s: %w", d.familyName(), splitErr), true
 	}
+	if noteLookupShape(&lookupShapes, host, len(v4), len(v6)) {
+		fs.Debugf(nil, "fshttp: %s: lookup returned %d IPv4 (%s) and %d IPv6 (%s), --connect-family=%s",
+			host, len(v4), summarizeAddrs(v4), len(v6), summarizeAddrs(v6), d.familyName())
+	}
 
 	// Order the families, then drop the ones cooling down. If that would leave
 	// nothing to try, ignore the cooldown: refusing to dial would deadlock a
@@ -236,7 +298,7 @@ func (d *Dialer) dialFamily(ctx context.Context, address string) (c net.Conn, er
 	}
 
 	var lastErr error
-	for _, i := range keep {
+	for pos, i := range keep {
 		cand := order[i]
 		network := "tcp4"
 		if cand.v6 {
@@ -252,6 +314,15 @@ func (d *Dialer) dialFamily(ctx context.Context, address string) (c net.Conn, er
 			if ctx.Err() != nil {
 				// The caller gave up; this says nothing about the family.
 				return nil, dialErr, true
+			}
+			// The demotion above needs two consecutive failures, so a host that
+			// fails once and then succeeds silently moves one request to the
+			// other family. Say so, or "why is a third of the traffic on IPv6"
+			// stays unanswerable from the logs.
+			if pos+1 < len(keep) && order[keep[pos+1]].v6 != cand.v6 &&
+				noteFallbackLog(&fallbackLogs, host, time.Now(), time.Minute) {
+				fs.Debugf(nil, "fshttp: %s: IPv%d dial failed (%v), falling back to IPv%d",
+					host, familyNum(cand.v6), dialErr, familyNum(order[keep[pos+1]].v6))
 			}
 			if h.noteDialFailure(host, cand.v6, d.cooldown) {
 				fs.Logf(nil, "fshttp: %s: IPv%d failed %d times in a row (%v), avoiding that family for %v",
