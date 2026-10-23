@@ -1538,15 +1538,25 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 		return "", errors.New("cloud189: createFolder returned no id")
 	}
 	created := resp.ID.String()
-	// Read the created directory's id back from its parent's listing. Measured
-	// live 2026-10-23: creating a directory whose name was deleted moments
-	// before (the test suite's rmdir-then-mkdir of the same root) made the
-	// create answer an id that no listing could then find, and every operation
-	// through the cached id failed with FileNotFound. The parent's listing is
-	// immediately consistent - a created directory shows up in it at once,
-	// measured the same day - so the id it carries is the one the drive will
-	// answer to. The cost is one listing per created directory; where the
-	// read-back fails or does not show the name, the create's own answer stands.
+	// The id createFolder answers has been measured live to be one no listing
+	// can find when the name was deleted moments before - the test suite's
+	// rmdir-then-mkdir of the same root, twice - and the drive needs a few
+	// seconds to let go of the recycled entry. So the id is verified by listing
+	// the directory it names, the window is waited out, and the parent's
+	// listing is the fallback. For a name that was not recycled the first
+	// verification answers at once, so the common case costs one listing and
+	// no sleep.
+	for attempt := 0; ; attempt++ {
+		_, verr := f.rowsIn(ctx, created)
+		if verr == nil {
+			return created, nil
+		}
+		var refused *apiError
+		if attempt >= 2 || ctx.Err() != nil || !errors.As(verr, &refused) || refused.Code != "FileNotFound" {
+			break
+		}
+		time.Sleep(time.Second)
+	}
 	rows, err := f.rowsIn(ctx, pathID)
 	if err == nil {
 		for _, row := range rows {

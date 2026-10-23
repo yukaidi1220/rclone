@@ -107,8 +107,10 @@ func TestServerSideCopyOfAFileMovesNoBytes(t *testing.T) {
 	drive := &fakeDrive{t: t, folders: map[string]string{"archive": archiveID}}
 	f := newFakeFs(t, drive)
 	drive.listingFn = newListingScript(map[string][]string{
-		rootID:    {emptyListing()}, // nothing named archive yet
-		archiveID: {emptyListing(), listingJSON([]string{fileJSON("900000000000000011", "clip-01.mp4", archiveID)}, nil)},
+		rootID: {emptyListing()}, // nothing named archive yet
+		// the created "archive" is verified by listing it first, so the read
+		// back of the copied object is the third walk of it
+		archiveID: {emptyListing(), emptyListing(), listingJSON([]string{fileJSON("900000000000000011", "clip-01.mp4", archiveID)}, nil)},
 	}).fn
 
 	obj, err := f.Copy(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "archive/clip-01.mp4")
@@ -164,6 +166,7 @@ func TestServerSideCopyParksTheOccupierAndDeletesIt(t *testing.T) {
 	drive.listingFn = newListingScript(map[string][]string{
 		rootID: {emptyListing()},
 		archiveID: {
+			emptyListing(), // the create's verification
 			listingJSON([]string{fileJSON("6000000000000000006", "clip-01.mp4", archiveID)}, nil),
 			listingJSON([]string{fileJSON("900000000000000011", "clip-01.mp4", archiveID)}, nil),
 		},
@@ -190,7 +193,7 @@ func TestCopyRefusesToDisplaceADirectory(t *testing.T) {
 	f := newFakeFs(t, drive)
 	drive.listingFn = newListingScript(map[string][]string{
 		rootID:    {emptyListing()},
-		archiveID: {listingJSON(nil, []string{folderJSON("5000000000000000005", "clip-01.mp4", archiveID)})},
+		archiveID: {emptyListing(), listingJSON(nil, []string{folderJSON("5000000000000000005", "clip-01.mp4", archiveID)})},
 	}).fn
 
 	_, err := f.Copy(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "archive/clip-01.mp4")
@@ -446,14 +449,15 @@ func TestDirMoveIsOneRecursiveTask(t *testing.T) {
 	drive := &fakeDrive{t: t, folders: map[string]string{"archive": archiveID}}
 	f := newFakeFs(t, drive)
 	subFolder := listingJSON(nil, []string{folderJSON("900000000000000007", "sub", rootID)})
-	drive.listingFn = newListingScript(map[string][]string{
-		// root: the destination's parent lookup (archive missing), the create's
-		// read-back, and the source lookup. archive: the "moved" lookup, its
-		// read-back, the destination-must-not-exist check, and the clearName
-		// sweep of the destination directory.
-		rootID:    {emptyListing(), emptyListing(), subFolder},
-		archiveID: {emptyListing(), emptyListing(), emptyListing(), emptyListing()},
-	}).fn
+	script := newListingScript(map[string][]string{
+		// The create of "archive" verifies itself by listing the created
+		// directory (an archive walk), and the destination-side walks all land
+		// on archiveID; the root queue answers the destination-parent lookup
+		// first and the source lookup after it.
+		rootID:    {emptyListing(), subFolder, subFolder, subFolder},
+		archiveID: {emptyListing(), emptyListing(), emptyListing(), emptyListing(), emptyListing(), emptyListing()},
+	})
+	drive.listingFn = script.fn
 
 	require.NoError(t, f.DirMove(context.Background(), f, "sub", "archive/moved"))
 
@@ -550,7 +554,7 @@ func TestFailedCopyPutsTheParkedNameBack(t *testing.T) {
 	drive.taskStates = []int64{taskStateConflict}
 	drive.listingFn = newListingScript(map[string][]string{
 		rootID:    {emptyListing()},
-		archiveID: {listingJSON([]string{fileJSON("6000000000000000006", "clip-01.mp4", archiveID)}, nil)},
+		archiveID: {emptyListing(), listingJSON([]string{fileJSON("6000000000000000006", "clip-01.mp4", archiveID)}, nil)},
 	}).fn
 
 	_, err := f.Copy(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "archive/clip-01.mp4")
@@ -579,6 +583,7 @@ func TestCopyRefusesToTakeADirectoryNameAndRemovesWhatItMade(t *testing.T) {
 	script := newListingScript(map[string][]string{
 		rootID: {emptyListing()},
 		archiveID: {
+			emptyListing(), // the create's verification
 			emptyListing(), // the name the copy arrives under is free
 			listingJSON([]string{fileJSON("900000000000000011", "clip-01.mp4", archiveID)}, nil),
 			listingJSON(nil, []string{folderJSON("5000000000000000005", "holiday.MP4", archiveID)}),
@@ -878,6 +883,7 @@ func TestNamesReachTheDriveEncodedOnce(t *testing.T) {
 		drive.listingFn = newListingScript(map[string][]string{
 			rootID: {emptyListing()},
 			archiveID: {
+				emptyListing(), // the create's verification
 				emptyListing(), // nothing arrives under the source's name
 				listingJSON([]string{fileJSON("900000000000000011", "clip-01.mp4", archiveID)}, nil),
 				listingJSON([]string{fileJSON("6000000000000000006", "a：b", archiveID)}, nil),
@@ -929,11 +935,12 @@ func TestMkdirCreatesTheDirectoryOnce(t *testing.T) {
 
 	require.NoError(t, f.Mkdir(context.Background(), "fresh"))
 	require.Equal(t, []string{"fresh"}, drive.mkdirs)
-	require.Equal(t, 2, script.walksOf(rootID), "the create reads the parent back once, to take the id from the listing")
+	require.Equal(t, 1, script.walksOf(rootID), "the parent is listed once, to find the name missing")
+	require.Equal(t, 1, script.walksOf(newID), "and the created directory is listed once, to prove the id answers")
 
 	require.NoError(t, f.Mkdir(context.Background(), "fresh"))
 	require.Equal(t, []string{"fresh"}, drive.mkdirs, "a directory the cache knows is not created twice")
-	require.Equal(t, 2, script.walksOf(rootID), "nor is the parent listed again")
+	require.Equal(t, 1, script.walksOf(rootID), "nor is anything listed again")
 }
 
 // TestSetModTimeReportsItCannotBeDone pins both halves of that answer: the
