@@ -159,22 +159,28 @@ func TestDefaultEncodingEscapesExactlyTheDamagedSet(t *testing.T) {
 		require.Equal(t, "a"+string(r)+"b", wire, "the table shows %q is stored verbatim, so escaping it is wrong", r)
 	}
 
-	// Also verbatim: the positions the sibling backends guard and this server
-	// does not. Leading and trailing spaces, a leading tilde and control
-	// characters in the middle of a name were all stored exactly as sent, so
-	// escaping them would rename files the official client keeps untouched.
-	require.Equal(t, " lead", enc.FromStandardName(" lead"))
-	require.Equal(t, "trail ", enc.FromStandardName("trail "))
+	// A leading or trailing space is stripped by the drive, so it is escaped:
+	// measured 2026-10-23, the name reaches the drive without the space and the
+	// rename that installs it is then refused as already existing. A space inside
+	// the name is stored as sent and stays unescaped.
+	for _, name := range []string{" lead", "trail "} {
+		wire := enc.FromStandardName(name)
+		require.NotEqual(t, name, wire, "%q begins or ends with a space, which the drive strips, so it must be escaped", name)
+		require.Equal(t, name, enc.ToStandardName(wire), "escaping %q must round-trip back", name)
+	}
+	require.Equal(t, "mid dle", enc.FromStandardName("mid dle"), "an interior space is stored as sent")
 
 	// These flags are off on purpose, each one because the table shows the
 	// server stores the characters it would escape.
 	for _, off := range []encoder.MultiEncoder{
-		encoder.EncodeHashPercent, encoder.EncodeLeftSpace, encoder.EncodeRightSpace,
+		encoder.EncodeHashPercent,
 		encoder.EncodeLeftPeriod, encoder.EncodeLeftTilde,
 		encoder.EncodeLeftCrLfHtVt, encoder.EncodeRightCrLfHtVt,
 	} {
 		require.Zerof(t, enc&off, "flag %v escapes characters this server stores verbatim", off)
 	}
+	require.NotZero(t, enc&encoder.EncodeLeftSpace, "a leading space is stripped by the drive")
+	require.NotZero(t, enc&encoder.EncodeRightSpace, "a trailing space is stripped by the drive")
 }
 
 // TestValidateNameRefusesNonBMP covers the local pre-refusal for characters the

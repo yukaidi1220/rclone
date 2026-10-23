@@ -190,12 +190,19 @@ fullwidth substitutes:
   lone `'` becomes `\'`. There is no error, and the original cannot be fetched,
   so rclone replaces each one with its fullwidth lookalike, which the server
   stores verbatim.
-- Everything else is stored as sent, on purpose: leading and trailing spaces,
-  leading `.`, `~`, tabs, newlines, `& = % # + , ; @ ( ) [ ] { } $ ! ^`, names of
-  300 ASCII characters or 200 Chinese ones, and `..` (which is a legal file name
-  here). Escaping any of those would invent a restriction the server does not
-  have and would make rclone rename files the official client stores without
-  complaint.
+- Everything else is stored as sent, on purpose: leading `.`, `~`, tabs,
+  newlines, `& = % # + , ; @ ( ) [ ] { } $ ! ^`, names of 300 ASCII characters or
+  200 Chinese ones, and `..` (which is a legal file name here). Escaping any of
+  those would invent a restriction the server does not have and would make rclone
+  rename files the official client stores without complaint.
+- Leading and trailing **spaces** are the exception, and newer than the first
+  table: the drive strips them from file and directory names alike. Uploading
+  ` film.mkv` stores `film.mkv`, and the rename that installs the object under
+  the wanted name is then refused as already existing, so such a name could not
+  be uploaded at all. Both boundaries are therefore escaped. A space inside a
+  name is stored as sent and is not escaped. Measured 2026-10-23 with the
+  integration suite and then directly on the drive with a leading-space file, a
+  trailing-space file, and two directories.
 - `EncodeInvalidUtf8` is required rather than cosmetic: names travel inside an
   encrypted form string, where Go would replace invalid bytes with U+FFFD and
   make the name irreversible.
