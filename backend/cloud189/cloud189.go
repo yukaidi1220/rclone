@@ -3474,10 +3474,6 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 		if dirID == "" {
 			return fserrors.NoRetryError(errors.New("cloud189: this remote has not been opened yet, so its root is unknown"))
 		}
-		err := error(nil)
-		if err != nil {
-			return err
-		}
 		rows, err := f.rowsIn(ctx, dirID)
 		if err != nil {
 			return err
