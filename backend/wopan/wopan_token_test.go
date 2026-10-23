@@ -256,6 +256,30 @@ func TestUnitChunkWriterRefreshesARotatedToken(t *testing.T) {
 	require.NoError(t, err, "a session opened after the refresh must succeed")
 }
 
+// TestUnitChunkWriterCoalescesOnTheSessionToken locks WHY the writer passes its
+// own token as the "used" one: when another part has already refreshed, the
+// session's token is stale but the account's token is not, and asking for
+// another login would be a second call on the shared account for nothing.
+func TestUnitChunkWriterCoalescesOnTheSessionToken(t *testing.T) {
+	ctx := context.Background()
+	tr := &rotatingTokenTransport{}
+	f := newUnitTestFs(tr)
+	// Somebody else already rotated: memory holds the fresh token while this
+	// session still carries the old one.
+	f.tok.accessToken = testFreshAT
+	w := &wopanChunkWriter{
+		f: f, zoneURL: "https://zone.test", dirID: "dir-1", name: "movie.bin",
+		size: 2, chunk: 1, total: 2, fiEnc: "enc", uniqueID: "u-1", token: testAccessToken,
+	}
+
+	_, err := w.WriteChunk(ctx, 0, strings.NewReader("a"))
+	require.Error(t, err)
+	assert.True(t, fserrors.IsRetryError(err), "the file still needs a fresh session, got %v", err)
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	assert.Equal(t, 0, tr.refreshes, "an already-rotated token must not trigger a second login")
+}
+
 // TestUnitChunkWriterKeepsNoRefreshHonest: with no_refresh the run promised not
 // to touch the refresh_token, so a rotation must be reported as-is instead of
 // asking rclone for a retry that cannot succeed.
@@ -272,6 +296,7 @@ func TestUnitChunkWriterKeepsNoRefreshHonest(t *testing.T) {
 	_, err := w.WriteChunk(ctx, 0, strings.NewReader("a"))
 	require.Error(t, err)
 	assert.False(t, fserrors.IsRetryError(err), "no_refresh must not ask for a retry that needs a refresh")
+	assert.False(t, fserrors.ShouldRetry(err), "and rclone must not burn --retries on it either")
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 	assert.Equal(t, 0, tr.refreshes, "no_refresh means no login attempt at all")

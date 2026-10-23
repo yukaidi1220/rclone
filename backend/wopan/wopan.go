@@ -3536,6 +3536,9 @@ func (w *wopanChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 			if rerr := w.f.refreshToken(ctx, w.f.tok, w.token); rerr != nil {
 				return 0, rerr
 			}
+			// A whole-file retransmission costs minutes; the single-request
+			// path logs the same event, so this one must not be silent.
+			fs.Logf(w.f, "wopan: upload token was rotated mid-file; refreshed the access token and retrying %q", w.name)
 			return 0, fserrors.RetryError(fmt.Errorf("wopan: upload token was rotated mid-file; refreshed, retrying this file: %w", err))
 		}
 		return 0, err
