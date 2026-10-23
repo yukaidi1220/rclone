@@ -41,6 +41,10 @@ const (
 	gtestGroupID = "1311970000000000001"
 	gtestRootCat = "ROOTCATALOGID"
 	gtestUserDOM = "1000000000000000001"
+
+	// 2026-10-23 实测: 群盘列目录窗口最大 200, 超过回这个业务码。
+	gtestListWindowCap       = 200
+	gtestListWindowErrorCode = "1909011500"
 )
 
 type gdir struct {
@@ -51,6 +55,8 @@ type gdir struct {
 type groupTransport struct {
 	mu    sync.Mutex
 	calls []string
+	// windows 记录每次列目录请求的窗口大小(end-start+1); 0 表示请求没带窗口。
+	windows []int
 	// bodies records the decoded JSON body of every call, keyed by path.
 	bodies map[string][]map[string]any
 	dirs   map[string]*gdir
@@ -163,11 +169,45 @@ func (tr *groupTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		if d == nil {
 			d = &gdir{}
 		}
+		// 真服务端对窗口有硬上限(1909011500),假服务器也得有,否则"别要超过 200"
+		// 这条不变量在单测里恒真。
+		start := int(asInt64(body["startNumber"]))
+		end := int(asInt64(body["endNumber"]))
+		window := end - start + 1
+		if start < 1 || end < start {
+			window = 0
+		}
+		if window > gtestListWindowCap {
+			return w.done(map[string]any{"result": map[string]any{
+				"resultCode": gtestListWindowErrorCode,
+				"resultDesc": "分页数量不能超过200",
+			}}), nil
+		}
+		tr.windows = append(tr.windows, window)
+		catalogs, contents := d.catalogs, d.contents
+		if window > 0 {
+			entries := append(append([]map[string]any{}, d.catalogs...), d.contents...)
+			lo, hi := start-1, end
+			if lo > len(entries) {
+				lo = len(entries)
+			}
+			if hi > len(entries) {
+				hi = len(entries)
+			}
+			catalogs, contents = nil, nil
+			for _, e := range entries[lo:hi] {
+				if _, ok := e["catalogID"]; ok {
+					catalogs = append(catalogs, e)
+				} else {
+					contents = append(contents, e)
+				}
+			}
+		}
 		return w.done(okResult(map[string]any{
 			"getGroupContentResult": map[string]any{
 				"parentCatalogID": catalogID,
-				"catalogList":     d.catalogs,
-				"contentList":     d.contents,
+				"catalogList":     catalogs,
+				"contentList":     contents,
 			},
 		})), nil
 
