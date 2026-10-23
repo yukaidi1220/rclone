@@ -334,9 +334,14 @@ func init() {
 			// form string, where Go would replace invalid bytes with U+FFFD and
 			// make the name irreversible.
 			//
+			// Leading and trailing spaces are escaped as well: the drive strips
+			// them from file and directory names, so a name that begins or ends
+			// with one would arrive as a different name and its install rename
+			// would then be refused as already existing.
+			//
 			// Everything else the table probed is stored exactly as sent, so it
-			// is left alone on purpose - leading and trailing spaces, leading
-			// `.`, `~`, tabs, newlines, `& = % # + , ; @ ( ) [ ] { } $ ! ^`,
+			// is left alone on purpose - leading `.`, `~`, tabs, newlines,
+			// `& = % # + , ; @ ( ) [ ] { } $ ! ^`, and a space inside a name,
 			// names 300 ASCII characters or 200 Chinese ones long, and `..`.
 			// Escaping any of those would invent a restriction this server does
 			// not have, and would make rclone rename files the official client
@@ -348,11 +353,20 @@ func init() {
 
 // cloud189DefaultEncoding is the encoding option's default: exactly the
 // characters the measured table shows this server damages, and nothing else.
+//
+// The boundary spaces are escaped too, and that is newer than the first table:
+// measured 2026-10-23 with the integration suite and then directly, the drive
+// strips a leading or trailing space from both file and directory names, so a
+// name that begins or ends with one is stored as a different name and the rename
+// that installs it is then refused as already existing. Escaping the boundary
+// space is what makes those names storable at all; a space inside a name is
+// stored as sent and is not escaped.
 const cloud189DefaultEncoding = encoder.Standard |
 	encoder.EncodeDoubleQuote | encoder.EncodeAsterisk |
 	encoder.EncodeColon | encoder.EncodeLtGt |
 	encoder.EncodeQuestion | encoder.EncodeBackSlash |
 	encoder.EncodePipe | encoder.EncodeSingleQuote |
+	encoder.EncodeLeftSpace | encoder.EncodeRightSpace |
 	encoder.EncodeInvalidUtf8
 
 // maxRuneForName is the widest code point the drive will store in a name.
@@ -3178,9 +3192,12 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		size:   src.Size(),
 		md5:    strings.ToUpper(res.md5),
 		urlMu:  new(sync.Mutex),
-		// The drive records the moment it took the file, and there is no way to
-		// ask it what that moment was without listing again, so a freshly
-		// uploaded object reports no time until the next listing sees it.
+		// The drive stamped the moment it took the file and will not tell us what
+		// that moment was without another listing, so this reports the time the
+		// upload finished - seconds away from the stamp, and the next listing
+		// replaces it with the drive's own. A zero time here is not an option: it
+		// reads as year 1 to anything that compares modification times.
+		modTime: time.Now(),
 	}, nil
 }
 
@@ -3369,9 +3386,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	o.id = res.id
 	o.size = src.Size()
 	o.md5 = strings.ToUpper(res.md5)
-	// modTime is left alone: it belongs to the object that was just replaced,
-	// and the drive will not be asked for the new one's time. Precision is
-	// ModTimeNotSupported, so no comparison rclone can make uses it.
+	// Same as after a Put: the drive stamped its own moment and the next listing
+	// carries it, so the object reports the time this upload finished rather than
+	// the time of the object it replaced.
+	o.modTime = time.Now()
 	o.invalidateURL()
 	return nil
 }
