@@ -267,7 +267,12 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if id == "" {
 			id = q.Get("folderId")
 		}
-		d.renames = append(d.renames, renameCall{id: id, name: q.Get("destFileName")})
+		// a folder rename spells its new name destFolderName
+		name := q.Get("destFileName")
+		if strings.HasSuffix(r.URL.Path, "renameFolder.action") {
+			name = q.Get("destFolderName")
+		}
+		d.renames = append(d.renames, renameCall{id: id, name: name})
 		installNumber := len(d.renames)
 		d.mu.Unlock()
 		if d.failInstall && installNumber == 2 {

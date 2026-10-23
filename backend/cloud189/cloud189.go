@@ -1149,53 +1149,70 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	f.dirCache = dircache.New(f.root, rootID, f)
 
-	// Find the current root
-	err = f.dirCache.FindRoot(ctx, false)
-	if err != nil {
-		// Assume it is a file
-		newRoot, remote := dircache.SplitPath(f.root)
-		tempF := *f
-		tempF.dirCache = dircache.New(newRoot, rootID, &tempF)
-		tempF.root = newRoot
-		err = tempF.dirCache.FindRoot(ctx, false)
-		if err != nil {
-			// No root so return old f
-			f.fsRootID = ""
-			return f, nil
+	if err := f.resolveRoot(ctx); err != nil {
+		if errors.Is(err, fs.ErrorIsFile) {
+			return f, err
 		}
-		_, err := tempF.NewObject(ctx, remote)
-		if err != nil {
-			if err == fs.ErrorObjectNotFound {
-				// File doesn't exist so return old f
-				f.fsRootID = ""
-				return f, nil
-			}
-			return nil, err
-		}
-		f.features.Fill(ctx, &tempF)
-		// The old f is updated rather than tempF returned, because features
-		// were filled with functions that close over f.
-		// https://github.com/rclone/rclone/issues/2182
-		f.dirCache = tempF.dirCache
-		f.root = tempF.root
-		// The anchor is now the file's directory, which the re-seeded walk
-		// above has resolved; see resolveAnchor.
-		if err := f.resolveAnchor(ctx); err != nil {
-			return nil, err
-		}
-		return f, fs.ErrorIsFile
-	}
-	// See resolveAnchor: the purge anchor is only known once the walk above has
-	// resolved the root, and a root that never resolved must not fall back to
-	// the space root - measured live 2026-10-23, a remote opened at a
-	// subdirectory carried the space root here, so `rclone purge remote:sub`
-	// listed the drive's top level and sent one DELETE task naming every entry
-	// of it, and a remote opened at a family subdirectory emptied the family
-	// root the same way before the server happened to refuse such a batch.
-	if err := f.resolveAnchor(ctx); err != nil {
 		return nil, err
 	}
 	return f, nil
+}
+
+// resolveRoot finishes what NewFs started: it resolves the root path, tells a
+// file from a directory, and fixes the purge anchor. It returns
+// fs.ErrorIsFile - with the Fs re-rooted at the file's directory - when the
+// root names a file.
+//
+// A root that never resolved leaves fsRootID empty: the destructive paths
+// refuse rather than guess. Guessing is what the space root here used to mean -
+// measured live 2026-10-23, a remote opened at a subdirectory carried it, so
+// `rclone purge remote:sub` listed the drive's top level and sent one DELETE
+// task naming every entry of it, and a remote opened at a family subdirectory
+// emptied the family root the same way before the server happened to refuse
+// such a batch.
+func (f *Fs) resolveRoot(ctx context.Context) error {
+	err := f.dirCache.FindRoot(ctx, false)
+	if err == nil {
+		return f.resolveAnchor(ctx)
+	}
+	// The walk failed at the leaf, and the directories above it are already in
+	// the cache: assume the leaf is a file and re-root there. The re-rooted
+	// dircache is seeded with the parent's id, which the failed walk cached, so
+	// nothing above the leaf is listed again - a fresh dircache seeded with the
+	// space root would walk the whole chain twice, and the Fs copy upstream's
+	// shape makes for this carries mutexes with it.
+	newRoot, remote := dircache.SplitPath(f.root)
+	parentID, cached := f.dirCache.Get(newRoot)
+	if !cached {
+		// The walk never reached the leaf's parent, so the leaf cannot be a
+		// file inside it: the path names nothing.
+		f.dirCache.ResetRoot()
+		f.fsRootID = ""
+		return nil
+	}
+	f.root = newRoot
+	// The re-rooted dircache is seeded with the parent's own id and an empty
+	// root path, so nothing above the leaf is listed again. Seeding it with the
+	// parent path instead would send the next walk looking for that path inside
+	// itself.
+	f.dirCache = dircache.New("", parentID, f)
+	if _, oerr := f.NewObject(ctx, remote); oerr != nil {
+		if oerr == fs.ErrorObjectNotFound {
+			// No root and no file: the path names nothing. The remote stays as
+			// it was asked for, the cache goes back to unresolved, and the
+			// anchor stays empty.
+			f.root = path.Join(newRoot, remote)
+			f.dirCache.ResetRoot()
+			f.fsRootID = ""
+			return nil
+		}
+		return oerr
+	}
+	// The anchor is the file's directory, which the re-rooted cache now holds.
+	if aerr := f.resolveAnchor(ctx); aerr != nil {
+		return aerr
+	}
+	return fs.ErrorIsFile
 }
 
 // resolveAnchor reads back the id the dircache resolved for the root this remote
@@ -1601,7 +1618,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		if f.root == "" {
 			return fserrors.NoRetryError(errors.New("cloud189: the drive's own top level cannot be removed, only what is inside it"))
 		}
-		return f.rmdirRoot(ctx)
+		return f.rmdirRoot(ctx, true)
 	}
 	parentDir, leaf := dircache.SplitPath(dir)
 	parentID, err := f.dirCache.FindDir(ctx, parentDir, false)
@@ -1646,8 +1663,12 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 // at the remote cannot name the directories above it, and the delete task
 // addresses the object by id and its parent by number: the row found in its
 // parent's listing carries both. The walk is the same resolution NewFs did, and
-// a root one level down is found in the first listing.
-func (f *Fs) rmdirRoot(ctx context.Context) error {
+// a root one level down is found in the first listing. checkEmpty refuses a
+// directory that still lists children, which is Rmdir's contract; a caller that
+// has just emptied the directory itself passes false, because the listing it
+// was emptied by is the freshest view there is and the drive may still be
+// carrying the deleted children in it.
+func (f *Fs) rmdirRoot(ctx context.Context, checkEmpty bool) error {
 	dirID, err := f.rootID(ctx)
 	if err != nil {
 		return err
@@ -1667,12 +1688,14 @@ func (f *Fs) rmdirRoot(ctx context.Context) error {
 		dirID = r.ID.String()
 		row = r
 	}
-	children, err := f.rowsIn(ctx, row.ID.String())
-	if err != nil {
-		return err
-	}
-	if len(children) > 0 {
-		return fs.ErrorDirectoryNotEmpty
+	if checkEmpty {
+		children, err := f.rowsIn(ctx, row.ID.String())
+		if err != nil {
+			return err
+		}
+		if len(children) > 0 {
+			return fs.ErrorDirectoryNotEmpty
+		}
 	}
 	if err := f.deleteRows(ctx, []deleteTarget{{row: row}}); err != nil {
 		return err
@@ -1707,6 +1730,16 @@ func (f *Fs) taskAuthFor(dst *Fs) (taskAuth, bool) {
 		// The reverse is signed by the family session and aims at the personal
 		// root alias.
 		return taskAuth{family: true, familyID: f.familyID, copyType: 2}, true
+	case f.opt.Space == dst.opt.Space && (!f.family() || f.familyID == dst.familyID):
+		// Two remotes of one account in the same space - which is what the
+		// standard suite constructs for DirMove, and what `rclone moveto`
+		// across two configured roots of one drive makes - share the session
+		// by token, so either instance signs with the same key. The task body
+		// is all ids, and every name in it is spelled by the remote that owns
+		// that name, so nothing the instances can disagree on reaches it. A
+		// family to family copy across two different families was never
+		// captured, and stays refused.
+		return f.taskAuth(), true
 	default:
 		return taskAuth{}, false
 	}
@@ -1924,7 +1957,29 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 	// The task names the object as the drive stores it.
 	srcLeaf := srcObj.fs.opt.Enc.FromStandardName(stdLeaf)
-	srcParentID, err := taskParentID(f.realDirID(srcDirID))
+	if dstDirID == srcDirID {
+		// A move within one directory is a rename, and no task: the drive has
+		// been measured to answer a MOVE addressed at the mover's own directory
+		// by destroying the object (measured live 2026-10-23, the suite's move
+		// of a file to a new name in its own directory left neither the old nor
+		// the new name on the drive). The rename goes through the same
+		// park-and-swap the cross-directory move lands in.
+		cleared, err := f.clearName(ctx, dstDirID, wireLeaf, srcObj.id)
+		if err != nil {
+			return nil, err
+		}
+		res := &uploadResult{id: srcObj.id, name: srcLeaf, md5: srcObj.md5}
+		if err := f.installObject(ctx, dstDirID, wireLeaf, res, nil, false); err != nil {
+			f.undoClear(ctx, cleared, wireLeaf)
+			return nil, err
+		}
+		if cleared != nil {
+			f.dropObject(ctx, cleared, "a moved object took its name")
+		}
+		srcObj.remote = remote
+		return srcObj, nil
+	}
+	srcParentID, err := taskParentID(srcObj.fs.realDirID(srcDirID))
 	if err != nil {
 		return nil, err
 	}
@@ -1970,18 +2025,18 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	// The helper resolves the ids, refuses a move of or onto a root, creates the
 	// destination's parent chain and requires the destination not to exist
 	// already - which is what the drive's own conflict answer wants.
-	srcID, srcDirectoryID, srcLeaf, dstDirID, _, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
+	srcID, srcDirectoryID, srcLeaf, dstDirID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
 	if err != nil {
 		return err
 	}
-	parentID, err := taskParentID(f.realDirID(srcDirectoryID))
+	parentID, err := taskParentID(srcFs.realDirID(srcDirectoryID))
 	if err != nil {
 		return err
 	}
-	// Named as the source remote stores it, the way Move and Copy do. Two remotes
-	// of one account cannot reach this line with different encodings today -
-	// taskAuthFor refuses a server-side move between two remote instances - but
-	// the spelling belongs to the source whichever way the guard evolves.
+	// Named as the source remote stores it, the way Move and Copy do: two
+	// remotes of one account may carry different encodings, and the name the
+	// drive stores is the source's bytes. The destination's spelling belongs to
+	// the name rclone asked for, which the arrival is renamed to below.
 	wireSrc := srcFs.opt.Enc.FromStandardName(srcLeaf)
 	cleared, err := f.clearName(ctx, dstDirID, wireSrc, srcID)
 	if err != nil {
@@ -1995,6 +2050,19 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	srcFs.dirCache.FlushDir(srcRemote)
 	if cleared != nil {
 		f.dropObject(ctx, cleared, "a moved directory took its name")
+	}
+	// The task carries no destination name: the directory arrives under the
+	// name it moved with. When that is not the name rclone asked for, rename it
+	// here - the id is the moved directory's, and the destination name was
+	// verified free before the task started. A rename that fails leaves the
+	// directory on the drive under the arrival name, which the destination
+	// cache must then not claim to know.
+	dstWire := f.opt.Enc.FromStandardName(dstLeaf)
+	if dstWire != wireSrc {
+		if err := f.renameObject(ctx, srcID, true, dstWire); err != nil {
+			f.dirCache.FlushDir(dstRemote)
+			return err
+		}
 	}
 	return nil
 }
@@ -3570,7 +3638,9 @@ func (o *Object) ModTime(ctx context.Context) time.Time { return o.modTime }
 // String returns a description of the object
 func (o *Object) String() string {
 	if o == nil {
-		return "<nil cloud189 object>"
+		// The suite's NilObject is a typed nil and prints "<nil>" for every
+		// backend; a custom string here reads as a non-nil object.
+		return "<nil>"
 	}
 	return o.remote
 }
@@ -3586,12 +3656,14 @@ func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
 // Storable says whether this object can be stored
 func (o *Object) Storable() bool { return true }
 
-// SetModTime reports that the drive cannot be told a modification time
+// SetModTime reports that the drive cannot be told a modification time.
+//
+// The bare sentinel is what rclone's callers look for - operations.Copy and
+// the chunk-writer path both treat ErrorCantSetModTime as "unsupported" rather
+// than as a failed transfer - and it is also what the suite compares with ==,
+// so it travels unwrapped.
 func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
-	// The sentinel is what rclone's callers look for - operations.Copy and the
-	// chunk-writer path both treat ErrorCantSetModTime as "unsupported" rather
-	// than as a failed transfer - and the text says why.
-	return fmt.Errorf("cloud189: the drive stamps its own times and offers no way to set one: %w", fs.ErrorCantSetModTime)
+	return fs.ErrorCantSetModTime
 }
 
 // Update replaces the contents of the object.
@@ -3706,6 +3778,13 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 			if rowIsDir(row) {
 				f.dirCache.FlushDir(f.opt.Enc.ToStandardName(row.Name))
 			}
+		}
+		// A remote opened below the space root owns the directory it was opened
+		// at, and a purge of it removes the directory too - that is what
+		// `rclone purge remote:sub` means, and what the suite's own teardown
+		// checks for. The space root itself is only ever emptied.
+		if f.root != "" {
+			return f.rmdirRoot(ctx, false)
 		}
 		return nil
 	}

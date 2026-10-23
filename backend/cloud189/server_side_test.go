@@ -298,16 +298,48 @@ func TestDestructiveOperationsRefuseAnUnknownFamilyRoot(t *testing.T) {
 	require.Empty(t, sequenceOf(drive), "and not one request went out, let alone a delete task")
 }
 
-// TestDirMoveBetweenTwoRemotesIsRefused is why a directory move can never see two
-// remotes disagree about how to spell a name: taskAuthFor refuses a server-side
-// move between two remote instances of one account, so DirMove only ever runs with
-// the source and the destination the same Fs and the same encoding.
-func TestDirMoveBetweenTwoRemotesIsRefused(t *testing.T) {
+// TestDirMoveBetweenTwoRemotesOfOneSpaceRuns: two remote instances of one
+// account in the same space share the session by token, so the move runs
+// between them - which is the shape the standard suite constructs, and what
+// `rclone movedto` across two configured roots of one drive makes. The task
+// carries no destination name, so the directory arrives under the name it moved
+// with and is renamed here.
+func TestDirMoveBetweenTwoRemotesOfOneSpaceRuns(t *testing.T) {
+	const subID = "900000000000000046"
 	drive := &fakeDrive{t: t}
 	src := newFakeFs(t, drive)
 	dst := newFakeFs(t, drive)
 	dst.opt.AccessToken = src.opt.AccessToken
 	dst.opt.Enc = encoder.Standard // different on purpose
+	subFolder := listingJSON(nil, []string{folderJSON(subID, "sub", rootID)})
+	drive.listingFn = newListingScript(map[string][]string{
+		// every walk of the root sees the same directory: it carries "sub" for
+		// the source's lookup and the destination sweep, and "renamed" is in
+		// none of them, which is what the destination check wants
+		rootID: {subFolder, subFolder, subFolder, subFolder},
+	}).fn
+
+	require.NoError(t, dst.DirMove(context.Background(), src, "sub", "renamed"))
+	require.Len(t, drive.tasks, 1)
+	require.Equal(t, taskMove, drive.tasks[0].taskType)
+	require.Equal(t, subID, drive.tasks[0].infos[0].FileID)
+	require.Len(t, drive.renames, 1, "the arrival name is not the asked-for one")
+	require.Equal(t, subID, drive.renames[0].id)
+	require.Equal(t, "renamed", drive.renames[0].name)
+}
+
+// TestDirMoveBetweenTwoDifferentFamiliesIsRefused: a family to family move
+// across two different families was never captured, and stays refused even
+// though both remotes share the account.
+func TestDirMoveBetweenTwoDifferentFamiliesIsRefused(t *testing.T) {
+	drive := &fakeDrive{t: t}
+	src := newFakeFs(t, drive)
+	dst := newFakeFs(t, drive)
+	dst.opt.AccessToken = src.opt.AccessToken
+	dst.opt.Space = spaceFamily
+	dst.familyID = famID + "9"
+	dst.familyRootID = famRoot
+	dst.dirCache = dircache.New("", famRoot, dst)
 
 	err := dst.DirMove(context.Background(), src, "sub", "sub")
 	require.ErrorIs(t, err, fs.ErrorCantDirMove)
@@ -414,10 +446,12 @@ func TestMoveParksTheOccupierThenRenamesIntoTheName(t *testing.T) {
 	_, err := f.Move(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "holiday.MP4")
 	require.NoError(t, err)
 
-	require.Len(t, drive.tasks, 2, "the move, then the delete of the parked occupier")
-	require.Equal(t, taskMove, drive.tasks[0].taskType)
-	require.Equal(t, taskDelete, drive.tasks[1].taskType)
-	require.Equal(t, "6000000000000000006", drive.tasks[1].infos[0].FileID)
+	// A move within one directory is a rename and no task: the drive has been
+	// measured to destroy an object a MOVE addresses at its own directory.
+	// What is left is the parked occupier's delete.
+	require.Len(t, drive.tasks, 1, "only the delete of the parked occupier")
+	require.Equal(t, taskDelete, drive.tasks[0].taskType)
+	require.Equal(t, "6000000000000000006", drive.tasks[0].infos[0].FileID)
 
 	require.Len(t, drive.renames, 2)
 	require.Equal(t, "6000000000000000006", drive.renames[0].id, "the occupier was parked")
@@ -516,7 +550,9 @@ func TestTaskStateConflictIsReportedNotAnswered(t *testing.T) {
 		rootID: {listingJSON([]string{source}, nil)},
 	}).fn
 
-	_, err := f.Move(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "clip-01.mp4")
+	// Copy still runs a task for this shape; the same-directory Move is a
+	// rename and never reaches the task engine.
+	_, err := f.Copy(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "clip-01.mp4")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "conflict")
 	require.True(t, fserrors.IsNoRetryError(err))
@@ -783,11 +819,13 @@ func TestPurgeAnchorIsTheDirectoryTheWalkResolved(t *testing.T) {
 	require.Equal(t, subID, f.fsRootID, "the anchor is the directory the walk resolved, not the space root")
 
 	require.NoError(t, f.Purge(context.Background(), ""))
-	require.Len(t, drive.tasks, 1)
+	require.Len(t, drive.tasks, 2)
 	require.Equal(t, taskDelete, drive.tasks[0].taskType)
 	require.Len(t, drive.tasks[0].infos, 1, "only what the opened directory holds is addressed")
 	require.Equal(t, "300000000000000010", drive.tasks[0].infos[0].FileID, "the top-level entry is not in the task")
 	require.EqualValues(t, 900000000000000043, *drive.tasks[0].infos[0].ParentID)
+	require.Equal(t, taskDelete, drive.tasks[1].taskType)
+	require.Equal(t, subID, drive.tasks[1].infos[0].FileID, "and the emptied directory itself goes with it")
 }
 
 // TestPurgeRefusesWhenNothingWasResolved: a remote whose root the walk could not
@@ -829,6 +867,28 @@ func TestFindEntryDistrustsAJustDeletedRow(t *testing.T) {
 	f2 := newFakeFs(t, drive)
 	_, err = f2.findEntry(context.Background(), rootID, f2.opt.Enc.FromStandardName("a.bin"))
 	require.NoError(t, err, "a fresh remote has deleted nothing, so the row is found as usual")
+}
+
+// TestNewFsOnAFilePathReturnsErrorIsFile: a remote whose root names an existing
+// file returns the parent Fs and fs.ErrorIsFile, however deep the file sits -
+// the suite's FsIsFile opens exactly such a path and checks Root() names the
+// parent directory.
+func TestNewFsOnAFilePathReturnsErrorIsFile(t *testing.T) {
+	const deepID = "900000000000000045"
+	drive := &fakeDrive{t: t, listings: map[string]string{
+		rootID:               listingJSON(nil, []string{folderJSON("900000000000000044", "sub", rootID)}),
+		"900000000000000044": listingJSON(nil, []string{folderJSON(deepID, "deep", "900000000000000044")}),
+		deepID:               listingJSON([]string{fileJSON("300000000000000011", "z.txt", deepID)}, nil),
+	}}
+	f := newFakeFs(t, drive)
+	// seeded the way NewFs seeds it, root naming the file
+	f.root = "sub/deep/z.txt"
+	f.dirCache = dircache.New(f.root, rootID, f)
+
+	err := f.resolveRoot(context.Background())
+	require.ErrorIs(t, err, fs.ErrorIsFile)
+	require.Equal(t, "sub/deep", f.root, "the remote is re-rooted at the file's directory")
+	require.Equal(t, deepID, f.fsRootID, "and the purge anchor is that directory")
 }
 
 // TestRmdirRefusesANonEmptyDirectory is the difference between Rmdir and Purge:
@@ -996,6 +1056,13 @@ func TestMkdirCreatesTheDirectoryOnce(t *testing.T) {
 	require.Equal(t, 1, script.walksOf(rootID), "nor is anything listed again")
 }
 
+// TestNilObjectStringIsTheNilConvention: the suite hands every backend a typed
+// nil and expects "<nil>" back, the same a plain interface would print.
+func TestNilObjectStringIsTheNilConvention(t *testing.T) {
+	var o *Object
+	require.Equal(t, "<nil>", o.String())
+}
+
 // TestSetModTimeReportsItCannotBeDone pins both halves of that answer: the
 // sentinel rclone's callers look for, and the reason a user would need.
 func TestSetModTimeReportsItCannotBeDone(t *testing.T) {
@@ -1005,7 +1072,8 @@ func TestSetModTimeReportsItCannotBeDone(t *testing.T) {
 
 	err := obj.SetModTime(context.Background(), time.Now())
 	require.Error(t, err)
-	require.ErrorIs(t, err, fs.ErrorCantSetModTime, "operations treats the sentinel as unsupported, not as a failed transfer")
-	require.Contains(t, err.Error(), "stamps its own times")
+	// the bare sentinel: the suite compares it with ==, and operations treats
+	// it as unsupported rather than as a failed transfer
+	require.Equal(t, fs.ErrorCantSetModTime, err)
 	require.Empty(t, sequenceOf(drive), "and the drive is never asked")
 }
