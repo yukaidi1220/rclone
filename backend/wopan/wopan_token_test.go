@@ -1,6 +1,7 @@
 package wopan
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,9 +10,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rclone/rclone/backend/wopan/api"
 	"github.com/rclone/rclone/fs/fserrors"
+	fsobject "github.com/rclone/rclone/fs/object"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -177,11 +180,24 @@ type rotatingTokenTransport struct {
 	mu        sync.Mutex
 	refreshes int
 	parts     []string // the accessToken each part POST presented
+	probes    []partProbe
+}
+
+// partProbe records, for one upload2C POST, whether the fileInfo envelope
+// actually opens under the key derived from the presented accessToken, and
+// what it then decodes to. The server derives the AES key from the access
+// token, so this is exactly the server's own consistency check on the pair.
+type partProbe struct {
+	token    string
+	name     string
+	size     int64
+	decrypts bool
 }
 
 func (t *rotatingTokenTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if strings.HasSuffix(r.URL.Path, "/openapi/client/upload2C") {
 		token := ""
+		fiEnc := ""
 		if mr, err := r.MultipartReader(); err == nil {
 			for {
 				p, err := mr.NextPart()
@@ -189,13 +205,27 @@ func (t *rotatingTokenTransport) RoundTrip(r *http.Request) (*http.Response, err
 					break
 				}
 				b, _ := io.ReadAll(p)
-				if p.FormName() == "accessToken" {
+				switch p.FormName() {
+				case "accessToken":
 					token = string(b)
+				case "fileInfo":
+					fiEnc = string(b)
+				}
+			}
+		}
+		probe := partProbe{token: token}
+		if fiEnc != "" {
+			if plain, derr := aesDecrypt(fiEnc, aesKeyFor(chanWoHome, token)); derr == nil {
+				probe.decrypts = true
+				var fi api.UploadFileInfo
+				if json.Unmarshal(plain, &fi) == nil {
+					probe.name, probe.size = fi.FileName, fi.FileSize
 				}
 			}
 		}
 		t.mu.Lock()
 		t.parts = append(t.parts, token)
+		t.probes = append(t.probes, probe)
 		t.mu.Unlock()
 		if token != testFreshAT {
 			return envelopeResponse(`{"code":"` + codeAuthInvalid + `","msg":"无效的令牌"}`), nil
@@ -300,4 +330,57 @@ func TestUnitChunkWriterKeepsNoRefreshHonest(t *testing.T) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 	assert.Equal(t, 0, tr.refreshes, "no_refresh means no login attempt at all")
+}
+
+// TestUnitRetrySessionReencryptsFileInfoWithTheFreshKey is the end-to-end half
+// of the rotation fix. The whole-file retry must reopen the session through the
+// real newUploadSession - reading accessTokenNow() again - so the fresh
+// session's fileInfo envelope is sealed with the fresh token's key. The server
+// derives the AES key from the presented access token and validates the token
+// before decrypting, so a session presenting the fresh token while still
+// carrying the stale envelope dies on its first part with 1001 in production;
+// the hand-built writer in TestUnitChunkWriterRefreshesARotatedToken cannot see
+// that, because its fiEnc is a dummy string.
+func TestUnitRetrySessionReencryptsFileInfoWithTheFreshKey(t *testing.T) {
+	ctx := context.Background()
+	tr := &rotatingTokenTransport{}
+	f := newUnitTestFs(tr)
+	f.zoneURL = "https://zone.test"
+	f.zoneLoaded = true
+	f.opt.ChunkSize = 8
+	const payloadSize = 20 // parts: 8, 8, 4
+	src := fsobject.NewStaticObjectInfo("rr.bin", time.Now(), payloadSize, true, nil, nil)
+
+	// Attempt 1: the session is sealed with the stale token; its first part is
+	// rejected, the writer refreshes and hands the file back to the engine.
+	_, w1, err := f.OpenChunkWriter(ctx, "rr.bin", src)
+	require.NoError(t, err)
+	_, err = w1.(*wopanChunkWriter).WriteChunk(ctx, 0, bytes.NewReader(make([]byte, 8)))
+	require.Error(t, err, "the first session's part carries a rejected token")
+	assert.True(t, fserrors.IsRetryError(err), "the file must go back for a whole-file retry, got %v", err)
+
+	// Attempt 2 is what --retries does: a brand new OpenChunkWriter, opened
+	// after the refresh, so newUploadSession runs again under the fresh token.
+	_, w2, err := f.OpenChunkWriter(ctx, "rr.bin", src)
+	require.NoError(t, err)
+	ww := w2.(*wopanChunkWriter)
+	for i, part := range []int{8, 8, 4} {
+		n, err := ww.WriteChunk(ctx, i, bytes.NewReader(make([]byte, part)))
+		require.NoError(t, err, "part %d must post cleanly under the fresh session", i+1)
+		assert.Equal(t, int64(part), n)
+	}
+	require.NoError(t, ww.Close(ctx), "the fresh session must complete with a fid")
+
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	assert.Equal(t, 1, tr.refreshes, "the rotation must be refreshed exactly once")
+	require.Len(t, tr.probes, 4, "one rejected part + three fresh-session parts")
+	stale, fresh := tr.probes[0], tr.probes[1]
+	assert.Equal(t, testAccessToken, stale.token)
+	assert.True(t, stale.decrypts, "the stale session must at least be internally coherent: its fileInfo opens with its own token's key")
+	assert.Equal(t, "rr.bin", stale.name)
+	assert.Equal(t, testFreshAT, fresh.token)
+	assert.True(t, fresh.decrypts, "the retry session's fileInfo must be sealed with the fresh token's key, not carried over stale")
+	assert.Equal(t, "rr.bin", fresh.name, "the retry session's envelope must describe this file")
+	assert.Equal(t, int64(payloadSize), fresh.size)
 }
