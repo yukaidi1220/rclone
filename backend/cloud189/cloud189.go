@@ -133,9 +133,11 @@ const (
 	// not one of the two codes above, because it says nothing about the account's
 	// state and must not end a run under fatal_if_no_space.
 	codeLocalSizeCeiling = "LocalSingleFileCeiling"
-	// limitsRetryGap is how long the gates wait before going back for account
-	// limits they have never managed to read.
-	limitsRetryGap       = time.Minute
+	// quotaReAskGap is how long the gates wait before going back to the account
+	// for numbers they either never managed to read or had reason to doubt. Both
+	// re-reads are per run, not per object: a long run would otherwise pay a
+	// metadata pair to every file for an answer that is the same each time.
+	quotaReAskGap        = time.Minute
 	codeSliceMd5Mismatch = "SliceMd5DoesNotMatch"
 	codeInvalidPartSize  = "InvalidPartSize"
 	codeInvalidSignature = "InvalidSignature"
@@ -2194,6 +2196,7 @@ type quotaState struct {
 	usedDayFlow   int64     // what the account said the day had used, when last asked
 	sent          int64     // bytes this process has uploaded since then
 	limitsAsk     time.Time // when the gates last went back for limits they never got
+	overRunAsk    time.Time // when the gates last re-read the day for a file that looked over the line
 	capacity      int64
 	available     int64
 }
@@ -2316,7 +2319,7 @@ func (f *Fs) gateUpload(ctx context.Context, name string, size int64) error {
 		// ask again here. An endpoint that keeps refusing is asked once a minute and
 		// not once a file: a long run would otherwise pay two metadata requests per
 		// object for an answer that never arrives.
-		if !q.limitsAsk.IsZero() && time.Since(q.limitsAsk) < limitsRetryGap {
+		if !q.limitsAsk.IsZero() && time.Since(q.limitsAsk) < quotaReAskGap {
 			q.mu.Unlock()
 			return nil
 		}
@@ -2351,16 +2354,27 @@ func (f *Fs) gateUpload(ctx context.Context, name string, size int64) error {
 	}
 	// usedDayFlow moves while a run is going - other programs, the official
 	// client, another machine - so a projected overrun is checked against the
-	// account once more before it refuses anything.
+	// account once more before it refuses anything. The check is the one the
+	// limits branch above gets: a run that has genuinely used up its day would
+	// otherwise pay a fresh metadata pair to every remaining file just to be
+	// refused again, and between checks this process's own count keeps the model
+	// moving, so what it refuses on is at worst one minute behind.
 	if dayFlow > 0 && used+size > dayFlow {
-		if err := f.readQuota(ctx); err == nil {
-			q.mu.Lock()
-			dayFlow, used = q.transDayFlow, q.usedDayFlow+q.sent
-			q.mu.Unlock()
+		q.mu.Lock()
+		recheck := q.overRunAsk.IsZero() || time.Since(q.overRunAsk) >= quotaReAskGap
+		if recheck {
+			q.overRunAsk = time.Now()
+		}
+		q.mu.Unlock()
+		if recheck {
+			if err := f.readQuota(ctx); err == nil {
+				q.mu.Lock()
+				dayFlow, used = q.transDayFlow, q.usedDayFlow+q.sent
+				q.mu.Unlock()
+			}
 		}
 		if dayFlow > 0 && used+size > dayFlow {
-			return f.uploadRefusal(name, codeDayFlowOver, fmt.Sprintf("%s needs %s and the day's allowance is %s with %s already used; it comes back with the next day",
-				name, fs.SizeSuffix(size), fs.SizeSuffix(dayFlow), fs.SizeSuffix(used)))
+			return f.dayFlowRefusal(name, size, dayFlow, used)
 		}
 	}
 	if spaceKnown {
@@ -2386,6 +2400,12 @@ func (f *Fs) uploadRefusal(name, code, why string) error {
 		Message: why,
 	}
 	return f.fatalIfNoSpace(noSpaceError(err))
+}
+
+// dayFlowRefusal words the one refusal that a later day can clear.
+func (f *Fs) dayFlowRefusal(name string, size, dayFlow, used int64) error {
+	return f.uploadRefusal(name, codeDayFlowOver, fmt.Sprintf("%s needs %s and the day's allowance is %s with %s already used; it comes back with the next day",
+		name, fs.SizeSuffix(size), fs.SizeSuffix(dayFlow), fs.SizeSuffix(used)))
 }
 
 // About reports the space the drive has.

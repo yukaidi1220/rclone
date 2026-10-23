@@ -408,10 +408,14 @@ refuse:
 - a file larger than the free space on the drive.
 
 Those figures are re-read when a refusal is about to be made, so an allowance
-spent elsewhere is noticed. Bytes that go up are added to a local count so the
-next file sees them. An endpoint that answers with a refusal in `res_code` is
-treated as a failure, not as an account with no limits - a silently empty
-privilege list would otherwise look like an unlimited account.
+spent elsewhere is noticed. That re-read is made at most once a minute for a
+remote, because a run that has genuinely used up its day would otherwise pay two
+metadata requests to every remaining file just to be refused again; between
+re-reads the local count keeps moving, so what a file is refused on is at worst a
+minute behind. Bytes that go up are added to a local count so the next file sees
+them. An endpoint that answers with a refusal in `res_code` is treated as a
+failure, not as an account with no limits - a silently empty privilege list would
+otherwise look like an unlimited account.
 
 The server's own refusals are `UserDayFlowOverLimited` and
 `InsufficientStorageSpace`. Neither can clear itself during a run, so both stop

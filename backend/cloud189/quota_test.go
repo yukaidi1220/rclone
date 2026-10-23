@@ -206,6 +206,46 @@ func TestGateAsksForLimitsOnceAMinuteNotOnceAFile(t *testing.T) {
 	require.Greater(t, drive.privReads, first, "past the gap the limits are fetched again")
 }
 
+// TestGateReChecksTheDayOnceAMinuteNotOnceAFile is the same cost on the other
+// re-read: an account that has genuinely used up its day refuses every file
+// left in the run, and each refusal used to ask the account first. On a tree of
+// a hundred thousand files that is two hundred thousand metadata requests spent
+// to be told the same thing, and a 5xx from either endpoint would multiply it by
+// the low-level retries. Between checks the process's own count keeps the model
+// moving, so the wait costs accuracy nobody needed.
+func TestGateReChecksTheDayOnceAMinuteNotOnceAFile(t *testing.T) {
+	drive := &fakeDrive{t: t, transDayFlow: miB(10), transFileSize: miB(10), usedDayFlow: miB(10)}
+	f := newQuotaFs(t, drive)
+	reads, caps := drive.privReads, drive.capReads
+
+	for _, name := range []string{"a.bin", "b.bin", "c.bin", "d.bin", "e.bin"} {
+		_, err := f.Put(context.Background(), bytes.NewReader(pattern(1024)), staticObject(name, 1024))
+		require.Errorf(t, err, "%s must still be refused", name)
+		require.Contains(t, err.Error(), "comes back with the next day")
+		require.True(t, fserrors.IsNoRetryError(err), "for %s", name)
+	}
+	require.Equal(t, reads+1, drive.privReads, "the first refusal asks the account and the rest wait out the gap")
+	require.Equal(t, caps+1, drive.capReads, "the same is true of the endpoint that carries the used figure")
+
+	// Past the gap the account is asked again, so a day that has turned over - or
+	// space that has been cleared by hand - is noticed without restarting the run.
+	f.quota.mu.Lock()
+	f.quota.overRunAsk = time.Now().Add(-2 * time.Minute)
+	f.quota.mu.Unlock()
+	_, err := f.Put(context.Background(), bytes.NewReader(pattern(1024)), staticObject("f.bin", 1024))
+	require.Error(t, err)
+	require.Equal(t, reads+2, drive.privReads, "a refusal past the gap re-reads once more")
+
+	// And when the account says the day has come back, that is what stops the
+	// refusal: the file goes up rather than being refused on the old model.
+	drive.usedDayFlow = 0
+	f.quota.mu.Lock()
+	f.quota.overRunAsk = time.Now().Add(-2 * time.Minute)
+	f.quota.mu.Unlock()
+	_, err = f.Put(context.Background(), bytes.NewReader(pattern(int(miB(1)))), staticObject("g.bin", miB(1)))
+	require.NoError(t, err, "a day that has turned over must not be refused on a stale figure")
+}
+
 // TestNoQuotaCheckMeansNoGatingAtAll: with the option set, the limits are not
 // read for the transfer and not consulted for it either, even when the account
 // has plainly run out. The server's own refusal is then the only gate.
@@ -226,7 +266,7 @@ func TestNoQuotaCheckMeansNoGatingAtAll(t *testing.T) {
 	require.NotEmpty(t, sequenceContains(sequenceOf(drive), "POST /person/initMultiUpload"), "the upload really went to the drive")
 }
 
-// / TestQuotaReadRefusesToTreatAResCodeAsAnAnswer: an account that refuses this
+// TestQuotaReadRefusesToTreatAResCodeAsAnAnswer: an account that refuses this
 // endpoint must not be read as an account with no limits.
 func TestQuotaReadRefusesToTreatAResCodeAsAnAnswer(t *testing.T) {
 	for _, tc := range []struct {
