@@ -47,11 +47,15 @@ import (
 // ------------------------------------------------------------ constants ----
 
 const (
+	// listPageSize 是向目录列举端点要的窗口大小。群盘的 startNumber/endNumber
+	// 窗口有服务端硬上限 200(2026-10-23 实测: 调到 1000 直接回
+	// `API error 1909011500: 分页数量不能超过200`),个人云与家庭云的
+	// pageSize 在 201 条目录上按 200 验证过完整 -> 统一取 200,别再往上加。
 	yunBaseURL        = "https://yun.139.com"
 	minSleep          = 10 * time.Millisecond
 	maxSleep          = 2 * time.Second
 	decayConstant     = 2
-	listPageSize      = 100
+	listPageSize      = 200
 	maxListPages      = 1000
 	defaultRootID     = "/"
 	defaultFamilyRoot = "0"
@@ -2626,9 +2630,6 @@ func (f *Fs) listPersonal(ctx context.Context, dirID string, fn func(listEntry) 
 		if err != nil {
 			return err
 		}
-		if len(resp.Data.Items) == 0 && cursor == "" {
-			return nil
-		}
 		n := 0
 		for i := range resp.Data.Items {
 			item := &resp.Data.Items[i]
@@ -2652,9 +2653,18 @@ func (f *Fs) listPersonal(ctx context.Context, dirID string, fn func(listEntry) 
 				return nil
 			}
 		}
+		prevCursor := cursor
 		cursor = resp.Data.NextPageCursor
-		if cursor == "" || n < listPageSize {
+		if cursor == "" {
 			return nil
+		}
+		// 空页配非空游标是协议自相矛盾: 继续走会在同一目录空转到 1000 页上限,
+		// 静默停又会丢掉后面的对象。个人云是 sync 的源端, 宁可让这一轮红。
+		if n == 0 {
+			return fmt.Errorf("yun139: personal listing of %s got an empty page but the server still offers a next page", dirID)
+		}
+		if cursor == prevCursor {
+			return fmt.Errorf("yun139: personal listing of %s: cursor did not advance", dirID)
 		}
 	}
 	return fmt.Errorf("yun139: personal listing of %s did not terminate after %d pages", dirID, maxListPages)
@@ -2667,6 +2677,7 @@ func (f *Fs) listFamily(ctx context.Context, dirID string, fn func(listEntry) bo
 		return err
 	}
 	pageNum := 1
+	seen := 0
 	for page := 0; page < maxListPages; page++ {
 		body := map[string]any{
 			"catalogSortType": 0,
@@ -2754,9 +2765,12 @@ func (f *Fs) listFamily(ctx context.Context, dirID string, fn func(listEntry) bo
 				return nil
 			}
 		}
-		// totalCount counts the entries of this dir; stop when we have them all.
-		if resp.TotalCount > 0 && n >= resp.TotalCount {
-			return nil
+		seen += n
+		// totalCount 不能当停止条件: 它可能过时, 用每页 n 去比更是只会在
+		// totalCount<=窗口时早停。这个端点没有游标, 唯一可用的末页信号是短页;
+		// 计数对不上只记一笔, 不据此动作。
+		if resp.TotalCount > 0 && seen < resp.TotalCount && n < listPageSize {
+			fs.Debugf(f, "yun139: family directory %s: stopped after %d entries but totalCount said %d", dirID, seen, resp.TotalCount)
 		}
 		if n < listPageSize {
 			return nil
