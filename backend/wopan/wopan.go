@@ -3524,6 +3524,20 @@ func (w *wopanChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 		return io.LimitReader(reader, plan.PartSize), nil
 	}, w.zoneURL, w.dirID, w.name, w.size, w.fiEnc, w.uniqueID, w.token, plan, w.total)
 	if err != nil {
+		if isAuthInvalid(err) && !w.f.opt.NoRefresh {
+			// The token was rotated by someone else after this session opened.
+			// Its fileInfo is encrypted with the old token, so this session can
+			// never continue; refreshing alone would leave every later part
+			// posting the stale value. Refresh once (concurrent parts coalesce
+			// on the used token), then hand the file back to rclone, whose
+			// retry opens a fresh session under the new token. This mirrors the
+			// single-request path in uploadSingle, which re-runs the upload
+			// after the same refresh.
+			if rerr := w.f.refreshToken(ctx, w.f.tok, w.token); rerr != nil {
+				return 0, rerr
+			}
+			return 0, fserrors.RetryError(fmt.Errorf("wopan: upload token was rotated mid-file; refreshed, retrying this file: %w", err))
+		}
 		return 0, err
 	}
 	return plan.PartSize, nil

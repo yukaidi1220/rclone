@@ -168,3 +168,111 @@ func TestUnitQueryUserSendsRefreshedToken(t *testing.T) {
 	assert.Equal(t, testFreshAT, tr.sentAT[1], "刷新之后的重试必须带上换出来的那枚")
 	assert.Equal(t, testFreshAT, f.tok.accessTokenNow(), "内存态也要跟上换出来的新令牌")
 }
+
+// rotatingTokenTransport accepts only testFreshAT. Upload parts presenting the
+// stale token answer the business "invalid token" code; AppRefreshToken mints
+// the fresh pair. It models the one shape the chunk writer cannot heal by
+// itself: a rotation that happens after the upload session was opened.
+type rotatingTokenTransport struct {
+	mu        sync.Mutex
+	refreshes int
+	parts     []string // the accessToken each part POST presented
+}
+
+func (t *rotatingTokenTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(r.URL.Path, "/openapi/client/upload2C") {
+		token := ""
+		if mr, err := r.MultipartReader(); err == nil {
+			for {
+				p, err := mr.NextPart()
+				if err != nil {
+					break
+				}
+				b, _ := io.ReadAll(p)
+				if p.FormName() == "accessToken" {
+					token = string(b)
+				}
+			}
+		}
+		t.mu.Lock()
+		t.parts = append(t.parts, token)
+		t.mu.Unlock()
+		if token != testFreshAT {
+			return envelopeResponse(`{"code":"` + codeAuthInvalid + `","msg":"无效的令牌"}`), nil
+		}
+		return envelopeResponse(`{"code":"0000","msg":"ok","data":{"fid":"fid-1","wcFileId":"wc-1"}}`), nil
+	}
+	method, _, err := envelopeRequest(r)
+	if err != nil {
+		return nil, err
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch method {
+	case "AppRefreshToken":
+		t.refreshes++
+		return envelopeResponse(business("0000", "ok",
+			`{"access_token":"`+testFreshAT+`","refresh_token":"`+testFreshRT+
+				`","token_type":"bearer","expires_in":604799}`)), nil
+	default:
+		return envelopeResponse(business(codeAuthInvalid, "无效的令牌", `""`)), nil
+	}
+}
+
+// TestUnitChunkWriterRefreshesARotatedToken covers the multi-thread upload path:
+// its session is opened with one token and every part carries it, so when the
+// token is rotated mid-file postPartRetry returns the business error without a
+// part retry and accessTokenNow still hands out the stale value. The writer
+// must refresh and ask for a whole-file retry, because only a NEW session can
+// re-encrypt the fileInfo under the new token.
+func TestUnitChunkWriterRefreshesARotatedToken(t *testing.T) {
+	ctx := context.Background()
+	tr := &rotatingTokenTransport{}
+	f := newUnitTestFs(tr)
+	w := &wopanChunkWriter{
+		f: f, zoneURL: "https://zone.test", dirID: "dir-1", name: "movie.bin",
+		size: 2, chunk: 1, total: 2, fiEnc: "enc", uniqueID: "u-1", token: testAccessToken,
+	}
+
+	_, err := w.WriteChunk(ctx, 0, strings.NewReader("a"))
+	require.Error(t, err, "the part carried a token the server no longer accepts")
+	assert.True(t, fserrors.IsRetryError(err), "the file must be retried under a fresh session, got %v", err)
+	assert.False(t, fserrors.IsNoRetryError(err), "a rotation is not terminal")
+
+	tr.mu.Lock()
+	assert.Equal(t, 1, tr.refreshes, "the rotation must be refreshed exactly once")
+	first := append([]string(nil), tr.parts...)
+	tr.mu.Unlock()
+	assert.Equal(t, []string{testAccessToken}, first, "the failed part used the stale token")
+	assert.Equal(t, testFreshAT, f.tok.accessTokenNow(), "the fresh token must be in memory")
+
+	// What rclone's whole-file retry does: a new session, opened after the
+	// refresh, which therefore carries the new token.
+	w2 := &wopanChunkWriter{
+		f: f, zoneURL: "https://zone.test", dirID: "dir-1", name: "movie.bin",
+		size: 2, chunk: 1, total: 2, fiEnc: "enc", uniqueID: "u-2", token: f.tok.accessTokenNow(),
+	}
+	_, err = w2.WriteChunk(ctx, 0, strings.NewReader("a"))
+	require.NoError(t, err, "a session opened after the refresh must succeed")
+}
+
+// TestUnitChunkWriterKeepsNoRefreshHonest: with no_refresh the run promised not
+// to touch the refresh_token, so a rotation must be reported as-is instead of
+// asking rclone for a retry that cannot succeed.
+func TestUnitChunkWriterKeepsNoRefreshHonest(t *testing.T) {
+	ctx := context.Background()
+	tr := &rotatingTokenTransport{}
+	f := newUnitTestFs(tr)
+	f.opt.NoRefresh = true
+	w := &wopanChunkWriter{
+		f: f, zoneURL: "https://zone.test", dirID: "dir-1", name: "movie.bin",
+		size: 2, chunk: 1, total: 2, fiEnc: "enc", uniqueID: "u-1", token: testAccessToken,
+	}
+
+	_, err := w.WriteChunk(ctx, 0, strings.NewReader("a"))
+	require.Error(t, err)
+	assert.False(t, fserrors.IsRetryError(err), "no_refresh must not ask for a retry that needs a refresh")
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	assert.Equal(t, 0, tr.refreshes, "no_refresh means no login attempt at all")
+}
