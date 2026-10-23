@@ -914,6 +914,8 @@ type Fs struct {
 	apiBase      string      // base URL of the file API, which is apiHost for any remote a user configures
 	uploadBase   string      // where upload traffic goes: the server's host, or upload_zone
 	quota        *quotaState // the account's limits, read at run time
+
+	deleted *deletedRows // ids this process deleted, kept against the listing lag
 }
 
 // Object describes a cloud189 object
@@ -1096,6 +1098,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		familyID:   opt.FamilyID,
 		uploadBase: uploadBase,
 		apiBase:    apiHost,
+		deleted:    &deletedRows{ids: map[string]time.Time{}},
 	}
 	if opt.RootFolderID != "" {
 		// Both drives name the top level by an id, so an explicit one is also
@@ -1560,10 +1563,17 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	rows, err := f.rowsIn(ctx, pathID)
 	if err == nil {
 		for _, row := range rows {
-			if row.Name == name && rowIsDir(row) {
+			// A row this process just deleted can still be in the listing; its
+			// id is one nothing will answer to, so it never names the fresh
+			// directory.
+			if row.Name == name && rowIsDir(row) && !f.deleted.recent(row.ID.String()) {
+				fs.Debugf(f, "cloud189: createFolder answered %s for %q but the parent's listing names it %s, which is the one kept", created, name, row.ID)
 				return row.ID.String(), nil
 			}
 		}
+		fs.Debugf(f, "cloud189: createFolder answered %s for %q, which does not list, and the parent's listing does not name it yet", created, name)
+	} else {
+		fs.Debugf(f, "cloud189: createFolder answered %s for %q, which does not list, and the parent could not be listed: %v", created, name, err)
 	}
 	return created, nil
 }
@@ -1668,8 +1678,12 @@ func (f *Fs) rmdirRoot(ctx context.Context) error {
 		return err
 	}
 	// The remote no longer exists on the drive, so nothing in its cache can be
-	// trusted, including the root's own id.
-	f.dirCache.Flush()
+	// trusted - including the root's own id, which a Flush would leave in place:
+	// the next mkdir of "" would then come back from the cache holding the
+	// deleted id, and everything under it would answer FileNotFound. Measured
+	// live 2026-10-23, twice, by the test suite's own teardown. ResetRoot sends
+	// the next lookup back to the drive instead.
+	f.dirCache.ResetRoot()
 	return nil
 }
 
@@ -3262,11 +3276,59 @@ func (f *Fs) deleteRows(ctx context.Context, targets []deleteTarget) error {
 	if _, err := f.runBatchTask(ctx, f.taskAuth(), taskDelete, infos, ""); err != nil {
 		return err
 	}
+	for _, t := range targets {
+		f.deleted.remember(t.row.ID.String())
+	}
 	if !f.opt.HardDelete {
 		return nil
 	}
 	_, err := f.runBatchTask(ctx, f.taskAuth(), taskClearRecycle, infos, "")
 	return err
+}
+
+// deletedRows remembers the ids this process has deleted. It lives behind a
+// pointer for the same reason the quota does: NewFs copies the Fs when a remote
+// turns out to name a file, and a mutex copied that way is a mutex nobody
+// shares.
+type deletedRows struct {
+	mu  sync.Mutex
+	ids map[string]time.Time
+}
+
+// deletedRowWindow is how long a deleted object's row is distrusted. The
+// drive's listings keep answering a deleted row for about a second after the
+// delete task reports done (measured 2026-10-23: the suite's rmdir-then-mkdir
+// of the same root found the deleted directory's row again and bound its dead
+// id, and every operation through the cached id then answered FileNotFound).
+// A fresh object with the same name gets a fresh id, which is never in the set,
+// so only the dead rows are distrusted.
+const deletedRowWindow = 5 * time.Second
+
+// rememberDeleted notes the ids a finished delete task removed.
+func (d *deletedRows) remember(ids ...string) {
+	now := time.Now()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for id, when := range d.ids {
+		if now.Sub(when) > 2*deletedRowWindow {
+			delete(d.ids, id)
+		}
+	}
+	if len(d.ids) >= 1024 {
+		return // to the top and stop remembering new keys, like the other tables
+	}
+	for _, id := range ids {
+		d.ids[id] = now
+	}
+}
+
+// recent reports whether a row with this id was deleted by this process
+// recently enough that a listing may still be carrying it.
+func (d *deletedRows) recent(id string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	when, ok := d.ids[id]
+	return ok && time.Since(when) < deletedRowWindow
 }
 
 // b2i writes the flag the task list wants for a directory.
@@ -3290,6 +3352,11 @@ func (f *Fs) findEntry(ctx context.Context, dirID, wireLeaf string) (*api.Row, e
 	var found *api.Row
 	err := f.listAll(ctx, dirID, func(row *api.Row) bool {
 		if row.Name == wireLeaf {
+			if f.deleted.recent(row.ID.String()) {
+				// The listing still carries the row this process deleted, and
+				// the id it carries is one nothing will ever answer to again.
+				return false
+			}
 			found = row
 			return true
 		}

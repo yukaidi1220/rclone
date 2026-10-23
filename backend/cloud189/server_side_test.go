@@ -725,6 +725,36 @@ func TestRmdirOfTheRootTheRemoteWasOpenedAt(t *testing.T) {
 	require.EqualValues(t, -11, *drive.tasks[0].infos[0].ParentID, "its parent is named the way the drive spells the space root")
 }
 
+// TestMkdirAfterRmdirOfTheRootGoesBackToTheDrive: the cache of a remote whose
+// root was just deleted holds nothing usable, and a Flush that kept the root's
+// own id made the next mkdir of "" come back from the cache holding the deleted
+// id - every operation under it then answered FileNotFound. Measured live
+// 2026-10-23, twice, by the suite's own teardown. The root reset sends the next
+// lookup back to the drive, which creates the directory again.
+func TestMkdirAfterRmdirOfTheRootGoesBackToTheDrive(t *testing.T) {
+	const subID = "900000000000000042"
+	drive := &fakeDrive{t: t, folders: map[string]string{"sub": subID}}
+	f := newFakeFs(t, drive)
+	f.root = "sub"
+	f.fsRootID = subID
+	// seeded the way NewFs seeds it: with the space root, before the walk
+	f.dirCache = dircache.New("sub", rootID, f)
+	drive.listingFn = newListingScript(map[string][]string{
+		// the walk that resolves the root, the rmdir's own walk, and after the
+		// reset the re-resolution that must find the name gone. subID: the
+		// rmdir's emptiness check and the recreated directory's verification.
+		rootID: {listingJSON(nil, []string{folderJSON(subID, "sub", rootID)}),
+			listingJSON(nil, []string{folderJSON(subID, "sub", rootID)}), emptyListing()},
+		subID: {emptyListing(), emptyListing()},
+	}).fn
+
+	require.NoError(t, f.resolveAnchor(context.Background()))
+	require.Equal(t, subID, f.fsRootID)
+	require.NoError(t, f.Rmdir(context.Background(), ""))
+	require.NoError(t, f.Mkdir(context.Background(), ""))
+	require.Equal(t, []string{"sub"}, drive.mkdirs, "the deleted root is created again on the drive, not resurrected from the cache")
+}
+
 // TestPurgeAnchorIsTheDirectoryTheWalkResolved is the live lesson of 2026-10-23:
 // NewFs seeded the purge anchor from rootID(), which names the space's top level
 // whatever the remote is opened at. A remote opened at a subdirectory then
@@ -776,6 +806,29 @@ func TestPurgeRefusesWhenNothingWasResolved(t *testing.T) {
 	err := f.Purge(context.Background(), "")
 	require.Error(t, err)
 	require.Empty(t, drive.tasks, "the space root is never dressed up as the target")
+}
+
+// TestFindEntryDistrustsAJustDeletedRow: the listing keeps answering a deleted
+// object's row for about a second after the delete task reports done, and the
+// id that row carries is one nothing will ever answer to again. A lookup that
+// trusts it binds the dead id - the shape the suite's rmdir-then-mkdir of the
+// same root measured live.
+func TestFindEntryDistrustsAJustDeletedRow(t *testing.T) {
+	drive := &fakeDrive{t: t}
+	f := newFakeFs(t, drive)
+	drive.listingFn = newListingScript(map[string][]string{
+		// two walks: one for the remote that deleted the row, one for the fresh one
+		rootID: {listingJSON([]string{fileJSON("300000000000000003", "a.bin", rootID)}, nil),
+			listingJSON([]string{fileJSON("300000000000000003", "a.bin", rootID)}, nil)},
+	}).fn
+	f.deleted.remember("300000000000000003")
+
+	_, err := f.findEntry(context.Background(), rootID, f.opt.Enc.FromStandardName("a.bin"))
+	require.ErrorIs(t, err, fs.ErrorObjectNotFound, "the row the drive still carries is the one this process deleted")
+
+	f2 := newFakeFs(t, drive)
+	_, err = f2.findEntry(context.Background(), rootID, f2.opt.Enc.FromStandardName("a.bin"))
+	require.NoError(t, err, "a fresh remote has deleted nothing, so the row is found as usual")
 }
 
 // TestRmdirRefusesANonEmptyDirectory is the difference between Rmdir and Purge:

@@ -586,6 +586,7 @@ func newFakeFs(t *testing.T, drive *fakeDrive) *Fs {
 	f.opt.UploadConcurrency = 2
 	f.opt.Enc = cloud189DefaultEncoding
 	f.partClient = noRedirectClient(srv.Client())
+	f.deleted = &deletedRows{ids: map[string]time.Time{}}
 	f.pacer = fs.NewPacer(context.Background(), pacer.NewDefault(pacer.MinSleep(time.Microsecond), pacer.MaxSleep(time.Millisecond), pacer.DecayConstant(1)))
 	f.features = cloud189Features(context.Background(), f)
 	f.dirCache = dircache.New("", personalRoot, f)
