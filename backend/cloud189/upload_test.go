@@ -156,8 +156,10 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	d.note(r.Method, r.URL.Path)
 
 	// A part PUT carries no 189 signature at all: the storage layer signed the
-	// URL itself, and the client only replays the headers it was given.
-	if !strings.HasPrefix(r.URL.Path, "/store/") {
+	// URL itself, and the client only replays the headers it was given. The
+	// exchange carries none either - it is the call that mints the session the
+	// later signatures are made from.
+	if !strings.HasPrefix(r.URL.Path, "/store/") && r.URL.Path != "/getSessionForPC.action" {
 		d.mu.Lock()
 		// Which session signed what: the family drive has its own key, and the
 		// signature check below cannot tell the two apart because the captured
@@ -382,6 +384,14 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			st["successedCount"] = subs
 		}
 		writeJSON(w, http.StatusOK, st)
+
+	case "/getSessionForPC.action":
+		// NewFs goes through the real entry point, so it exchanges the token
+		// itself. The answer mints the same key the pre-seeded remotes use.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"res_code": 0, "sessionKey": fakeKey, "sessionSecret": fakeSecret,
+			"loginName": "fixture-account",
+		})
 
 	case "/getUserPrivilegesV2.action":
 		d.mu.Lock()
@@ -830,6 +840,32 @@ func TestPutDetectsARacingOccupant(t *testing.T) {
 	require.Equal(t, "7000000000000000002", drive.renames[0].id, "the object that appeared is the one parked")
 	require.Len(t, drive.tasks, 1)
 	require.Equal(t, "7000000000000000002", drive.tasks[0].infos[0].FileID)
+}
+
+// TestPutSwapsOutAFileTheDriveListedWithoutAParent is the personal endpoint's
+// row shape, captured 2026-10-23: a file row carries no parentId at all, only
+// the folderList rows do. The parked occupier still has to be deleted by a task
+// that names its parent as a number, and the listing that found the row is the
+// only place that number exists. Measured live the same day: without this the
+// swap cleans up nothing and prints "the drive answers with the directory id
+// \"\"" while the parked file keeps costing quota.
+func TestPutSwapsOutAFileTheDriveListedWithoutAParent(t *testing.T) {
+	drive := &fakeDrive{
+		t:          t,
+		commitName: "movie(20261022191710).bin",
+		listing: `{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[` +
+			`{"id":"7000000000000000004","name":"movie.bin","size":10,"type":"1"}]}}`,
+	}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase))
+
+	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
+	require.NoError(t, err)
+	require.Len(t, drive.renames, 2, "park, install")
+	require.Len(t, drive.tasks, 1, "and the parked object is taken back out")
+	require.Equal(t, "7000000000000000004", drive.tasks[0].infos[0].FileID)
+	require.NotNil(t, drive.tasks[0].infos[0].ParentID, "the parent comes from the listing, not from the row")
+	require.EqualValues(t, -11, *drive.tasks[0].infos[0].ParentID, "this listing was of the space root, which the drive spells -11")
 }
 
 // TestPutRefusesToOverwriteADirectory: a name can be held by a directory, and a

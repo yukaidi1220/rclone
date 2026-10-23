@@ -127,7 +127,10 @@ and always settable with `rclone config set <remote> <key> <value>`:
   certificate rclone accepts.
 - `--cloud189-disable-http2`: use HTTP/1.1 keep-alive instead of HTTP/2, so that
   concurrent part uploads spread over parallel TCP connections rather than
-  sharing one.
+  sharing one. Measured live 2026-10-23: with HTTP/2 left on, one read of a
+  21 MiB file died mid-transfer with `stream error: INTERNAL_ERROR; received
+  from peer`, once in a run of some four hundred requests. The throughput
+  argument alone is reason enough to set it on a long run.
 - `--cloud189-encoding`: the default is `Standard` plus `EncodeDoubleQuote`,
   `EncodeAsterisk`, `EncodeColon`, `EncodeLtGt`, `EncodeQuestion`,
   `EncodeBackSlash`, `EncodePipe`, `EncodeSingleQuote` and `EncodeInvalidUtf8`,
@@ -378,10 +381,17 @@ what the alias named. Nothing destructive is sent until `family_id` or
 
 `Purge` of a directory is likewise a single recursive `DELETE`, so a deep tree
 costs one request rather than one per entry. `Purge` of a remote's own root
-empties it in one multi-object task, because the root itself cannot be deleted.
+empties it in one multi-object task; the drive's top level itself is emptied,
+never deleted, and the same is true of the directory a remote was opened at.
+That anchor is the directory the remote resolved at open time, not the space's
+top level: a purge of a subdirectory remote used to name the top level's
+contents, which is how a family drive came to be emptied from inside the test
+suite.
 
 `Rmdir` refuses a directory that still has children - the drive cannot remove one
-without taking them - and refuses the top level. A deleted directory is dropped
+without taking them - and refuses the drive's top level. The root of a remote
+opened below the top level is removable when empty, which is what the test
+suite's teardown and `rclone rmdir remote:sub` mean. A deleted directory is dropped
 from rclone's id cache, so a later `mkdir` of the same name creates it again
 instead of writing into an id the drive no longer has.
 
