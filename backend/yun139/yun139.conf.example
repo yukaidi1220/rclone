@@ -8,7 +8,7 @@
 # 每个 remote 一节, [remote名] 后跟 key = value。多个 remote 可共存:
 # 同一个账号可以同时添加个人云、家庭云和共享群 (space 不同即可)。
 #
-# 所有参数一览 (共 15 个):
+# 所有参数一览 (共 16 个):
 #   authorization       (必填, 敏感) 授权 token
 #   space               (可选, 默认 personal) 空间类型: personal | family | group
 #   family_id           (family 必填) 家庭云 ID
@@ -23,6 +23,7 @@
 #   disable_http2       (可选, 默认 false) 关闭 HTTP/2
 #   max_file_size       (可选, 默认 0=自动) 单文件上传上限
 #   no_member_check     (可选, 默认 false) 跳过会员等级探测
+#   url_type_header     (可选, 默认 false) 发送 x-yun-url-type: 3 请求头
 #   encoding            (可选, 默认 Slash,Del,Ctl,LeftSpace,LeftPeriod,LeftTilde,
 #                        LeftCrLfHtVt,RightSpace,RightPeriod,RightCrLfHtVt,
 #                        InvalidUtf8,Dot) 文件名编码
@@ -168,6 +169,14 @@ group_id = <共享群 ID, 数字; 多个群时必填, 见下方说明>
 # false = NewFs 时探测会员等级并据此拦截超限文件 (默认)。
 # 何时使用: 探测接口异常/账号等级特殊时, 避免 fail-open 行为影响判断。
 # 注意: 开启后本项覆盖 max_file_size。
+
+# --- url_type_header (可选, 高级, 默认 false) ---------------------------------
+# true  = 在需要该请求头的调用上发送 x-yun-url-type: 3;
+# false = 不发送 (默认)。
+# 该头是官方客户端签下载链接、家庭云全部请求及共享群 native 模块调用时带的
+# 开关: 带上它, 签出的链接主机名为 *.eos.yun.139.com; 不带则是裸 cmecloud EOS
+# 主机, 而直链网关的规则是按主机名匹配的 (2026-10-19 两种方式实测)。
+# 默认不发送; 若下载在 cmecloud 主机上失败, 开启本项再对比测试。
 
 # --- encoding (可选, 高级, 默认见下) ----------------------------------------
 # 文件名编码规则 (rclone encoder 位掩码, 逗号分隔)。
