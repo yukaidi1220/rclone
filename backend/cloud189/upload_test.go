@@ -579,6 +579,7 @@ func newFakeFs(t *testing.T, drive *fakeDrive) *Fs {
 	f.pacer = fs.NewPacer(context.Background(), pacer.NewDefault(pacer.MinSleep(time.Microsecond), pacer.MaxSleep(time.Millisecond), pacer.DecayConstant(1)))
 	f.features = cloud189Features(context.Background(), f)
 	f.dirCache = dircache.New("", personalRoot, f)
+	f.fsRootID = personalRoot
 
 	ts := f.session()
 	ts.mu.Lock()
