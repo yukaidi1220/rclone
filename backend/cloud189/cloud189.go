@@ -2320,12 +2320,9 @@ func (f *Fs) gateUpload(ctx context.Context, name string, size int64) error {
 		if f.opt.MaxFileSize > 0 {
 			whose = "--cloud189-max_file_size"
 		}
-		return fserrors.NoRetryError(&apiError{
-			Status:  http.StatusForbidden,
-			Field:   "local pre-check",
-			Code:    codeLocalSizeCeiling,
-			Message: fmt.Sprintf("%s is %s and %s is %s", name, fs.SizeSuffix(size), whose, fs.SizeSuffix(limit)),
-		})
+		// A plain error, not an apiError: nothing was sent, so printing it as a
+		// server answer with an HTTP status would be a lie about where it came from.
+		return fserrors.NoRetryError(fmt.Errorf("cloud189: %s is %s and %s is %s (%s)", name, fs.SizeSuffix(size), whose, fs.SizeSuffix(limit), codeLocalSizeCeiling))
 	}
 	// usedDayFlow moves while a run is going - other programs, the official
 	// client, another machine - so a projected overrun is checked against the
@@ -3011,6 +3008,11 @@ func redactQueryValues(text, u string) string {
 		for _, v := range values {
 			if len(v) >= 8 {
 				text = strings.ReplaceAll(text, v, "<redacted>")
+				// The storage layer may quote the query back with its separators
+				// percent-encoded, which is a different string for a value holding
+				// `/ + =`. Masking both forms is what makes "however they arrive"
+				// true.
+				text = strings.ReplaceAll(text, url.QueryEscape(v), "<redacted>")
 			}
 		}
 	}
