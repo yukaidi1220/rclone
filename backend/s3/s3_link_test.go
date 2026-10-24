@@ -170,7 +170,9 @@ func TestCommandLinkErrors(t *testing.T) {
 		{"TooManyPaths", []string{"one", "two"}, nil},
 		{"EmptyPath", []string{""}, nil},
 		{"Directory", []string{"dir/"}, nil},
-		{"Missing", []string{"missing"}, nil},
+		// {"Missing", ...} is gone on purpose: with no version switch set the
+		// link command no longer resolves the object, so it cannot tell a
+		// missing one from a present one. See s3_version_gate_test.go.
 		{"UnknownOption", []string{"file"}, map[string]string{"response-unknown": "value"}},
 		{"InvalidDate", []string{"file"}, map[string]string{"response-expires": "tomorrow"}},
 		{"InvalidExpire", []string{"file"}, map[string]string{"expire": "invalid"}},
@@ -222,6 +224,6 @@ func TestPublicLink(t *testing.T) {
 	assert.Equal(t, u.Query().Get("X-Amz-Signature"), linkSignature(t, u))
 	_, err = f.PublicLink(context.Background(), "dir/", fs.DurationOff, false)
 	assert.ErrorIs(t, err, fs.ErrorCantShareDirectories)
-	_, err = f.PublicLink(context.Background(), "missing", fs.DurationOff, false)
-	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
+	// A missing object is not resolved here any more: see
+	// TestPublicLinkWithoutVersionsSendsNoRequest and ...WithVersionsStatsTheObject.
 }
