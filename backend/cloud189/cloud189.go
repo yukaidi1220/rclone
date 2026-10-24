@@ -2028,14 +2028,26 @@ func (f *Fs) undoArrival(ctx context.Context, dirID string, parked *api.Row, nam
 		// was free all along.
 		return
 	}
-	// The name is taken. Only this run's own object may be handed over, so the
-	// holder is read back rather than assumed.
-	row, err := f.awaitRow(ctx, dirID, name)
-	if err != nil {
+	// The rename was refused. That is either the name being taken or the drive not
+	// having answered, and only a read can tell them apart. The read waits past the
+	// state the park left behind: a listing one rename behind answers with the very
+	// object that was moved aside, which says nothing about who holds the name now.
+	row, err := f.holderAfterThePark(ctx, dirID, name, parked.ID.String())
+	switch {
+	case errors.Is(err, fs.ErrorObjectNotFound):
+		// Nobody holds it, so the refusal was about the rename itself. One more
+		// try; the object that was there before this run is worth the request.
+		if rerr := f.restoreName(ctx, parked, name); rerr != nil {
+			fs.Errorf(f, "cloud189: the object parked as %q could not be given back its name %q: %v", parked.Name, name, rerr)
+		}
+		return
+	case err != nil:
 		fs.Errorf(f, "cloud189: the object parked as %q could not be given back its name %q, and who holds it could not be read: %v", parked.Name, name, err)
 		return
 	}
 	if row.ID.String() != movedID {
+		// Somebody else's object. Nothing here may move it: this run only knows that
+		// its own object was the one that landed.
 		fs.Errorf(f, "cloud189: the object parked as %q could not be given back its name %q: it is held by another object", parked.Name, name)
 		return
 	}
@@ -2049,6 +2061,34 @@ func (f *Fs) undoArrival(ctx context.Context, dirID string, parked *api.Row, nam
 		return
 	}
 	fs.Logf(f, "cloud189: the operation failed after the move landed, so the moved object is left as %q and '%s' is back in place", park, truncate(name, 60))
+}
+
+// holderAfterThePark reads back who holds a name, waiting past the state the park
+// left behind.
+//
+// A listing that is one rename behind answers with the object the park moved away,
+// still wearing the name it was moved from. That row is not an answer about who
+// holds the name now, and acting on it would report a hand-over that cannot happen.
+func (f *Fs) holderAfterThePark(ctx context.Context, dirID, wireName, parkedID string) (*api.Row, error) {
+	lastErr := fs.ErrorObjectNotFound
+	for attempt := 0; attempt < arrivalAttempts; attempt++ {
+		row, err := f.findEntry(ctx, dirID, wireName)
+		switch {
+		case err == nil && row.ID.String() != parkedID:
+			return row, nil
+		case err == nil:
+			lastErr = fs.ErrorObjectNotFound // the pre-park row, not the name's holder
+		default:
+			lastErr = err
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		if attempt < arrivalAttempts-1 {
+			time.Sleep(arrivalWait)
+		}
+	}
+	return nil, lastErr
 }
 
 // finishClear decides what becomes of the object that was standing where an
@@ -2153,7 +2193,9 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 	info := taskInfo{FileID: srcObj.id, FileName: srcLeaf, IsFolder: 0, ParentID: srcParentID}
 	if _, err := srcObj.fs.runBatchTask(ctx, auth, taskMove, []taskInfo{info}, dstDirID); err != nil {
-		f.undoClear(ctx, cleared, srcLeaf)
+		// A task that failed moved nothing, so the same handler covers both: it
+		// restores the name when it is free and hands it over when it is not.
+		f.undoArrival(ctx, dstDirID, cleared, srcLeaf, srcObj.id, false)
 		return nil, err
 	}
 	// A task's counters are all this backend has to judge it by, and installObject
@@ -2213,7 +2255,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	// at the end, after the task has run and something has been parked. Nothing is
 	// parked until the name the directory has to take is known to be free.
 	if row, ferr := f.findEntry(ctx, dstDirID, dstWire); ferr == nil && !rowIsDir(row) {
-		return fserrors.NoRetryError(fmt.Errorf("cloud189: %q is a file on the drive, so the directory cannot take its name", truncate(dstWire, 60)))
+		return fmt.Errorf("cloud189: %q is a file on the drive, so the directory cannot take its name", truncate(dstWire, 60))
 	} else if ferr != nil && !errors.Is(ferr, fs.ErrorObjectNotFound) {
 		return ferr
 	}
@@ -2238,17 +2280,12 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		}
 		// Read the arrival back before anything parked is deleted: the destination
 		// must hold the moved directory under the name the task left it in, and if
-		// it does not then this run has not earned removing what was there. The
-		// drive keeps its listings a second or two behind, so the window is waited
-		// out the way a created directory's id is.
-		arrived, err := f.awaitRow(ctx, dstDirID, wireSrc)
-		if err != nil {
-			f.undoClear(ctx, cleared, wireSrc)
+		// it does not then this run has not earned removing what was there. The read
+		// waits for this run's id, not merely for some row: the park and the task are
+		// two mutations of one name inside a second.
+		if err := f.proveArrived(ctx, dstDirID, wireSrc, srcID); err != nil {
+			f.undoArrival(ctx, dstDirID, cleared, wireSrc, srcID, true)
 			return err
-		}
-		if arrived.ID.String() != srcID {
-			f.undoClear(ctx, cleared, wireSrc)
-			return fserrors.NoRetryError(fmt.Errorf("cloud189: the directory move left something other than the moved directory under %q", truncate(wireSrc, 60)))
 		}
 		// The task carries no destination name: the directory arrives under the
 		// name it moved with. When that is not the name rclone asked for, rename it
@@ -2311,15 +2348,22 @@ func (f *Fs) awaitRow(ctx context.Context, dirID, wireName string) (*api.Row, er
 // object on its way in.
 func (f *Fs) proveArrived(ctx context.Context, dirID, wireName, wantID string) error {
 	var lastErr error
+	sawOther := false
 	for attempt := 0; attempt < arrivalAttempts; attempt++ {
 		row, err := f.findEntry(ctx, dirID, wireName)
 		switch {
 		case err == nil && row.ID.String() == wantID:
 			return nil
 		case err == nil:
+			// A row that is not this run's, for the whole window. Whatever happens
+			// after this point, trying the same operation again will not change it,
+			// and the row may be somebody else's object.
+			sawOther = true
 			lastErr = fserrors.NoRetryError(fmt.Errorf("cloud189: %q is held by something other than the object this run moved there", truncate(wireName, 60)))
 		case errors.Is(err, fs.ErrorObjectNotFound):
-			lastErr = err
+			if !sawOther {
+				lastErr = err
+			}
 		default:
 			return err
 		}
@@ -3861,7 +3905,108 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 				truncate(redactQueryValues(redactURLInText(string(body), link), link), 200))
 		}
 	}
-	return res.Body, nil
+	if o.size <= 0 {
+		// Without a length there is nothing to compare a short body against, so
+		// nothing to continue from either.
+		return res.Body, nil
+	}
+	return &resumableBody{ctx: ctx, o: o, body: res.Body}, nil
+}
+
+// maxResumes bounds how many times one download may reconnect. Each one is a fresh
+// request, and a host that cuts every attempt should be reported rather than
+// hammered.
+const maxResumes = 4
+
+// resumableBody hands a download to the caller and repairs a body the storage host
+// cut short.
+//
+// The host has been measured to drop a large transfer part way and answer the same
+// object in full afterwards (2026-10-24: the standard suite's 21 MiB read failed
+// with unexpected EOF on three runs in a row, and the object read back whole
+// minutes later). An object cannot change under a reader - it is addressed by id -
+// so the rest is asked for from the byte already delivered, and a dropped
+// connection becomes a slower download instead of a failed file.
+type resumableBody struct {
+	ctx     context.Context
+	o       *Object
+	body    io.ReadCloser
+	offset  int64
+	resumes int
+	done    bool
+}
+
+func (b *resumableBody) Read(p []byte) (int, error) {
+	if b.done {
+		return 0, io.EOF
+	}
+	n, err := b.body.Read(p)
+	b.offset += int64(n)
+	if err == nil {
+		return n, nil
+	}
+	if errors.Is(err, io.EOF) && b.offset < b.o.size {
+		// The body ended before the last byte the drive announced: this is a cut,
+		// not the end of the object.
+		err = io.ErrUnexpectedEOF
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) || b.offset >= b.o.size || b.resumes >= maxResumes {
+		b.done = true
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return n, fmt.Errorf("cloud189: the download stopped at %d of %d bytes after %d reconnects: %w", b.offset, b.o.size, b.resumes, err)
+		}
+		return n, err
+	}
+	if rerr := b.reopen(); rerr != nil {
+		b.done = true
+		return n, fmt.Errorf("cloud189: the download stopped at %d of %d bytes and could not be continued: %w", b.offset, b.o.size, rerr)
+	}
+	return n, nil
+}
+
+// reopen asks for the object from the byte already delivered, on a fresh link.
+func (b *resumableBody) reopen() error {
+	b.resumes++
+	_ = b.body.Close()
+	// A link that was being used when the transfer was cut may be the reason it
+	// was cut; asking the drive for another one costs a request and removes it as
+	// a suspicion.
+	b.o.invalidateURL()
+	link, err := b.o.fs.downloadURLCached(b.ctx, b.o)
+	if err != nil {
+		return err
+	}
+	res, err := b.o.get(b.ctx, link, &fs.RangeOption{Start: b.offset, End: -1})
+	if err != nil {
+		return err
+	}
+	switch res.StatusCode {
+	case http.StatusPartialContent:
+		if got := res.Header.Get("Content-Range"); got != "" && !strings.HasPrefix(got, fmt.Sprintf("bytes %d-", b.offset)) {
+			_ = res.Body.Close()
+			return fmt.Errorf("the host answered a range that does not start where the transfer stopped: %s", truncate(got, 60))
+		}
+	case http.StatusRequestedRangeNotSatisfiable:
+		_ = res.Body.Close()
+		return errors.New("the host holds fewer bytes than it announced")
+	case http.StatusOK:
+		// The host ignored the range and started again from the beginning: drop
+		// what has already been handed to the caller.
+		if _, err := io.CopyN(io.Discard, res.Body, b.offset); err != nil {
+			_ = res.Body.Close()
+			return fmt.Errorf("the host answered the whole object and it ended before the byte already read: %w", err)
+		}
+	default:
+		_ = res.Body.Close()
+		return fmt.Errorf("HTTP %d", res.StatusCode)
+	}
+	b.body = res.Body
+	return nil
+}
+
+func (b *resumableBody) Close() error {
+	b.done = true
+	return b.body.Close()
 }
 
 // get issues the download request, following the redirect to the storage host
@@ -4091,6 +4236,14 @@ func (f *Fs) restoreOrConfirm(ctx context.Context, dirID, wireName string, parke
 	err := f.restoreName(ctx, parked, wireName)
 	if err == nil {
 		return nil
+	}
+	// Only a refusal about the NAME may be read as "the object already holds it".
+	// Any other failure is the drive not having answered, and a listing that is one
+	// rename behind answers with the object under the name it was parked from -
+	// which would turn "still parked" into a reported success.
+	var refused *apiError
+	if !errors.As(err, &refused) || refused.Code != codeFileAlreadyExists {
+		return err
 	}
 	row, ferr := f.awaitRow(ctx, dirID, wireName)
 	switch {

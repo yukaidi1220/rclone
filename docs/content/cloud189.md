@@ -560,6 +560,15 @@ written, the storage layer refuses it.
 The URL's query is a signature; rclone strips it out of any message or log line
 that would otherwise echo it back.
 
+The storage host is also measurably unreliable over long transfers: on 2026-10-24
+the standard suite's 21 MiB read failed with `unexpected EOF` on three runs in a
+row, while the same object read back whole minutes later and a ranged request
+answered at once. So a body that stops before the last byte the drive announced
+is continued: the rest is asked for from the byte already delivered, on a fresh
+link, up to four times per read. An object cannot change under a reader, because
+it is addressed by id, so the whole download is still one object's bytes - a
+dropped connection costs time rather than the file.
+
 ## How to reach the service
 
 The endpoints are `https://api.cloud.189.cn` (the session call, listing, tasks,

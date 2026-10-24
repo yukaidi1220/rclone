@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -102,6 +103,8 @@ type fakeDrive struct {
 	readStatus   []int             // status for each successive read; shorter than the reads means 200
 	readBody     []byte            // bytes served on a read, default a short constant
 	readQueries  []string          // the query each read actually arrived with
+	readRanges   []string          // the Range header each read arrived with
+	readCut      []int64           // bytes to send while announcing the whole body, for each read
 	folders      map[string]string // directory name to id, for a createFolder
 	mkdirs       []string          // the directory names the drive was asked to create
 
@@ -477,12 +480,17 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (d *fakeDrive) storeRead(w http.ResponseWriter, r *http.Request) {
 	d.mu.Lock()
 	d.readQueries = append(d.readQueries, r.URL.RawQuery)
+	d.readRanges = append(d.readRanges, r.Header.Get("Range"))
 	n := len(d.readQueries)
 	status := http.StatusOK
 	if n <= len(d.readStatus) {
 		status = d.readStatus[n-1]
 	}
 	body := d.readBody
+	cut := int64(-1)
+	if n <= len(d.readCut) {
+		cut = d.readCut[n-1]
+	}
 	d.mu.Unlock()
 	if status != http.StatusOK {
 		// Real storage layers quote the request they refused, URL and all, which
@@ -493,8 +501,30 @@ func (d *fakeDrive) storeRead(w http.ResponseWriter, r *http.Request) {
 	if body == nil {
 		body = []byte("downloaded-bytes")
 	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(body)
+	// A Range header is honoured the way the storage host honours it: 206 with
+	// the rest of the object.
+	payload := body
+	status = http.StatusOK
+	if rng := r.Header.Get("Range"); strings.HasPrefix(rng, "bytes=") && len(body) > 0 {
+		spec := strings.TrimSuffix(strings.TrimPrefix(rng, "bytes="), "-")
+		if i := strings.IndexByte(spec, '-'); i >= 0 {
+			spec = spec[:i]
+		}
+		if start, err := strconv.ParseInt(spec, 10, 64); err == nil && start >= 0 && start <= int64(len(body)) {
+			payload = body[start:]
+			status = http.StatusPartialContent
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(body)-1, len(body)))
+		}
+	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+	w.WriteHeader(status)
+	if cut >= 0 && cut < int64(len(payload)) {
+		// Announce the whole answer and send part of it, the way a host that drops
+		// a transfer looks to the client.
+		_, _ = w.Write(payload[:cut])
+		return
+	}
+	_, _ = w.Write(payload)
 }
 
 // storePart is the storage layer. It compares the arriving bytes with the

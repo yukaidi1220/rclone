@@ -63,6 +63,66 @@ func TestExpiredLinkIsMintedAgainOnce(t *testing.T) {
 	require.Len(t, drive.readQueries, 2)
 }
 
+// TestADownloadCutShortIsContinued: the storage host has been measured to drop a
+// large transfer part way and answer the same object in full afterwards (2026-10-24:
+// the standard suite's 21 MiB read failed with unexpected EOF three runs in a row
+// while the object read back whole minutes later). An object cannot change under a
+// reader - it is addressed by id - so the rest is asked for from the byte already
+// delivered, with a fresh link.
+func TestADownloadCutShortIsContinued(t *testing.T) {
+	drive := &fakeDrive{t: t, readBody: []byte("0123456789"), readCut: []int64{4}}
+	f := newFakeFs(t, drive)
+	obj := srcObject(f, "clip-01.mp4", "900000000000000004")
+	obj.size = 10
+
+	rc, err := obj.Open(context.Background())
+	require.NoError(t, err)
+	got, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+	require.Equal(t, []byte("0123456789"), got, "the half the host did not send came from a ranged read")
+
+	require.Len(t, drive.readQueries, 2, "the transfer was continued, not restarted")
+	require.Empty(t, drive.readRanges[0])
+	require.Equal(t, "bytes=4-9", drive.readRanges[1], "asked for the rest from the byte already delivered")
+	require.Equal(t, 2, drive.downloadHits, "on a link of its own")
+}
+
+// TestADownloadCutEveryTimeIsReported: a host that cuts every attempt is reported
+// instead of being asked forever.
+func TestADownloadCutEveryTimeIsReported(t *testing.T) {
+	drive := &fakeDrive{t: t, readBody: []byte("0123456789"), readCut: []int64{0, 0, 0, 0, 0, 0, 0}}
+	f := newFakeFs(t, drive)
+	obj := srcObject(f, "clip-01.mp4", "900000000000000004")
+	obj.size = 10
+
+	rc, err := obj.Open(context.Background())
+	require.NoError(t, err)
+	_, err = io.ReadAll(rc)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	require.Contains(t, err.Error(), "after 4 reconnects", "the attempts are bounded and the message says where it stopped")
+	require.NoError(t, rc.Close())
+
+	require.Len(t, drive.readQueries, 1+maxResumes, "one read and the reconnects it allows, and no more")
+}
+
+// TestADownloadOfUnknownLengthIsNotContinued: without a length there is nothing to
+// measure a short body against, so a cut is reported as it is.
+func TestADownloadOfUnknownLengthIsNotContinued(t *testing.T) {
+	drive := &fakeDrive{t: t, readBody: []byte("0123456789"), readCut: []int64{4}}
+	f := newFakeFs(t, drive)
+	obj := srcObject(f, "clip-01.mp4", "900000000000000004")
+	obj.size = 0
+
+	rc, err := obj.Open(context.Background())
+	require.NoError(t, err)
+	_, err = io.ReadAll(rc)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	require.NotContains(t, err.Error(), "stopped at", "there is no length to report progress against")
+	require.NoError(t, rc.Close())
+	require.Len(t, drive.readQueries, 1, "nothing was asked for a second time")
+}
+
 // TestDownloadGivesUpAfterTheSecondRefusal: the retry is one deep. A link that is
 // refused twice means something other than age is wrong, and looping here would
 // spend requests on a read that cannot succeed.
