@@ -11,6 +11,7 @@ import (
 	_ "github.com/rclone/rclone/backend/box"
 	_ "github.com/rclone/rclone/backend/cache"
 	_ "github.com/rclone/rclone/backend/chunker"
+	_ "github.com/rclone/rclone/backend/cloud189"
 	_ "github.com/rclone/rclone/backend/cloudinary"
 	_ "github.com/rclone/rclone/backend/cloudreve"
 	_ "github.com/rclone/rclone/backend/combine"
