@@ -819,6 +819,54 @@ func TestUpdateKeepsTheOriginalWhenTheDriveReusesItsId(t *testing.T) {
 	require.Empty(t, drive.tasks, "nothing is deleted: the fresh bytes are the object this run replaced")
 }
 
+// TestUpdateRestoresWithARenameEvenWhenTheListingStillShowsTheObject: a listing that
+// still answers with the parked original under the wanted name is exactly what a
+// listing one rename behind looks like, and taking it as confirmation would report
+// the object as being in place while it sits under a park name and the name is
+// empty. The rename is the confirmation, so it goes out whatever the listing says.
+func TestUpdateRestoresWithARenameEvenWhenTheListingStillShowsTheObject(t *testing.T) {
+	drive := &fakeDrive{
+		t:        t,
+		commitID: "5000000000000000001",
+		listing: `{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[` +
+			`{"id":"5000000000000000001","name":"movie.bin","size":10,"type":"1"}]}}`,
+	}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase))
+
+	old := &Object{fs: f, remote: "movie.bin", id: "5000000000000000001", size: 1, urlMu: new(sync.Mutex)}
+	require.NoError(t, old.Update(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content)))))
+
+	require.Len(t, drive.renames, 2, "parked aside, then brought back under the wanted name")
+	require.Equal(t, "5000000000000000001", drive.renames[1].id)
+	require.Equal(t, "movie.bin", drive.renames[1].name)
+	require.Equal(t, 0, sequencesCount(sequenceOf(drive), "GET /listFiles.action"),
+		"the object's place is confirmed by the rename, not by a listing that can be one rename behind")
+}
+
+// TestUpdateTreatsARefusedRestoreAsDoneWhenTheOriginalIsAlreadyThere: the drive can
+// refuse a rename onto the name an object already holds. Read back, the name holds
+// the parked object itself - which means it is where it belongs, so the update is
+// finished rather than failed.
+func TestUpdateTreatsARefusedRestoreAsDoneWhenTheOriginalIsAlreadyThere(t *testing.T) {
+	drive := &fakeDrive{
+		t:           t,
+		commitID:    "5000000000000000001",
+		failInstall: true, // the restore, which is this run's second rename, is refused
+		listing: `{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[` +
+			`{"id":"5000000000000000001","name":"movie.bin","size":10,"type":"1"}]}}`,
+	}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase))
+
+	old := &Object{fs: f, remote: "movie.bin", id: "5000000000000000001", size: 1, urlMu: new(sync.Mutex)}
+	require.NoError(t, old.Update(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content)))))
+
+	require.Len(t, drive.renames, 2, "parked aside, then asked to come back and refused")
+	require.Equal(t, "movie.bin", drive.renames[1].name)
+	require.Empty(t, drive.tasks, "nothing is deleted")
+}
+
 func putFor(t *testing.T, d *fakeDrive, part string) putCall {
 	t.Helper()
 	d.mu.Lock()
