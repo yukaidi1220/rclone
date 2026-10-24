@@ -2081,9 +2081,6 @@ func (f *Fs) holderAfterThePark(ctx context.Context, dirID, wireName, parkedID s
 		default:
 			lastErr = err
 		}
-		if ctx.Err() != nil {
-			break
-		}
 		if attempt < arrivalAttempts-1 {
 			time.Sleep(arrivalWait)
 		}
@@ -3921,9 +3918,10 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 			break
 		}
 	}
-	if start < 0 || end < start || end >= o.size {
-		// A window this code does not understand is left alone rather than
-		// measured wrongly.
+	if start != 0 || end != o.size-1 {
+		// A read that asked for part of the object is left as the host answered
+		// it. Continuing one is a different measurement from continuing the whole
+		// object, and nothing has measured the host cutting a ranged read.
 		return res.Body, nil
 	}
 	return &resumableBody{ctx: ctx, o: o, body: res.Body, start: start, end: end}, nil
@@ -4304,7 +4302,18 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 		// drive's root with it, twice.
 		dirID := f.fsRootID
 		if dirID == "" {
-			return fserrors.NoRetryError(errors.New("cloud189: this remote has not been opened yet, so its root is unknown"))
+			// The anchor is read when the remote is opened, and a listing that
+			// failed at that moment leaves it empty while every other path keeps
+			// working through the directory cache - measured 2026-10-25, the
+			// standard suite's teardown purge refused a root it had been using all
+			// run. Ask the cache again; a root that really does not resolve still
+			// leaves it empty and the purge still refuses.
+			if aerr := f.resolveAnchor(ctx); aerr == nil {
+				dirID = f.fsRootID
+			}
+		}
+		if dirID == "" {
+			return fserrors.NoRetryError(errors.New("cloud189: this remote's root could not be resolved, so a purge will not be sent"))
 		}
 		rows, err := f.rowsIn(ctx, dirID)
 		if err != nil {

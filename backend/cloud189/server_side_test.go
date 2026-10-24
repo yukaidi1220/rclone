@@ -528,6 +528,38 @@ func TestFailedMoveHandsTheArrivalNameBack(t *testing.T) {
 	require.Equal(t, taskMove, drive.tasks[0].taskType)
 }
 
+// TestFailedMoveRetriesTheRestoreWhenTheNameReadsFree: the first restore is refused
+// and the name then reads back empty - the refusal was about the rename itself, not
+// a collision - so it is tried once more rather than leaving the object that was on
+// the drive before the run parked for good.
+func TestFailedMoveRetriesTheRestoreWhenTheNameReadsFree(t *testing.T) {
+	drive := &fakeDrive{t: t, folders: map[string]string{"archive": archiveID}, failInstall: true}
+	f := newFakeFs(t, drive)
+	unrelated := fileJSON("7000000000000000028", "clip-01.mp4", archiveID)
+	fresh := fileJSON("900000000000000006", "clip-01.mp4", archiveID)
+	drive.listingFn = newListingScript(map[string][]string{
+		rootID: {emptyListing()},
+		archiveID: {
+			emptyListing(),                        // the create's verification
+			listingJSON([]string{unrelated}, nil), // the holder of the arrival name
+			listingJSON([]string{fresh}, nil),     // the proof: the task landed it
+			// the name rclone asked for is a directory
+			listingJSON(nil, []string{folderJSON("5000000000000000009", "sub", archiveID)}),
+			// and the arrival name reads back free, so a restore is worth trying again
+			emptyListing(),
+		},
+	}).fn
+
+	_, err := f.Move(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "archive/sub")
+	require.Error(t, err)
+
+	require.Len(t, drive.renames, 3, "parked, one refused restore, and the restore that was tried again")
+	require.Equal(t, "7000000000000000028", drive.renames[1].id)
+	require.Equal(t, "clip-01.mp4", drive.renames[1].name, "the restore the drive refused")
+	require.Equal(t, "7000000000000000028", drive.renames[2].id)
+	require.Equal(t, "clip-01.mp4", drive.renames[2].name, "and the one that put it back")
+}
+
 // TestFailedMoveLeavesAForeignHolderAlone: the name the move failed on is held by an
 // object this run did not put there, so it is not something this run may set aside.
 // The parked object stays parked and the log says so; what must not happen is the
@@ -1372,6 +1404,25 @@ func TestPurgeAnchorIsTheDirectoryTheWalkResolved(t *testing.T) {
 	require.EqualValues(t, 900000000000000043, *drive.tasks[0].infos[0].ParentID)
 	require.Equal(t, taskDelete, drive.tasks[1].taskType)
 	require.Equal(t, subID, drive.tasks[1].infos[0].FileID, "and the emptied directory itself goes with it")
+}
+
+// TestPurgeReadsItsAnchorAgainWhenTheOpenLeftItUnset: a listing that fails while
+// the remote is being opened leaves the purge anchor empty, while every other path
+// keeps working through the directory cache. Measured live 2026-10-25: the standard
+// suite's teardown purge refused a root it had been using all run. The anchor is
+// read again, and a root that really does not resolve is still refused.
+func TestPurgeReadsItsAnchorAgainWhenTheOpenLeftItUnset(t *testing.T) {
+	drive := &fakeDrive{t: t}
+	f := newFakeFs(t, drive)
+	root := listingJSON([]string{fileJSON("3000000000000000003", "a.bin", rootID)}, nil)
+	drive.listingFn = newListingScript(map[string][]string{rootID: {root}}).fn
+	f.fsRootID = ""
+
+	require.NoError(t, f.Purge(context.Background(), ""))
+	require.Equal(t, personalRoot, f.fsRootID, "the anchor was read back from the cache before the purge")
+	require.Len(t, drive.tasks, 1)
+	require.Equal(t, taskDelete, drive.tasks[0].taskType)
+	require.Equal(t, "3000000000000000003", drive.tasks[0].infos[0].FileID)
 }
 
 // TestPurgeRefusesWhenNothingWasResolved: a remote whose root the walk could not
