@@ -413,6 +413,12 @@ When the operation also renames, that object merely happened to own the name the
 drive lands arrivals under; it is given its name back and stays on the drive. Only
 the object holding the name rclone actually wanted is replaced.
 
+Handing that name back is not always one rename. Once the task has run it has put
+this run's object on the arrival's name, so a restore would collide, and the drive
+does not overwrite. The moved object is set aside first: both stay on the drive, the
+object that was there before the run keeps its name, and the log says which park
+name the moved bytes are left under.
+
 The window in which a name holds nothing is normally one rename. Two paths are
 wider and mean it. A replacement (`Update`) frees the name before the new bytes go
 up, so the name is empty for the whole transfer - which is the price of the drive
@@ -431,6 +437,10 @@ Nothing that was on the drive before the run is deleted on the strength of a tas
 counters. Before a move or a replacement removes the object it displaced, the
 destination is read back and has to be holding this run's object - by id, not by
 name, and not by what the commit or the task reported.
+
+A directory move is refused when the name it has to take is held by a file, before
+anything is parked; the directory cache only refuses a destination that is
+already a directory.
 
 A directory is never moved aside for a file, and a file is never replaced by a
 name that a directory holds: the delete that follows a successful task is
