@@ -3782,13 +3782,41 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if err := validateName(wireLeaf); err != nil {
 		return err
 	}
-	occupier := fileRow(o.id, wireLeaf, dirID)
-	res, err := o.fs.upload(ctx, in, dirID, wireLeaf, src.Size())
-	if err != nil {
+	// Park the object being replaced out of the name BEFORE the new bytes go up.
+	// The drive never overwrites: an upload onto a name already in use is stored
+	// beside it under a name the server invents (measured live 2026-10-24, when the
+	// new bytes came back as "file name(20261024123855).txt" while the old object
+	// kept the wanted name). Into a name this run has just freed, the upload
+	// arrives wearing the name it was asked for, so the swap needs no rename of the
+	// fresh object at all - and the name is not hit by park, rename and delete
+	// inside one second, which is what left the drive's listing too far behind for
+	// rclone to read the object back (measured the same day: the name was still
+	// unreadable seven seconds after a swap that had in fact completed).
+	parkedName := newParkName()
+	if err := o.fs.renameObject(ctx, o.id, false, parkedName); err != nil {
 		return err
 	}
-	if err := o.fs.installObject(ctx, dirID, wireLeaf, res, occupier, true); err != nil {
+	parked := *fileRow(o.id, parkedName, dirID)
+	res, err := o.fs.upload(ctx, in, dirID, wireLeaf, src.Size())
+	if err != nil {
+		// The bytes that were there are still on the drive, only under a name
+		// nobody asked for. Give them back before reporting the failure.
+		o.fs.undoClear(ctx, &parked, wireLeaf)
 		return err
+	}
+	// The drive deduplicates by digest, so new bytes equal to the parked object's
+	// own come back as THAT object: the same stored data, and the same file that
+	// was moved aside a moment ago. It is then the original being renamed back into
+	// place, never something to delete.
+	reused := res.id == o.id
+	if err := o.fs.installObject(ctx, dirID, wireLeaf, res, nil, !reused); err != nil {
+		// Either way the parked object is what was on the drive before this run, so
+		// it goes back: a fresh upload installObject took for itself is not it.
+		o.fs.undoClear(ctx, &parked, wireLeaf)
+		return err
+	}
+	if !reused {
+		o.fs.dropObject(ctx, &parked, "it was replaced by newer bytes")
 	}
 	o.id = res.id
 	o.size = src.Size()
