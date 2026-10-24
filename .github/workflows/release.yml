@@ -61,6 +61,13 @@ jobs:
       - name: Test backend/cloudreve with race detector
         run: go test -race -count=2 ./backend/cloudreve/
 
+      # cloud189 stages whole files to a temp file and uploads their parts
+      # concurrently, rotates one shared session under a mutex, and counts bytes
+      # sent into a quota model several copy threads read - the same shape that
+      # needs the race detector rather than a plain run.
+      - name: Test backend/cloud189 with race detector
+        run: go test -race -count=2 ./backend/cloud189/...
+
       # golangci-lint v2, matching .golangci.yml, at the release `make build_dep`
       # would fetch (latest), which is also the version upstream's own lint step
       # used. This is all the linting CI does here: it covers the backends this
@@ -70,7 +77,7 @@ jobs:
       - name: Install golangci-lint
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
       - name: Lint
-        run: golangci-lint run ./backend/cloudreve/... ./backend/wopan/... ./backend/yun139/... ./backend/s3/...
+        run: golangci-lint run ./backend/cloudreve/... ./backend/wopan/... ./backend/yun139/... ./backend/cloud189/... ./backend/s3/...
 
   prepare:
     if: startsWith(github.ref, 'refs/tags/')

@@ -1,0 +1,24 @@
+backend: cloud189
+name: China Telecom Cloud Drive (天翼云盘)
+tier: Tier 2
+maintainers: External
+features_score: 4
+integration_tests: N/A
+data_integrity: Hash
+performance: Medium
+adoption: Some use
+docs: Full
+security: Medium
+virtual: false
+remote: 'TestCloud189:'
+features:
+- About
+- CanHaveEmptyDirectories
+- Copy
+- DirMove
+- Move
+- OpenChunkWriter
+- Purge
+hashes:
+- MD5
+precision: 3153600000000000000

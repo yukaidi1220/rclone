@@ -763,3 +763,19 @@ backends:
    # The server shows new/deleted entries in the parent listing seconds to
    # tens of seconds late, so fstest's retry ladder needs headroom.
    listretries: 10
+ - backend:  "cloud189"
+   remote:   "TestCloud189:"
+   # bisync has never been run against this backend. Its modtime cases already
+   # self-skip (the harness skips any remote whose Precision is ModTimeNotSupported,
+   # which this backend reports), so what this line actually holds back is the
+   # nomodtime case - excluded until someone has run it, not because it is known
+   # to fail.
+   ignoretests:
+     - cmd/bisync
+   fastlist: false
+   extratime: 2.0
+   # Every write is an asynchronous task that is polled to completion, so the
+   # timing budget is not the transfer's. The listing is also measurably behind
+   # after a name has been mutated more than once inside a second (2026-10-24:
+   # still unreadable seven seconds on), which is longer than the default ladder.
+   listretries: 5
