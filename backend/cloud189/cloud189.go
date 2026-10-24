@@ -1651,7 +1651,17 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	if err != nil {
 		return err
 	}
-	if len(children) > 0 {
+	// A row this process just deleted can still be in the listing - the suite
+	// removes a directory's last file and removes the directory in the same
+	// breath - and its id is one nothing will answer to. Counting it would refuse
+	// a directory that is empty.
+	live := 0
+	for _, child := range children {
+		if !f.deleted.recent(child.ID.String()) {
+			live++
+		}
+	}
+	if live > 0 {
 		return fs.ErrorDirectoryNotEmpty
 	}
 	if err := f.deleteRows(ctx, []deleteTarget{{row: row}}); err != nil {
@@ -1702,7 +1712,13 @@ func (f *Fs) rmdirRoot(ctx context.Context, checkEmpty bool) error {
 		if err != nil {
 			return err
 		}
-		if len(children) > 0 {
+		live := 0
+		for _, child := range children {
+			if !f.deleted.recent(child.ID.String()) {
+				live++
+			}
+		}
+		if live > 0 {
 			return fs.ErrorDirectoryNotEmpty
 		}
 	}
