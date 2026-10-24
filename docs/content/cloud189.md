@@ -633,9 +633,13 @@ account appears to have.
   to be enforced against rclone's requests, so one unmeasured number cannot be
   read as a ceiling either.
 - Case-only differences in names were not probed - see [File names](#file-names).
-- `rclone test fstests` has not been run against a live remote for this backend.
-  The backend refuses empty files, which most integration suites use, and it
-  cannot set modification times.
+- The standard integration suite runs against this backend in a directory of its
+  own (`fstest/test_all/config.yaml`). It refuses empty files and cannot set
+  modification times, which the suite skips rather than fails.
+- One run left an `rclone-park-…` object behind although its delete task had
+  reported success (2026-10-25, for an object parked two seconds earlier), so
+  such an object can survive a replace. It is visible in listings and safe to
+  remove by hand.
 - A zero-byte file cannot be uploaded: whether a multipart session accepts one
   has never been measured, and the protocol's first move is to declare a size, so
   rclone says it cannot rather than guessing. The sibling drives in this fork
