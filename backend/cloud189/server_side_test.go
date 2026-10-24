@@ -132,58 +132,52 @@ func TestServerSideCopyOfAFileMovesNoBytes(t *testing.T) {
 	}
 }
 
-// TestServerSideCopyCarriesTheDestinationName pins the measured task shape: the
-// fileName a COPY carries is the name the copy has in the destination (measured
-// live 2026-10-24), so a copy that also renames is one task and no rename follows
-// it. The readback then looks for the destination's name in the destination
-// directory. (Excluding the source's id from that readback is a separate rule and
-// TestArrivedCopySkipsTheSource is its witness.)
-func TestServerSideCopyCarriesTheDestinationName(t *testing.T) {
-	drive := &fakeDrive{t: t}
+// TestServerSideCopyArrivesNamedAfterItsSource pins the measured task shape: the
+// drive ignores the fileName a COPY carries and lands the copy in the target
+// folder under its SOURCE's name (measured live 2026-10-24 - a copy of A.txt
+// asked to arrive as sub/B.txt came back as sub/A.txt). So the name this run
+// clears is the source's spelling, and the arrival is renamed by id into the name
+// rclone asked for.
+func TestServerSideCopyArrivesNamedAfterItsSource(t *testing.T) {
+	drive := &fakeDrive{t: t, folders: map[string]string{"archive": archiveID}}
 	f := newFakeFs(t, drive)
 	drive.listingFn = newListingScript(map[string][]string{
-		rootID: {
-			// the name to clear, and then the readback
-			listingJSON([]string{fileJSON("900000000000000006", "clip-01.mp4", rootID)}, nil),
-			listingJSON([]string{
-				fileJSON("900000000000000006", "clip-01.mp4", rootID),
-				fileJSON("7000000000000000007", "holiday.MP4", rootID),
-			}, nil),
+		rootID: {emptyListing()}, // the destination's parent, which is not there yet
+		archiveID: {
+			emptyListing(), // the create's verification
+			emptyListing(), // the name the copy is to arrive under is free
+			listingJSON([]string{fileJSON("7000000000000000007", "clip-01.mp4", archiveID)}, nil),
 		},
 	}).fn
 
-	obj, err := f.Copy(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "holiday.MP4")
+	obj, err := f.Copy(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "archive/holiday.MP4")
 	require.NoError(t, err)
 	require.Equal(t, "7000000000000000007", obj.(*Object).id, "the copy, not the source")
+	require.Equal(t, "archive/holiday.MP4", obj.Remote())
 
-	require.Empty(t, drive.renames, "the task named the copy itself; no rename follows")
 	require.Len(t, drive.tasks, 1, "the source is left alone by a copy")
 	require.Equal(t, taskCopy, drive.tasks[0].taskType)
-	require.Equal(t, "holiday.MP4", drive.tasks[0].infos[0].FileName, "the task names the destination")
+	require.Equal(t, "clip-01.mp4", drive.tasks[0].infos[0].FileName, "the task names what lands")
+	require.Len(t, drive.renames, 1)
+	require.Equal(t, "7000000000000000007", drive.renames[0].id)
+	require.Equal(t, "holiday.MP4", drive.renames[0].name, "and the arrival is renamed into the asked-for name")
 }
 
-// TestCopyOntoItsOwnNameParksNothing is the one case where the name the task
-// wants is held by the source itself: a copy of an object onto the name it
-// already carries. The drive is not asked to overwrite, and the source is not the
-// occupier standing in its own copy's way - parking it would move the original
-// aside, and the delete that follows a successful task would then remove it.
-func TestCopyOntoItsOwnNameParksNothing(t *testing.T) {
-	drive := &fakeDrive{t: t, taskStates: []int64{taskStateConflict}}
+// TestCopyWithinItsOwnDirectoryIsRefused: a copy whose destination directory is
+// the directory holding the source would have to arrive under a name its own
+// source is holding, and the drive refuses that instead of duplicating the object
+// (measured live 2026-10-24 as COPY failing with FileAlreadyExists, and on
+// 2026-10-23 as a task stopped in the state that waits for a client to answer).
+// rclone's answer for a server-side operation a backend cannot do is
+// fs.ErrorCantCopy, which lets the caller transfer the bytes instead. The drive
+// is not asked for anything.
+func TestCopyWithinItsOwnDirectoryIsRefused(t *testing.T) {
+	drive := &fakeDrive{t: t}
 	f := newFakeFs(t, drive)
-	source := fileJSON("900000000000000006", "clip-01.mp4", rootID)
-	drive.listingFn = newListingScript(map[string][]string{
-		rootID: {listingJSON([]string{source}, nil)},
-	}).fn
 
-	_, err := f.Copy(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "clip-01.mp4")
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "conflict")
-
-	require.Empty(t, drive.renames, "the source is not moved aside for its own copy")
-	require.Len(t, drive.tasks, 1, "the task that stopped at the conflict")
-	for _, task := range drive.tasks {
-		require.NotEqual(t, taskDelete, task.taskType, "and the source is never deleted")
-	}
+	_, err := f.Copy(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "other.txt")
+	require.ErrorIs(t, err, fs.ErrorCantCopy)
+	require.Empty(t, sequenceOf(drive), "and the drive is not asked")
 }
 
 // TestServerSideCopyParksTheOccupierAndDeletesIt is the collision case: the name
@@ -330,7 +324,8 @@ func TestDestructiveOperationsRefuseAnUnknownFamilyRoot(t *testing.T) {
 // account in the same space share the session by token, so the move runs between
 // them - which is what `rclone movedto` across two configured roots of one drive
 // makes. The task carries the destination's name, so the directory lands where
-// rclone says it is and nothing is renamed after it.
+// rclone says it is, so the directory arrives under the name it moved with and is
+// renamed here.
 func TestDirMoveBetweenTwoRemotesOfOneSpaceRuns(t *testing.T) {
 	const subID = "900000000000000046"
 	drive := &fakeDrive{t: t, folders: map[string]string{"archive": archiveID}}
@@ -340,11 +335,11 @@ func TestDirMoveBetweenTwoRemotesOfOneSpaceRuns(t *testing.T) {
 	dst.opt.Enc = encoder.Standard // different on purpose
 	subFolder := listingJSON(nil, []string{folderJSON(subID, "sub", rootID)})
 	script := newListingScript(map[string][]string{
-		// The root answers the source's lookup of "sub"; every walk of
-		// "archive" is empty until the last one, which is the readback of the
-		// name the task was told to give the directory.
+		// The root answers the source's lookup of "sub"; the walks of "archive"
+		// are the create's verification, the check that the destination does not
+		// exist, the name the arrival will wear, and the readback that finds it.
 		rootID:    {subFolder, subFolder, subFolder, subFolder},
-		archiveID: {emptyListing(), emptyListing(), emptyListing(), listingJSON(nil, []string{folderJSON(subID, "moved", archiveID)})},
+		archiveID: {emptyListing(), emptyListing(), emptyListing(), listingJSON(nil, []string{folderJSON(subID, "sub", archiveID)})},
 	})
 	drive.listingFn = script.fn
 
@@ -352,8 +347,10 @@ func TestDirMoveBetweenTwoRemotesOfOneSpaceRuns(t *testing.T) {
 	require.Len(t, drive.tasks, 1)
 	require.Equal(t, taskMove, drive.tasks[0].taskType)
 	require.Equal(t, subID, drive.tasks[0].infos[0].FileID)
-	require.Equal(t, "moved", drive.tasks[0].infos[0].FileName, "the task names the directory it moves")
-	require.Empty(t, drive.renames, "and nothing needs renaming after it")
+	require.Equal(t, "sub", drive.tasks[0].infos[0].FileName, "the task names what lands, which is the source")
+	require.Len(t, drive.renames, 1, "and the arrival is renamed into the asked-for name")
+	require.Equal(t, subID, drive.renames[0].id)
+	require.Equal(t, "moved", drive.renames[0].name)
 }
 
 // TestDirMoveRenameInsideItsOwnParentIsNotATask is the case a task must never be
@@ -382,19 +379,19 @@ func TestDirMoveRenameInsideItsOwnParentIsNotATask(t *testing.T) {
 	require.False(t, cached, "the old path leaves the cache")
 }
 
-// TestDirMoveKeepsTheOccupierUntilTheDirectoryArrives is the reason a directory
-// move reads its destination back: the name a task gives a DIRECTORY is inferred
-// from the measurement made on a file, and if the drive kept the source name
-// instead, the object parked out of the destination's way would have been deleted
-// for a move that did not happen. Nothing parked goes off the drive until the
-// moved directory is standing in the name.
+// TestDirMoveKeepsTheOccupierUntilTheDirectoryArrives is why a directory move
+// reads its destination back before it deletes anything: the name that has to be
+// free is the one the arrival will wear, which is the source's, and whoever held
+// it was moved aside on the strength of a task that has only been reported done.
+// If the directory is not standing there, the parked object is handed its name
+// back and nothing that was already on the drive is removed.
 func TestDirMoveKeepsTheOccupierUntilTheDirectoryArrives(t *testing.T) {
 	const subID = "900000000000000048"
 	drive := &fakeDrive{t: t, folders: map[string]string{"archive": archiveID}}
 	f := newFakeFs(t, drive)
-	// archive holds a file named "moved", which is parked so the task can take
-	// the name; the destination is then read back and answers nothing, because
-	// the directory did not arrive under that name.
+	// archive holds a file named "sub", which is parked so the directory can
+	// arrive under that name; the destination is then read back and answers
+	// nothing, because the directory did not arrive.
 	drive.listingFn = newListingScript(map[string][]string{
 		// the first root walk answers the destination parent lookup (no "archive"
 		// yet), the rest carry the source's "sub"
@@ -404,7 +401,7 @@ func TestDirMoveKeepsTheOccupierUntilTheDirectoryArrives(t *testing.T) {
 		archiveID: {
 			emptyListing(), // the create's verification
 			emptyListing(), // the check that the destination does not exist yet
-			listingJSON([]string{fileJSON("6000000000000000006", "moved", archiveID)}, nil), // the occupier
+			listingJSON([]string{fileJSON("6000000000000000006", "sub", archiveID)}, nil), // the occupier
 			emptyListing(), // the readback, and the two waited out
 			emptyListing(),
 			emptyListing(),
@@ -417,7 +414,7 @@ func TestDirMoveKeepsTheOccupierUntilTheDirectoryArrives(t *testing.T) {
 
 	require.Len(t, drive.renames, 2, "parked, then given its name back")
 	require.Equal(t, "6000000000000000006", drive.renames[1].id)
-	require.Equal(t, "moved", drive.renames[1].name)
+	require.Equal(t, "sub", drive.renames[1].name)
 	require.Len(t, drive.tasks, 1, "the move, and nothing else")
 	require.Equal(t, taskMove, drive.tasks[0].taskType)
 }
@@ -458,12 +455,13 @@ func TestDirMoveBetweenTwoDifferentFamiliesIsRefused(t *testing.T) {
 	require.Empty(t, sequenceOf(drive), "and the drive is not asked")
 }
 
-// TestCopyNamesTheTargetAsTheDestinationRemoteStoresIt is the case of two
-// remotes of one account carrying different encoding options. The name a COPY
-// task carries is the name the copy has in the destination (measured live
-// 2026-10-24), so it is the destination's spelling that travels: the name this
-// run clears and the object it reads back are both in those bytes.
-func TestCopyNamesTheTargetAsTheDestinationRemoteStoresIt(t *testing.T) {
+// TestCopyNamesTheSourceAsTheSourceRemoteStoresIt is the case of two remotes of
+// one account carrying different encoding options. The name a COPY task carries
+// is the name the drive lands the copy under - its source's own bytes - so the
+// name this run clears and the object it reads back are both spelled by the
+// source remote, while the destination's spelling belongs only to the rename that
+// follows the task.
+func TestCopyNamesTheSourceAsTheSourceRemoteStoresIt(t *testing.T) {
 	drive := &fakeDrive{t: t}
 	src := newFakeFs(t, drive)
 	dst := newFakeFs(t, drive)
@@ -477,22 +475,26 @@ func TestCopyNamesTheTargetAsTheDestinationRemoteStoresIt(t *testing.T) {
 
 	drive.listingFn = newListingScript(map[string][]string{
 		famRoot: {
-			// the name to clear: the source's own spelling, which this name is not
-			listingJSON([]string{fileJSON("900000000000000006", "a＜b＞.mp4", famRoot)}, nil),
-			// and the readback, under the destination's spelling
-			listingJSON([]string{fileJSON("900000000000000011", "a<b>.mp4", famRoot)}, nil),
+			// the name the arrival will wear is free here
+			emptyListing(),
+			// and the readback finds the copy under the SOURCE's spelling
+			listingJSON([]string{fileJSON("900000000000000011", "a＜b＞.mp4", famRoot)}, nil),
+			// the destination's own spelling, which nothing holds
+			emptyListing(),
 		},
 	}).fn
 
 	obj, err := dst.Copy(context.Background(), srcObject(src, "a<b>.mp4", "900000000000000006"), "a<b>.mp4")
-	require.NoError(t, err, "the copy is found in the destination under the name the task asked for")
+	require.NoError(t, err, "the copy is found in the destination under the name the drive gave it")
 	require.Equal(t, "900000000000000011", obj.(*Object).id)
 
 	require.Len(t, drive.tasks, 1)
 	require.Equal(t, taskCopy, drive.tasks[0].taskType)
-	require.Equal(t, "a<b>.mp4", drive.tasks[0].infos[0].FileName,
-		"the task names the copy the way the destination stores it")
-	require.Empty(t, drive.renames, "nothing follows the task: it already carries the name")
+	require.Equal(t, "a＜b＞.mp4", drive.tasks[0].infos[0].FileName,
+		"the task names the source the way the source remote stores it, not the way the destination would")
+	require.Len(t, drive.renames, 1)
+	require.Equal(t, "a<b>.mp4", drive.renames[0].name,
+		"and the requested name is spelled with the destination's own encoding")
 }
 
 // TestFamilyToFamilyCopyIsRefused: that direction was never captured, so nothing
@@ -537,10 +539,12 @@ func TestServerSideMoveKeepsTheId(t *testing.T) {
 
 	require.Len(t, drive.tasks, 1)
 	require.Equal(t, taskMove, drive.tasks[0].taskType)
-	require.Equal(t, "moved.mp4", drive.tasks[0].infos[0].FileName,
-		"the task names the object where it lands, so the move and the rename are one step")
+	require.Equal(t, "clip-01.mp4", drive.tasks[0].infos[0].FileName,
+		"the task names what lands, which is the name the object already had")
 	require.Contains(t, drive.createBodies[0], "targetFolderId="+archiveID)
-	require.Empty(t, drive.renames, "the task gave the object its destination name, so nothing was renamed")
+	require.Len(t, drive.renames, 1, "and the arrival is renamed into the name rclone asked for")
+	require.Equal(t, "moved.mp4", drive.renames[0].name)
+	require.Equal(t, "900000000000000006", drive.renames[0].id, "the same object, moved and renamed")
 	require.Len(t, drive.tasks, 1, "and nothing was deleted")
 }
 
@@ -631,10 +635,9 @@ func TestDirMoveIsOneRecursiveTask(t *testing.T) {
 		// directory (an archive walk), and the destination-side walks all land
 		// on archiveID; the root queue answers the destination-parent lookup
 		// first and the source lookup after it. The last archive walk is the
-		// readback that has to find the moved directory before anything parked
-		// is deleted.
+		// arrival, still under the name the directory moved with.
 		rootID:    {emptyListing(), subFolder, subFolder, subFolder},
-		archiveID: {emptyListing(), emptyListing(), emptyListing(), listingJSON(nil, []string{folderJSON("900000000000000007", "moved", archiveID)})},
+		archiveID: {emptyListing(), emptyListing(), emptyListing(), listingJSON(nil, []string{folderJSON("900000000000000007", "sub", archiveID)})},
 	})
 	drive.listingFn = script.fn
 
@@ -644,6 +647,8 @@ func TestDirMoveIsOneRecursiveTask(t *testing.T) {
 	require.Equal(t, taskMove, drive.tasks[0].taskType)
 	require.Equal(t, "900000000000000007", drive.tasks[0].infos[0].FileID)
 	require.EqualValues(t, 1, drive.tasks[0].infos[0].IsFolder, "a directory moves as one object")
+	require.Len(t, drive.renames, 1, "and the arrival is renamed into the asked-for name")
+	require.Equal(t, "moved", drive.renames[0].name)
 	require.Contains(t, drive.createBodies[0], "targetFolderId="+archiveID)
 	require.Empty(t, drive.puts, "no bytes moved")
 	_, cached := f.dirCache.Get("sub")
@@ -688,24 +693,29 @@ func TestCrossSpaceDirMoveIsRefused(t *testing.T) {
 // is a failure said out loud, because answering it needs the conflict endpoints,
 // which are captured but not implemented.
 func TestTaskStateConflictIsReportedNotAnswered(t *testing.T) {
-	drive := &fakeDrive{t: t, taskStates: []int64{taskStateConflict}}
+	drive := &fakeDrive{t: t, folders: map[string]string{"archive": archiveID}, taskStates: []int64{taskStateConflict}}
 	f := newFakeFs(t, drive)
-	source := fileJSON("900000000000000006", "clip-01.mp4", rootID)
 	drive.listingFn = newListingScript(map[string][]string{
-		rootID: {listingJSON([]string{source}, nil)},
+		rootID:    {emptyListing()},
+		archiveID: {emptyListing(), emptyListing()},
 	}).fn
 
-	// Copy still runs a task for this shape; the same-directory Move is a
-	// rename and never reaches the task engine.
-	_, err := f.Copy(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "clip-01.mp4")
+	// A cross-directory copy is the shape that still runs a task here: the
+	// same-directory Copy is refused before the drive is asked, and the
+	// same-directory Move is a rename that never reaches the task engine.
+	_, err := f.Copy(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "archive/clip-01.mp4")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "conflict")
 	require.True(t, fserrors.IsNoRetryError(err))
 	require.Empty(t, drive.renames, "nothing was renamed on the way in")
 }
 
-// TestArrivedCopySkipsTheSource is the readback rule that keeps a same-directory
-// copy from being mistaken for its own source.
+// TestArrivedCopySkipsTheSource pins the helper's rule directly: of the rows
+// carrying the name a copy arrived under, the one that is the source is not the
+// copy, and neither is a row this process has just deleted. Copy refuses a
+// same-directory copy before the task, so the listing that would need this is one
+// the drive should not produce - which is exactly why the answer must not be the
+// original.
 func TestArrivedCopySkipsTheSource(t *testing.T) {
 	drive := &fakeDrive{t: t}
 	f := newFakeFs(t, drive)
@@ -782,7 +792,8 @@ func TestFailedMovePutsTheParkedNameBack(t *testing.T) {
 		rootID: {emptyListing()},
 		archiveID: {
 			emptyListing(), // the create's verification
-			listingJSON([]string{fileJSON("6000000000000000006", "renamed.mp4", archiveID)}, nil),
+			// the arrival would wear the source's name here, and that name is held
+			listingJSON([]string{fileJSON("6000000000000000006", "clip-01.mp4", archiveID)}, nil),
 		},
 	}).fn
 
@@ -796,24 +807,28 @@ func TestFailedMovePutsTheParkedNameBack(t *testing.T) {
 	require.Equal(t, "6000000000000000006", drive.renames[0].id)
 	require.True(t, strings.HasPrefix(drive.renames[0].name, "rclone-park-"))
 	require.Equal(t, "6000000000000000006", drive.renames[1].id)
-	require.Equal(t, "renamed.mp4", drive.renames[1].name,
-		"the name it was cleared from, not the name the mover still carries")
+	require.Equal(t, "clip-01.mp4", drive.renames[1].name,
+		"the name it was cleared from, which is the name the arrival would have worn")
 	for _, task := range drive.tasks {
 		require.NotEqual(t, taskDelete, task.taskType, "nothing parked is deleted when the move did not happen")
 	}
 }
 
-// TestCopyRefusesToTakeADirectoryNameAndStartsNoTask: the name a directory holds
-// is never cleared for a file, so the run stops before the drive is asked for a
-// task at all - and there is consequently nothing to take back.
-func TestCopyRefusesToTakeADirectoryNameAndStartsNoTask(t *testing.T) {
+// TestCopyRefusesToTakeADirectoryNameAndRemovesWhatItMade: the copy did land, so
+// the object it made is the one thing this run created, and the rule is that a
+// failure handler takes back what it made and never touches what was already on
+// the drive. The directory holding the wanted name is neither listed nor moved.
+func TestCopyRefusesToTakeADirectoryNameAndRemovesWhatItMade(t *testing.T) {
 	drive := &fakeDrive{t: t, folders: map[string]string{"archive": archiveID}}
 	f := newFakeFs(t, drive)
 	script := newListingScript(map[string][]string{
 		rootID: {emptyListing()},
 		archiveID: {
 			emptyListing(), // the create's verification
-			// the holder of the name: a directory, which nothing is moved aside for
+			emptyListing(), // the name the arrival will wear is free
+			// the arrival, under the source's name
+			listingJSON([]string{fileJSON("900000000000000011", "clip-01.mp4", archiveID)}, nil),
+			// the holder of the wanted name: a directory, which nothing is moved aside for
 			listingJSON(nil, []string{folderJSON("5000000000000000005", "holiday.MP4", archiveID)}),
 		},
 	})
@@ -824,8 +839,11 @@ func TestCopyRefusesToTakeADirectoryNameAndStartsNoTask(t *testing.T) {
 	require.Contains(t, err.Error(), "is a directory on the drive")
 	require.True(t, fserrors.IsNoRetryError(err))
 
-	require.Empty(t, drive.tasks, "no task is started, so nothing has to be taken back")
-	require.Empty(t, drive.renames, "and the directory is never moved aside")
+	require.Equal(t, []string{taskCopy, taskDelete}, []string{drive.tasks[0].taskType, drive.tasks[1].taskType},
+		"the copy is taken back, the directory is left alone")
+	require.Equal(t, "900000000000000011", drive.tasks[1].infos[0].FileID, "what is deleted is the fresh copy")
+	require.Zero(t, script.walksOf("5000000000000000005"), "the directory standing in the way is never listed")
+	require.Empty(t, drive.renames)
 }
 
 // TestPurgeOfADirectoryIsOneRecursiveTask is the whole point of the delete task:
@@ -1080,6 +1098,47 @@ func TestNewFsOnAFilePathReturnsErrorIsFile(t *testing.T) {
 	require.Equal(t, deepID, f.fsRootID, "and the purge anchor is that directory")
 }
 
+// TestNewFsOnAMissingDirectoryKeepsItsOwnPath is the other half of the same
+// walk: the parent resolved, the leaf is neither a file nor a directory, so the
+// path names nothing. The remote keeps that path and the cache stays the one
+// seeded with the space root. Had the parent-seeded cache been left in place -
+// which is what this path used to do - the Fs would have claimed
+// "sub/missing" while resolving every operation against "sub": a listing there
+// would read the parent's contents, and a write would make its folders one level
+// above where the user pointed.
+func TestNewFsOnAMissingDirectoryKeepsItsOwnPath(t *testing.T) {
+	const (
+		subID2    = "900000000000000049"
+		missingID = "900000000000000050"
+		innerID   = "900000000000000051"
+	)
+	drive := &fakeDrive{
+		t:       t,
+		folders: map[string]string{"missing": missingID, "inner": innerID},
+		listings: map[string]string{
+			rootID: listingJSON(nil, []string{folderJSON(subID2, "sub", rootID)}),
+			subID2: listingJSON([]string{fileJSON("300000000000000012", "sibling.txt", subID2)}, nil),
+		},
+	}
+	f := newFakeFs(t, drive)
+	f.root = "sub/missing"
+	f.dirCache = dircache.New(f.root, rootID, f)
+
+	require.NoError(t, f.resolveRoot(context.Background()), "a path naming nothing is not a failure: a write may still make it")
+	require.Equal(t, "sub/missing", f.root, "the remote keeps the path it was given")
+	require.Empty(t, f.fsRootID, "and the anchor stays empty, so whole-directory operations refuse")
+
+	_, err := f.List(context.Background(), "")
+	require.ErrorIs(t, err, fs.ErrorDirNotFound, "listing the missing directory says so, it does not read its parent")
+
+	require.NoError(t, f.Mkdir(context.Background(), "inner"))
+	require.Equal(t, []string{"missing", "inner"}, drive.mkdirs,
+		"the missing chain is made inside the path the user named, not beside it")
+	id, cerr := f.dirCache.FindDir(context.Background(), "inner", false)
+	require.NoError(t, cerr)
+	require.Equal(t, innerID, id, "and it resolves inside the directory that was missing")
+}
+
 // TestRmdirRefusesANonEmptyDirectory is the difference between Rmdir and Purge:
 // the drive cannot remove a directory that has children without taking the
 // children, so the listing is checked and the call is refused.
@@ -1186,19 +1245,22 @@ func TestNamesReachTheDriveEncodedOnce(t *testing.T) {
 			rootID: {emptyListing()},
 			archiveID: {
 				emptyListing(), // the create's verification
-				// the holder of the stored spelling, seen while clearing the name
+				emptyListing(), // the name the arrival will wear is free
+				// the arrival, under the source's own spelling
+				listingJSON([]string{fileJSON("900000000000000011", "clip-01.mp4", archiveID)}, nil),
+				// the holder of the wanted name, spelled the way the drive stores it
 				listingJSON([]string{fileJSON("6000000000000000006", "a：b", archiveID)}, nil),
-				// the readback: the copy, already under that spelling
-				listingJSON([]string{fileJSON("900000000000000011", "a：b", archiveID)}, nil),
 			},
 		}).fn
 
 		_, err := f.Copy(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "archive/a:b")
 		require.NoError(t, err)
 
-		require.Len(t, drive.renames, 1)
+		require.Len(t, drive.renames, 2)
 		require.Equal(t, "6000000000000000006", drive.renames[0].id, "the holder of the encoded name was found")
 		require.True(t, strings.HasPrefix(drive.renames[0].name, "rclone-park-"))
+		require.Equal(t, "900000000000000011", drive.renames[1].id)
+		require.Equal(t, "a：b", drive.renames[1].name, "and the copy was given the stored spelling of it")
 
 		require.Len(t, drive.tasks, 2)
 		require.Equal(t, taskDelete, drive.tasks[1].taskType)
