@@ -528,6 +528,38 @@ func TestFailedMoveHandsTheArrivalNameBack(t *testing.T) {
 	require.Equal(t, taskMove, drive.tasks[0].taskType)
 }
 
+// TestFailedMoveLeavesAForeignHolderAlone: the name the move failed on is held by an
+// object this run did not put there, so it is not something this run may set aside.
+// The parked object stays parked and the log says so; what must not happen is the
+// foreign object being renamed out of the way to make room.
+func TestFailedMoveLeavesAForeignHolderAlone(t *testing.T) {
+	drive := &fakeDrive{t: t, folders: map[string]string{"archive": archiveID}, failInstall: true}
+	f := newFakeFs(t, drive)
+	unrelated := fileJSON("7000000000000000026", "clip-01.mp4", archiveID)
+	fresh := fileJSON("900000000000000006", "clip-01.mp4", archiveID)
+	foreign := fileJSON("7000000000000000027", "clip-01.mp4", archiveID)
+	drive.listingFn = newListingScript(map[string][]string{
+		rootID: {emptyListing()},
+		archiveID: {
+			emptyListing(),                        // the create's verification
+			listingJSON([]string{unrelated}, nil), // the holder of the arrival name
+			listingJSON([]string{fresh}, nil),     // the proof: the task landed it
+			// the name rclone asked for is a directory
+			listingJSON(nil, []string{folderJSON("5000000000000000008", "sub", archiveID)}),
+			// and the arrival name is now held by an object this run did not write
+			listingJSON([]string{foreign}, nil),
+		},
+	}).fn
+
+	_, err := f.Move(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "archive/sub")
+	require.Error(t, err)
+
+	require.Len(t, drive.renames, 2, "the holder parked and one refused restore; the foreign object is left alone")
+	require.Equal(t, "7000000000000000026", drive.renames[0].id)
+	require.Equal(t, "7000000000000000026", drive.renames[1].id)
+	require.Equal(t, "clip-01.mp4", drive.renames[1].name)
+}
+
 // TestArrivalWaitOutlastsAStaleRow: the first read after the task answers with the
 // row the park moved away, because the listing is one rename behind. That row is not
 // this run's object, and treating it as an answer would report a move that worked as
@@ -629,7 +661,8 @@ func TestDirMoveRefusesAFileAtTheDestinationName(t *testing.T) {
 	err := f.DirMove(context.Background(), f, "sub", "archive/renamed")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "is a file on the drive")
-	require.True(t, fserrors.IsNoRetryError(err))
+	require.False(t, fserrors.IsNoRetryError(err),
+		"a row another remote deleted can still be in this one's listing, so the refusal is worth a retry")
 
 	require.Empty(t, drive.tasks, "nothing is sent")
 	require.Empty(t, drive.renames, "and nothing is parked")
