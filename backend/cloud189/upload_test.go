@@ -874,6 +874,29 @@ func TestUpdateRestoresWithARenameEvenWhenTheListingStillShowsTheObject(t *testi
 		"the object's place is confirmed by the rename, not by a listing that can be one rename behind")
 }
 
+// TestUpdatePutsTheOriginalBackWhenTheConfirmFails: the dedupe branch has no fresh
+// object of its own, so a failed confirmation must not be the end of it - the
+// original would be left under a park name with the wanted name empty.
+func TestUpdatePutsTheOriginalBackWhenTheConfirmFails(t *testing.T) {
+	drive := &fakeDrive{
+		t:           t,
+		commitID:    "5000000000000000001",
+		failInstall: true, // the restore, this run's second rename, is refused
+		listing: `{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[` +
+			`{"id":"6000000000000000099","name":"movie.bin","size":10,"type":"1"}]}}`,
+	}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase))
+
+	old := &Object{fs: f, remote: "movie.bin", id: "5000000000000000001", size: 1, urlMu: new(sync.Mutex)}
+	require.Error(t, old.Update(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content)))))
+
+	require.Len(t, drive.renames, 3, "parked, a refused restore, and the put-back the failure path owes")
+	require.Equal(t, "5000000000000000001", drive.renames[1].id, "the restore the drive refused")
+	require.Equal(t, "5000000000000000001", drive.renames[2].id, "and the original asked for its name again")
+	require.Equal(t, "movie.bin", drive.renames[2].name)
+}
+
 // TestUpdateTreatsARefusedRestoreAsDoneWhenTheOriginalIsAlreadyThere: the drive can
 // refuse a rename onto the name an object already holds. Read back, the name holds
 // the parked object itself - which means it is where it belongs, so the update is
