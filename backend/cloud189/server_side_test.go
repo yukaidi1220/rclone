@@ -1406,6 +1406,29 @@ func TestPurgeAnchorIsTheDirectoryTheWalkResolved(t *testing.T) {
 	require.Equal(t, subID, drive.tasks[1].infos[0].FileID, "and the emptied directory itself goes with it")
 }
 
+// TestRmdirOfADirectoryWhoseLastFileWasJustDeleted: the listing keeps answering
+// the file this process just deleted, and its id is one nothing will answer to.
+// Counting it refuses a directory that is empty - measured live 2026-10-25, the
+// standard suite removes a directory's last file and the directory in the same
+// breath, and was told the directory was not empty.
+func TestRmdirOfADirectoryWhoseLastFileWasJustDeleted(t *testing.T) {
+	const subID = "900000000000000046"
+	drive := &fakeDrive{t: t}
+	f := newFakeFs(t, drive)
+	gone := fileJSON("3000000000000000077", "a.bin", subID)
+	folder := folderJSON(subID, "sub", rootID)
+	drive.listingFn = newListingScript(map[string][]string{
+		rootID: {listingJSON(nil, []string{folder})}, // the lookup of "sub"
+		subID:  {listingJSON([]string{gone}, nil)},   // its children, still listing the deleted file
+	}).fn
+	f.deleted.remember("3000000000000000077")
+
+	require.NoError(t, f.Rmdir(context.Background(), "sub"))
+	require.Len(t, drive.tasks, 1, "the directory itself goes, and nothing else")
+	require.Equal(t, subID, drive.tasks[0].infos[0].FileID)
+	require.EqualValues(t, 1, drive.tasks[0].infos[0].IsFolder)
+}
+
 // TestPurgeReadsItsAnchorAgainWhenTheOpenLeftItUnset: a listing that fails while
 // the remote is being opened leaves the purge anchor empty, while every other path
 // keeps working through the directory cache. Measured live 2026-10-25: the standard
