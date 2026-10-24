@@ -4167,6 +4167,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	// listing, not from what the upload reported.
 	if res.id == o.id {
 		if err := o.fs.restoreOrConfirm(ctx, dirID, wireLeaf, &parked); err != nil {
+			// The object is not confirmed back under its name, and this branch has
+			// no fresh object of its own to leave there: put the original back
+			// rather than let it sit under a park name with the name empty.
+			o.fs.undoClear(ctx, &parked, wireLeaf)
 			return err
 		}
 		o.size = src.Size()
