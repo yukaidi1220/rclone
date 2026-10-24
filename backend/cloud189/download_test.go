@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/rclone/rclone/fs"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -86,6 +88,27 @@ func TestADownloadCutShortIsContinued(t *testing.T) {
 	require.Empty(t, drive.readRanges[0])
 	require.Equal(t, "bytes=4-9", drive.readRanges[1], "asked for the rest from the byte already delivered")
 	require.Equal(t, 2, drive.downloadHits, "on a link of its own")
+}
+
+// TestARangedDownloadIsContinuedWithinItsWindow: a read that asks for part of an
+// object is measured and resumed as that part - the whole object's length is not
+// what it is waiting for, and comparing against it turns every ranged read into a
+// failure.
+func TestARangedDownloadIsContinuedWithinItsWindow(t *testing.T) {
+	drive := &fakeDrive{t: t, readBody: []byte("0123456789"), readCut: []int64{2}}
+	f := newFakeFs(t, drive)
+	obj := srcObject(f, "clip-01.mp4", "900000000000000004")
+	obj.size = 10
+
+	rc, err := obj.Open(context.Background(), &fs.RangeOption{Start: 4, End: -1})
+	require.NoError(t, err)
+	got, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+	require.Equal(t, []byte("456789"), got, "the read stayed inside the window it asked for")
+
+	require.Equal(t, "bytes=4-9", drive.readRanges[0])
+	require.Equal(t, "bytes=6-9", drive.readRanges[1], "continued from where it stopped, not from the start")
 }
 
 // TestADownloadCutEveryTimeIsReported: a host that cuts every attempt is reported

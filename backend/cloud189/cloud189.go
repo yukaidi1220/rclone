@@ -3910,7 +3910,23 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		// nothing to continue from either.
 		return res.Body, nil
 	}
-	return &resumableBody{ctx: ctx, o: o, body: res.Body}, nil
+	// A read may have asked for part of the object, and that part is what has to
+	// be measured and resumed - not the whole object. FixRangeOption has already
+	// turned every way of asking (a range, a seek, a suffix) into one pair of
+	// offsets.
+	start, end := int64(0), o.size-1
+	for _, opt := range options {
+		if r, ok := opt.(*fs.RangeOption); ok {
+			start, end = r.Start, r.End
+			break
+		}
+	}
+	if start < 0 || end < start || end >= o.size {
+		// A window this code does not understand is left alone rather than
+		// measured wrongly.
+		return res.Body, nil
+	}
+	return &resumableBody{ctx: ctx, o: o, body: res.Body, start: start, end: end}, nil
 }
 
 // maxResumes bounds how many times one download may reconnect. Each one is a fresh
@@ -3931,10 +3947,15 @@ type resumableBody struct {
 	ctx     context.Context
 	o       *Object
 	body    io.ReadCloser
-	offset  int64
+	start   int64 // the first byte this read asked for
+	end     int64 // the last one, inclusive
+	offset  int64 // bytes handed to the caller so far
 	resumes int
 	done    bool
 }
+
+// want is how many bytes this read asked for.
+func (b *resumableBody) want() int64 { return b.end - b.start + 1 }
 
 func (b *resumableBody) Read(p []byte) (int, error) {
 	if b.done {
@@ -3945,15 +3966,15 @@ func (b *resumableBody) Read(p []byte) (int, error) {
 	if err == nil {
 		return n, nil
 	}
-	if errors.Is(err, io.EOF) && b.offset < b.o.size {
-		// The body ended before the last byte the drive announced: this is a cut,
-		// not the end of the object.
+	if errors.Is(err, io.EOF) && b.offset < b.want() {
+		// The body ended before the last byte this read asked for: this is a cut,
+		// not the end of it.
 		err = io.ErrUnexpectedEOF
 	}
-	if !errors.Is(err, io.ErrUnexpectedEOF) || b.offset >= b.o.size || b.resumes >= maxResumes {
+	if !errors.Is(err, io.ErrUnexpectedEOF) || b.offset >= b.want() || b.resumes >= maxResumes {
 		b.done = true
 		if errors.Is(err, io.ErrUnexpectedEOF) {
-			return n, fmt.Errorf("cloud189: the download stopped at %d of %d bytes after %d reconnects: %w", b.offset, b.o.size, b.resumes, err)
+			return n, fmt.Errorf("cloud189: the download stopped at %d of %d bytes after %d reconnects: %w", b.offset, b.want(), b.resumes, err)
 		}
 		return n, err
 	}
@@ -3976,13 +3997,14 @@ func (b *resumableBody) reopen() error {
 	if err != nil {
 		return err
 	}
-	res, err := b.o.get(b.ctx, link, &fs.RangeOption{Start: b.offset, End: -1})
+	from := b.start + b.offset
+	res, err := b.o.get(b.ctx, link, &fs.RangeOption{Start: from, End: b.end})
 	if err != nil {
 		return err
 	}
 	switch res.StatusCode {
 	case http.StatusPartialContent:
-		if got := res.Header.Get("Content-Range"); got != "" && !strings.HasPrefix(got, fmt.Sprintf("bytes %d-", b.offset)) {
+		if got := res.Header.Get("Content-Range"); got != "" && !strings.HasPrefix(got, fmt.Sprintf("bytes %d-", from)) {
 			_ = res.Body.Close()
 			return fmt.Errorf("the host answered a range that does not start where the transfer stopped: %s", truncate(got, 60))
 		}
@@ -3992,7 +4014,7 @@ func (b *resumableBody) reopen() error {
 	case http.StatusOK:
 		// The host ignored the range and started again from the beginning: drop
 		// what has already been handed to the caller.
-		if _, err := io.CopyN(io.Discard, res.Body, b.offset); err != nil {
+		if _, err := io.CopyN(io.Discard, res.Body, from); err != nil {
 			_ = res.Body.Close()
 			return fmt.Errorf("the host answered the whole object and it ended before the byte already read: %w", err)
 		}
