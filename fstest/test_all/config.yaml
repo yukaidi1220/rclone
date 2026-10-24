@@ -765,13 +765,17 @@ backends:
    listretries: 10
  - backend:  "cloud189"
    remote:   "TestCloud189:"
-   # bisync compares and repairs modification times, which this drive stamps
-   # itself and offers no way to set, and a rename or move refreshes them
+   # bisync has never been run against this backend. Its modtime cases already
+   # self-skip (the harness skips any remote whose Precision is ModTimeNotSupported,
+   # which this backend reports), so what this line actually holds back is the
+   # nomodtime case - excluded until someone has run it, not because it is known
+   # to fail.
    ignoretests:
      - cmd/bisync
    fastlist: false
    extratime: 2.0
-   # Everything is an asynchronous task, polled to completion, and the listing
-   # keeps answering a deleted row for about a second after the task reports
-   # done, so the retry ladder needs headroom.
+   # Every write is an asynchronous task that is polled to completion, so the
+   # timing budget is not the transfer's. The listing is also measurably behind
+   # after a name has been mutated more than once inside a second (2026-10-24:
+   # still unreadable seven seconds on), which is longer than the default ladder.
    listretries: 5

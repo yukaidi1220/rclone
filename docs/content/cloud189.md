@@ -399,15 +399,38 @@ deleted: because the drive deduplicates by digest, content identical to the obje
 just parked can come back as **that object's own id**. It is the original, so it is
 renamed back into place and never dropped.
 
-The window in which the name holds nothing is one rename. If step 2 fails, the
-parked object is given its name back before anything else - on a context detached
-from the caller's, since the commonest way to fail part-way through a swap is the
-user stopping the run, and an object left named `rclone-park-…` reads to the next
-`rclone sync` as a file to delete. For an upload the object this run made is then
-deleted; a task that failed made nothing, so there is nothing to take back. The
-one case with no clean answer is a `COPY` whose task reported success but whose
-object cannot be read back out of the destination: it stays on the drive, because
-an object with no known id cannot be addressed, and the error says so.
+A replacement large enough for `--multi-thread-streams` (256 MiB by default) is
+not an `Update`: the parts are staged first and the drive only sees one upload at
+the end, so that path cannot free the name before the bytes exist. It parks,
+renames and deletes on the same name inside one second, which is the shape
+measured to leave the listing behind - so a large replacement still pays the lag
+that a small one avoids.
+
+Which parked object is deleted and which is put back is decided by one question:
+was it the object rclone was asked to replace? When the operation keeps the name,
+the object standing where the arrival has to land is exactly that one, so it goes.
+When the operation also renames, that object merely happened to own the name the
+drive lands arrivals under; it is given its name back and stays on the drive. Only
+the object holding the name rclone actually wanted is replaced.
+
+The window in which a name holds nothing is normally one rename. Two paths are
+wider and mean it. A replacement (`Update`) frees the name before the new bytes go
+up, so the name is empty for the whole transfer - which is the price of the drive
+not overwriting an upload in place, and the reason a killed run can leave the only
+copy of a file named `rclone-park-…`. And if step 2 fails, the parked object is
+given its name back before anything else - on a context detached from the caller's,
+since the commonest way to fail part-way through a swap is the user stopping the
+run, and an object left named `rclone-park-…` reads to the next `rclone sync` as a
+file to delete. For an upload the object this run made is then deleted; a task that
+failed made nothing, so there is nothing to take back. The one case with no clean
+answer is a `COPY` whose task reported success but whose object cannot be read back
+out of the destination: it stays on the drive, because an object with no known id
+cannot be addressed, and the error says so.
+
+Nothing that was on the drive before the run is deleted on the strength of a task's
+counters. Before a move or a replacement removes the object it displaced, the
+destination is read back and has to be holding this run's object - by id, not by
+name, and not by what the commit or the task reported.
 
 A directory is never moved aside for a file, and a file is never replaced by a
 name that a directory holds: the delete that follows a successful task is
