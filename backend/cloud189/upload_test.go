@@ -728,7 +728,12 @@ func md5sOfParts(content []byte, partSize int64) [][]byte {
 // behaviour forces: the old object leaves the name, the new bytes land into the
 // name that is now free, and only then is the old one dropped.
 func TestUpdateParksTheNameBeforeTheNewBytesGoUp(t *testing.T) {
-	drive := &fakeDrive{t: t}
+	drive := &fakeDrive{
+		t: t,
+		// what the proof reads back: this run's upload, standing at the name
+		listing: `{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[` +
+			`{"id":"9000000000000001","name":"movie.bin","size":10,"type":"1"}]}}`,
+	}
 	f := newFakeFs(t, drive)
 	content := pattern(int(fakePartBase))
 
@@ -737,7 +742,11 @@ func TestUpdateParksTheNameBeforeTheNewBytesGoUp(t *testing.T) {
 
 	require.Equal(t, "9000000000000001", old.id, "the object now points at the copy the drive stored")
 	require.EqualValues(t, len(content), old.size)
-	require.Empty(t, sequenceContains(sequenceOf(drive), "GET /listFiles.action"), "the swap used the id it already had, not a listing")
+	// One listing, and it is the proof that runs before the delete: the swap
+	// addresses the object by the id the commit reported, so the only thing it
+	// needs from the drive is confirmation that this run's object stands at the
+	// name the old one is about to be removed for.
+	require.Equal(t, 1, sequencesCount(sequenceOf(drive), "GET /listFiles.action"), "the proof reads the destination once")
 
 	// The park is the ONLY rename: the name was free when the upload went in, so
 	// the fresh object arrived wearing it and nothing had to be renamed afterwards.
@@ -764,6 +773,7 @@ func TestUpdateParksTheNameBeforeTheNewBytesGoUp(t *testing.T) {
 		"GET /person/getMultiUploadUrls",
 		"PUT /store/part",
 		"POST /person/commitMultiUploadFile",
+		"GET /listFiles.action",
 		"POST /batch/createBatchTask.action",
 		"POST /batch/checkBatchTask.action",
 	}, sequenceOf(drive))
@@ -789,11 +799,13 @@ func TestUpdateRestoresTheParkedObjectWhenTheUploadFails(t *testing.T) {
 
 // TestUpdateKeepsTheOriginalWhenTheDriveReusesItsId: the drive deduplicates by
 // digest, so content identical to the object just parked can come back as THAT
-// object's own id. It is the original, not a fresh upload: renaming it back into
-// place is the whole job, and deleting it because the swap "made a duplicate" would
-// remove the user's file.
+// object's own id. It is the original, not a duplicate: it is put back under the
+// wanted name and nothing is deleted. The dangerous part is that the commit echo
+// spells the WANTED name while the file is still sitting under the park name - the
+// fake drive's default echo does exactly that - so the swap has to ask the drive
+// where the object is instead of believing what the upload reported.
 func TestUpdateKeepsTheOriginalWhenTheDriveReusesItsId(t *testing.T) {
-	drive := &fakeDrive{t: t, commitID: "5000000000000000001", commitName: "rclone-park-maybe.bin"}
+	drive := &fakeDrive{t: t, commitID: "5000000000000000001"}
 	f := newFakeFs(t, drive)
 	content := pattern(int(fakePartBase))
 
@@ -802,6 +814,7 @@ func TestUpdateKeepsTheOriginalWhenTheDriveReusesItsId(t *testing.T) {
 	require.Equal(t, "5000000000000000001", old.id, "the object is the one that was already there")
 
 	require.Len(t, drive.renames, 2, "parked aside, then brought back under the wanted name")
+	require.Equal(t, "5000000000000000001", drive.renames[1].id)
 	require.Equal(t, "movie.bin", drive.renames[1].name)
 	require.Empty(t, drive.tasks, "nothing is deleted: the fresh bytes are the object this run replaced")
 }
@@ -817,6 +830,16 @@ func putFor(t *testing.T, d *fakeDrive, part string) putCall {
 	}
 	t.Fatalf("no part was sent to %s; the drive saw %+v", part, d.puts)
 	return putCall{}
+}
+
+func sequencesCount(seq []string, want string) int {
+	n := 0
+	for _, s := range seq {
+		if s == want {
+			n++
+		}
+	}
+	return n
 }
 
 func sequenceContains(seq []string, want string) string {

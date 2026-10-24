@@ -1800,23 +1800,37 @@ func (f *Fs) occupant(ctx context.Context, dirID, wireName string) (*api.Row, er
 }
 
 // arrivedCopy finds the object a copy task just made: the entry with this name
-// that is not the source.
+// that is neither the source nor the object this run parked out of the way.
 //
-// The drive answers a successful COPY with no id at all, so the new object has
-// to be recognised from the destination listing - under the name it arrived with,
-// which is the source's, because the task's fileName is ignored. The source's id
-// is excluded from the match so that a listing holding both never hands back the
-// original: a copy into the source's own directory is refused before the task
-// runs, so that listing is one the drive should not have produced, and this is
-// the cheap backstop rather than the rule that decides the case.
-func (f *Fs) arrivedCopy(ctx context.Context, dirID, wireName, srcID string) (*api.Row, error) {
+// The drive answers a successful COPY with no id at all, so the new object has to
+// be recognised from the destination listing - under the name it arrived with,
+// which is the source's, because the task's fileName is ignored. Two rows can
+// carry that name legitimately at once, and one of them is this run's own doing:
+// whoever held the arrival name was renamed aside, and a rename is not a delete,
+// so the negative cache does not cover it. If the destination listing is still one
+// rename behind, the parked row is what matches first, and installing it under the
+// wanted name would hand rclone an object it then deletes - the copy staying on
+// the drive under a name nobody asked for. So its id is excluded too.
+func (f *Fs) arrivedCopy(ctx context.Context, dirID, wireName, srcID, parkedID string) (*api.Row, error) {
 	var found *api.Row
 	err := f.listAll(ctx, dirID, func(row *api.Row) bool {
-		if row.Name == wireName && row.ID.String() != srcID && !f.deleted.recent(row.ID.String()) {
-			found = row
-			return true
+		if row.Name != wireName {
+			return false
 		}
-		return false
+		id := row.ID.String()
+		if id == srcID || (parkedID != "" && id == parkedID) {
+			return false
+		}
+		// A directory and a file can carry the same name here, and a directory is
+		// never what a file's copy turned into.
+		if rowIsDir(row) {
+			return false
+		}
+		if f.deleted.recent(id) {
+			return false
+		}
+		found = row
+		return true
 	})
 	if err != nil {
 		return nil, err
@@ -1927,7 +1941,11 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	// directory before the task, so the exclusion is not what tells the two rows
 	// apart - it is the backstop for a listing that should not have had to hold
 	// both, and it costs one comparison.
-	arrived, err := f.arrivedCopy(ctx, dstDirID, srcLeaf, srcObj.id)
+	parkedID := ""
+	if cleared != nil {
+		parkedID = cleared.ID.String()
+	}
+	arrived, err := f.arrivedCopy(ctx, dstDirID, srcLeaf, srcObj.id, parkedID)
 	if err != nil {
 		f.undoClear(ctx, cleared, srcLeaf)
 		return nil, fmt.Errorf("cloud189: the copy finished but the new object cannot be found in the destination: %w", err)
@@ -1940,9 +1958,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		f.undoClear(ctx, cleared, srcLeaf)
 		return nil, err
 	}
-	if cleared != nil {
-		f.dropObject(ctx, cleared, "a server-side copy took its name")
-	}
+	f.finishClear(ctx, cleared, srcLeaf, wireLeaf, "a server-side copy took its name")
 	return f.rowObject(remote, arrived), nil
 }
 
@@ -1959,6 +1975,28 @@ func (f *Fs) undoClear(ctx context.Context, parked *api.Row, name string) {
 	if err := f.restoreName(context.WithoutCancel(ctx), parked, name); err != nil {
 		fs.Errorf(f, "cloud189: the object parked as %q could not be given back its name %q: %v", parked.Name, name, err)
 	}
+}
+
+// finishClear decides what becomes of the object that was standing where an
+// arrival was going to land.
+//
+// A task lands the object under the name it moves with, so that is the name the
+// operation has to clear first. When the operation keeps that name, the object in
+// the way is the one rclone asked to replace, and it goes off the drive. When the
+// operation also renames, the parked object never held the wanted name at all - it
+// only happened to be where the drive put the arrival - so it is given its name
+// back. Deleting it there is how a move that renames removed an unrelated file from
+// the destination (found live 2026-10-24: the standard suite's own move cascade
+// destroyed its earlier step).
+func (f *Fs) finishClear(ctx context.Context, cleared *api.Row, arrivalName, wantedName, why string) {
+	if cleared == nil {
+		return
+	}
+	if arrivalName == wantedName {
+		f.dropObject(ctx, cleared, why)
+		return
+	}
+	f.undoClear(ctx, cleared, arrivalName)
 }
 
 // copyTaskInfo builds the task entry for one object, in the shape the drive
@@ -2044,6 +2082,15 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		f.undoClear(ctx, cleared, srcLeaf)
 		return nil, err
 	}
+	// A task's counters are all this backend has to judge it by, and installObject
+	// below deletes whatever holds the name rclone asked for. So the destination is
+	// read back for the object this run moved before anything there is renamed or
+	// removed: a task that reported success without moving anything must not take a
+	// file that was on the drive first.
+	if err := f.proveArrived(ctx, dstDirID, srcLeaf, srcObj.id); err != nil {
+		f.undoClear(ctx, cleared, srcLeaf)
+		return nil, err
+	}
 	// A move keeps the id, and the task left the object in the destination under
 	// the name it moved with. installObject gives it the name rclone asked for.
 	res := &uploadResult{id: srcObj.id, name: srcLeaf, md5: srcObj.md5}
@@ -2055,9 +2102,19 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		f.undoClear(ctx, cleared, srcLeaf)
 		return nil, err
 	}
-	if cleared != nil {
-		f.dropObject(ctx, cleared, "a moved object took its name")
+	// Read the wanted name back before what was standing in the way is deleted: the
+	// counters say the object moved, not that the rename above left it where rclone
+	// will look for it, and that object was on the drive before this run.
+	arrived, err := f.awaitRow(ctx, dstDirID, wireLeaf)
+	if err != nil {
+		f.undoClear(ctx, cleared, srcLeaf)
+		return nil, err
 	}
+	if arrived.ID.String() != srcObj.id {
+		f.undoClear(ctx, cleared, srcLeaf)
+		return nil, fserrors.NoRetryError(fmt.Errorf("cloud189: the move left something other than the moved object under %q", truncate(wireLeaf, 60)))
+	}
+	f.finishClear(ctx, cleared, srcLeaf, wireLeaf, "a moved object took its name")
 	return movedObject(f, remote, srcObj), nil
 }
 
@@ -2138,25 +2195,52 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		}
 	}
 	srcFs.dirCache.FlushDir(srcRemote)
-	if cleared != nil {
-		f.dropObject(ctx, cleared, "a moved directory took its name")
-	}
+	f.finishClear(ctx, cleared, wireSrc, dstWire, "a moved directory took its name")
 	return nil
 }
 
 // awaitRow reads a name back from a directory the drive has just been told to
-// change, waiting out the second or two its listing takes to catch up.
+// change, waiting out the window its listing takes to catch up.
+//
+// The window is not small: measured 2026-10-24, a name that had a park, a rename
+// and a delete cross it inside one second was still unreadable seven seconds
+// later, while a directory that saw one mutation answered immediately. A wait
+// shorter than that turns a move that worked into a reported failure, and the
+// restore on that path then collides with the object that is on its way in.
 func (f *Fs) awaitRow(ctx context.Context, dirID, wireName string) (*api.Row, error) {
-	for attempt := 0; ; attempt++ {
+	var lastErr error
+	for attempt := 0; attempt < arrivalAttempts; attempt++ {
 		row, err := f.findEntry(ctx, dirID, wireName)
 		if err == nil {
 			return row, nil
 		}
-		if !errors.Is(err, fs.ErrorObjectNotFound) || attempt >= 2 || ctx.Err() != nil {
+		lastErr = err
+		if !errors.Is(err, fs.ErrorObjectNotFound) || ctx.Err() != nil {
 			return nil, err
 		}
-		time.Sleep(time.Second)
+		if attempt < arrivalAttempts-1 {
+			time.Sleep(arrivalWait)
+		}
 	}
+	return nil, lastErr
+}
+
+// proveArrived reads the wanted name back and requires the drive to be holding
+// this run's object there.
+//
+// It exists because a swap deletes something that was on the drive before this run
+// - the object replaced, or one parked out of the arrival's way - and a task
+// judged only by counters has been measured to report work it did not do. Without
+// this, the drive's own answer decides whether a user's file is removed.
+func (f *Fs) proveArrived(ctx context.Context, dirID, wireName, wantID string) error {
+	row, err := f.awaitRow(ctx, dirID, wireName)
+	if err != nil {
+		return err
+	}
+	if row.ID.String() != wantID {
+		return fserrors.NoRetryError(fmt.Errorf("cloud189: %q is held by something other than the object this run moved there", truncate(wireName, 60)))
+	}
+	return nil
 }
 
 // ------------------------------------------------------------ names --------
@@ -3452,10 +3536,12 @@ func (f *Fs) deleteRows(ctx context.Context, targets []deleteTarget) error {
 	return err
 }
 
-// deletedRows remembers the ids this process has deleted. It lives behind a
+// deletedRows remembers the ids this Fs instance has deleted. It lives behind a
 // pointer for the same reason the quota does: NewFs copies the Fs when a remote
-// turns out to name a file, and a mutex copied that way is a mutex nobody
-// shares.
+// turns out to name a file, and a mutex copied that way is a mutex nobody shares.
+// Being per instance rather than per account is a known limit: a second remote of
+// the same account opened in the same run has no idea what the first one deleted,
+// so it can read a lingering row of a deleted object as a live one.
 type deletedRows struct {
 	mu  sync.Mutex
 	ids map[string]time.Time
@@ -3469,6 +3555,15 @@ type deletedRows struct {
 // A fresh object with the same name gets a fresh id, which is never in the set,
 // so only the dead rows are distrusted.
 const deletedRowWindow = 5 * time.Second
+
+// How long a swap waits for the drive's listing to agree before it believes the
+// operation did not happen. The measurement behind the numbers is 2026-10-24: a
+// name that had three mutations cross it inside a second was still unreadable
+// seven seconds on, so anything under that turns successes into failures.
+const (
+	arrivalWait     = 3 * time.Second
+	arrivalAttempts = 6
+)
 
 // rememberDeleted notes the ids a finished delete task removed.
 func (d *deletedRows) remember(ids ...string) {
@@ -3805,19 +3900,35 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 	// The drive deduplicates by digest, so new bytes equal to the parked object's
-	// own come back as THAT object: the same stored data, and the same file that
-	// was moved aside a moment ago. It is then the original being renamed back into
-	// place, never something to delete.
-	reused := res.id == o.id
-	if err := o.fs.installObject(ctx, dirID, wireLeaf, res, nil, !reused); err != nil {
-		// Either way the parked object is what was on the drive before this run, so
-		// it goes back: a fresh upload installObject took for itself is not it.
+	// own can come back as THAT object: the same stored data, and the same file that
+	// was moved aside a moment ago. It is then the original being put back, never
+	// something to delete - and the commit's echo cannot be trusted to tell the two
+	// cases apart, because the drive answers a deduplicated commit with the name the
+	// object holds, which is the park name here. So the decision is made from the
+	// listing, not from what the upload reported.
+	if res.id == o.id {
+		if err := o.fs.restoreOrConfirm(ctx, dirID, wireLeaf, &parked); err != nil {
+			return err
+		}
+		o.size = src.Size()
+		o.md5 = strings.ToUpper(res.md5)
+		o.modTime = time.Now()
+		o.invalidateURL()
+		return nil
+	}
+	if err := o.fs.installObject(ctx, dirID, wireLeaf, res, nil, true); err != nil {
+		// installObject took back the fresh upload if it could; the parked object is
+		// what was on the drive before this run, so it goes back either way.
 		o.fs.undoClear(ctx, &parked, wireLeaf)
 		return err
 	}
-	if !reused {
-		o.fs.dropObject(ctx, &parked, "it was replaced by newer bytes")
+	// Nothing that was on the drive before this run is removed until the drive says
+	// the new bytes are standing at the wanted name.
+	if err := o.fs.proveArrived(ctx, dirID, wireLeaf, res.id); err != nil {
+		o.fs.undoClear(ctx, &parked, wireLeaf)
+		return err
 	}
+	o.fs.dropObject(ctx, &parked, "it was replaced by newer bytes")
 	o.id = res.id
 	o.size = src.Size()
 	o.md5 = strings.ToUpper(res.md5)
@@ -3858,6 +3969,39 @@ func (f *Fs) requireKnownFamilyRoot(what string) error {
 		return nil
 	}
 	return fserrors.NoRetryError(fmt.Errorf("cloud189: the family root id could not be read, so %s will not be sent - set family_id or root_folder_id", what))
+}
+
+// DirCacheFlush resets the directory cache - the optional interface rclone's own
+// suite calls between listing retries, and `rclone dedupe` calls in a live run.
+//
+// It matters here because a directory can be removed under the cache's feet: the
+// suite purges and rmdir's directories through a remote opened AT that directory,
+// which flushes that remote's cache and not the one the run keeps using above it.
+// The mapping left behind names a folder the drive no longer has, and every path
+// under it resolves through that dead id until something drops it.
+func (f *Fs) DirCacheFlush() {
+	f.dirCache.ResetRoot()
+}
+
+// restoreOrConfirm puts a parked object back under the name it was cleared from,
+// unless the drive already lists it there.
+//
+// The "unless" is not decoration: the object is parked by a rename addressed by id,
+// so whether the name is free again is a fact about the drive, not about this run's
+// bookkeeping, and renaming a file onto the name it already holds is a request the
+// drive refuses.
+func (f *Fs) restoreOrConfirm(ctx context.Context, dirID, wireName string, parked *api.Row) error {
+	row, err := f.awaitRow(ctx, dirID, wireName)
+	switch {
+	case err == nil:
+		if row.ID.String() != parked.ID.String() {
+			return fserrors.NoRetryError(fmt.Errorf("cloud189: %q is held by something other than the object this run parked there", truncate(wireName, 60)))
+		}
+		return nil
+	case err != fs.ErrorObjectNotFound:
+		return err
+	}
+	return f.restoreName(ctx, parked, wireName)
 }
 
 // Purge removes a directory and everything under it.
@@ -4143,5 +4287,6 @@ var (
 	_ fs.Copier          = (*Fs)(nil)
 	_ fs.Mover           = (*Fs)(nil)
 	_ fs.DirMover        = (*Fs)(nil)
+	_ fs.DirCacheFlusher = (*Fs)(nil)
 	_ dircache.DirCacher = (*Fs)(nil)
 )
