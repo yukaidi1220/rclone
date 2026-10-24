@@ -724,11 +724,11 @@ func md5sOfParts(content []byte, partSize int64) [][]byte {
 	return out
 }
 
-// TestUpdateSwapsTheNameAfterParking is the ordering that was agreed: the new
-// bytes land, the old object is moved out of the name, the new one takes it, and
-// only then is the old one dropped.
-func TestUpdateSwapsTheNameAfterParking(t *testing.T) {
-	drive := &fakeDrive{t: t, commitName: "movie(20261022191707).bin"}
+// TestUpdateParksTheNameBeforeTheNewBytesGoUp is the ordering the drive's own
+// behaviour forces: the old object leaves the name, the new bytes land into the
+// name that is now free, and only then is the old one dropped.
+func TestUpdateParksTheNameBeforeTheNewBytesGoUp(t *testing.T) {
+	drive := &fakeDrive{t: t}
 	f := newFakeFs(t, drive)
 	content := pattern(int(fakePartBase))
 
@@ -739,12 +739,12 @@ func TestUpdateSwapsTheNameAfterParking(t *testing.T) {
 	require.EqualValues(t, len(content), old.size)
 	require.Empty(t, sequenceContains(sequenceOf(drive), "GET /listFiles.action"), "the swap used the id it already had, not a listing")
 
-	require.Len(t, drive.renames, 2)
-	park, install := drive.renames[0], drive.renames[1]
-	require.Equal(t, "5000000000000000001", park.id, "the first rename moves the old object aside")
+	// The park is the ONLY rename: the name was free when the upload went in, so
+	// the fresh object arrived wearing it and nothing had to be renamed afterwards.
+	require.Len(t, drive.renames, 1)
+	park := drive.renames[0]
+	require.Equal(t, "5000000000000000001", park.id, "the old object is moved out of the name")
 	require.True(t, strings.HasPrefix(park.name, "rclone-park-"), "to a unique name, got %q", park.name)
-	require.Equal(t, "9000000000000001", install.id, "the second brings the new object in")
-	require.Equal(t, "movie.bin", install.name)
 
 	require.Len(t, drive.tasks, 1, "the parked object is deleted last")
 	require.Equal(t, taskDelete, drive.tasks[0].taskType)
@@ -754,16 +754,56 @@ func TestUpdateSwapsTheNameAfterParking(t *testing.T) {
 	require.NotNil(t, drive.tasks[0].infos[0].ParentID)
 	require.EqualValues(t, -11, *drive.tasks[0].infos[0].ParentID)
 
+	// The order is the whole point: park, then upload into the freed name, then
+	// drop. Uploading first would make the drive store the new bytes beside the old
+	// under a name it invents, and the swap would hit this name three times inside
+	// a second - which is measured to leave the drive's listing seconds behind.
 	require.Equal(t, []string{
+		"POST /renameFile.action",
 		"POST /person/initMultiUpload",
 		"GET /person/getMultiUploadUrls",
 		"PUT /store/part",
 		"POST /person/commitMultiUploadFile",
-		"POST /renameFile.action",
-		"POST /renameFile.action",
 		"POST /batch/createBatchTask.action",
 		"POST /batch/checkBatchTask.action",
 	}, sequenceOf(drive))
+}
+
+// TestUpdateRestoresTheParkedObjectWhenTheUploadFails: the bytes that were on the
+// drive before this run were only moved aside, never replaced, so a failed upload
+// has to give the name back before it reports anything.
+func TestUpdateRestoresTheParkedObjectWhenTheUploadFails(t *testing.T) {
+	drive := &fakeDrive{t: t, refuseAllPuts: true}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase))
+
+	old := &Object{fs: f, remote: "movie.bin", id: "5000000000000000001", size: 1, urlMu: new(sync.Mutex)}
+	require.Error(t, old.Update(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content)))))
+
+	require.Len(t, drive.renames, 2, "parked, then given its name back")
+	require.True(t, strings.HasPrefix(drive.renames[0].name, "rclone-park-"))
+	require.Equal(t, "5000000000000000001", drive.renames[1].id)
+	require.Equal(t, "movie.bin", drive.renames[1].name)
+	require.Empty(t, drive.tasks, "and the original is not deleted - it is still the file on the drive")
+}
+
+// TestUpdateKeepsTheOriginalWhenTheDriveReusesItsId: the drive deduplicates by
+// digest, so content identical to the object just parked can come back as THAT
+// object's own id. It is the original, not a fresh upload: renaming it back into
+// place is the whole job, and deleting it because the swap "made a duplicate" would
+// remove the user's file.
+func TestUpdateKeepsTheOriginalWhenTheDriveReusesItsId(t *testing.T) {
+	drive := &fakeDrive{t: t, commitID: "5000000000000000001", commitName: "rclone-park-maybe.bin"}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase))
+
+	old := &Object{fs: f, remote: "movie.bin", id: "5000000000000000001", size: 1, urlMu: new(sync.Mutex)}
+	require.NoError(t, old.Update(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content)))))
+	require.Equal(t, "5000000000000000001", old.id, "the object is the one that was already there")
+
+	require.Len(t, drive.renames, 2, "parked aside, then brought back under the wanted name")
+	require.Equal(t, "movie.bin", drive.renames[1].name)
+	require.Empty(t, drive.tasks, "nothing is deleted: the fresh bytes are the object this run replaced")
 }
 
 func putFor(t *testing.T, d *fakeDrive, part string) putCall {
@@ -846,6 +886,37 @@ func TestPutDetectsARacingOccupant(t *testing.T) {
 	require.Equal(t, "7000000000000000002", drive.renames[0].id, "the object that appeared is the one parked")
 	require.Len(t, drive.tasks, 1)
 	require.Equal(t, "7000000000000000002", drive.tasks[0].infos[0].FileID)
+}
+
+// TestPutRestoreGivesTheRacingHolderItsNameBack is the swap that fails in the
+// middle: the upload arrived under a name of the server's own, the object that had
+// raced into the wanted name was parked for it, and the rename that would have
+// finished the swap was refused. The holder must be given its name back - it was on
+// the drive before this run - and only rclone's own upload is taken back.
+func TestPutRestoreGivesTheRacingHolderItsNameBack(t *testing.T) {
+	drive := &fakeDrive{
+		t:           t,
+		commitName:  "movie(20261022191711).bin",
+		failInstall: true,
+		listing: `{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[` +
+			`{"id":"7000000000000000003","name":"movie.bin","size":10,"type":"1"}]}}`,
+	}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase))
+
+	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "FileAlreadyExists")
+
+	require.Len(t, drive.renames, 3, "park the holder, fail to install, give the holder its name back")
+	require.Equal(t, "7000000000000000003", drive.renames[0].id, "the holder was the object moved aside")
+	require.True(t, strings.HasPrefix(drive.renames[0].name, "rclone-park-"))
+	require.Equal(t, "7000000000000000003", drive.renames[2].id, "the restore addresses the holder")
+	require.Equal(t, "movie.bin", drive.renames[2].name, "with the name it came with")
+
+	require.Len(t, drive.tasks, 1, "and only rclone's own upload is taken back")
+	require.Equal(t, taskDelete, drive.tasks[0].taskType)
+	require.Equal(t, "9000000000000001", drive.tasks[0].infos[0].FileID)
 }
 
 // TestPutSwapsOutAFileTheDriveListedWithoutAParent is the personal endpoint's

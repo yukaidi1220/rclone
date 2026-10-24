@@ -387,6 +387,18 @@ For an upload all three steps are rclone's own renames. For a server-side copy o
 move the arrival takes step 2's place: the task runs while the name it will land on
 is clear, and step 2 then renames the arrival into the name rclone asked for.
 
+Replacing a file (`Update`) parks the old object **before** the new bytes go up, so
+the upload arrives wearing the name it was asked for and no rename follows it. The
+drive will not overwrite: an upload onto a name still in use is stored beside it
+under a name the server invents, `movie(20261024123855).bin` (measured live
+2026-10-24). Freeing the name first avoids that invented name, and it also avoids
+hitting one name with a park, a rename and a delete inside a single second - which
+is measured to leave the drive's listing seconds behind, long enough that rclone
+could not read back a file the swap had in fact replaced. One case must not be
+deleted: because the drive deduplicates by digest, content identical to the object
+just parked can come back as **that object's own id**. It is the original, so it is
+renamed back into place and never dropped.
+
 The window in which the name holds nothing is one rename. If step 2 fails, the
 parked object is given its name back before anything else - on a context detached
 from the caller's, since the commonest way to fail part-way through a swap is the
