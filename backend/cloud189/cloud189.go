@@ -1171,6 +1171,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 // emptied the family root the same way before the server happened to refuse
 // such a batch.
 func (f *Fs) resolveRoot(ctx context.Context) error {
+	// The cache NewFs seeded walks from the space root through the whole path
+	// this remote was asked for. It is what gets restored below when the path
+	// names nothing: a later write has to create the missing chain where the
+	// user pointed, not where this walk happened to give up.
+	seeded, origRoot := f.dirCache, f.root
 	err := f.dirCache.FindRoot(ctx, false)
 	if err == nil {
 		return f.resolveAnchor(ctx)
@@ -1198,10 +1203,14 @@ func (f *Fs) resolveRoot(ctx context.Context) error {
 	f.dirCache = dircache.New("", parentID, f)
 	if _, oerr := f.NewObject(ctx, remote); oerr != nil {
 		if oerr == fs.ErrorObjectNotFound {
-			// No root and no file: the path names nothing. The remote stays as
-			// it was asked for, the cache goes back to unresolved, and the
-			// anchor stays empty.
-			f.root = path.Join(newRoot, remote)
+			// No root and no file: the path names nothing. The remote keeps the
+			// path it was asked for and the cache goes back to the one seeded
+			// with the space root, so a listing here says "directory not found"
+			// and a write makes the missing chain in the place the user named.
+			// Leaving the parent-seeded cache in place would make this Fs claim
+			// one path while resolving every operation against its parent.
+			f.root = origRoot
+			f.dirCache = seeded
 			f.dirCache.ResetRoot()
 			f.fsRootID = ""
 			return nil
@@ -1794,11 +1803,12 @@ func (f *Fs) occupant(ctx context.Context, dirID, wireName string) (*api.Row, er
 // that is not the source.
 //
 // The drive answers a successful COPY with no id at all, so the new object has
-// to be recognised from the destination listing. The name the task carried is the
-// copy's own, but the source can hold that same name in that same directory - a
-// copy of an object onto the name it already has - and the row that matches first
-// is then the original. Handing that back would make every later operation on the
-// "copy" address the source, so the source id is excluded by name.
+// to be recognised from the destination listing - under the name it arrived with,
+// which is the source's, because the task's fileName is ignored. The source's id
+// is excluded from the match so that a listing holding both never hands back the
+// original: a copy into the source's own directory is refused before the task
+// runs, so that listing is one the drive should not have produced, and this is
+// the cheap backstop rather than the rule that decides the case.
 func (f *Fs) arrivedCopy(ctx context.Context, dirID, wireName, srcID string) (*api.Row, error) {
 	var found *api.Row
 	err := f.listAll(ctx, dirID, func(row *api.Row) bool {
@@ -1855,11 +1865,18 @@ func (f *Fs) restoreName(ctx context.Context, parked *api.Row, name string) erro
 // Copy duplicates an object on the drive, which moves no bytes and costs the
 // account's transfer allowance nothing.
 //
-// The task names the object it makes - the fileName it carries is the name the
-// copy has in the destination (measured live 2026-10-24) - so a copy that also
-// renames is still one task, and no rename follows it. The name has to be free
-// first: the drive refuses to overwrite, and a task that lands on a name in use
-// waits for a decision rclone will not give it.
+// The drive ignores the fileName a COPY entry carries. The copy lands in the
+// target folder under its SOURCE's name - measured live 2026-10-24 with the
+// command and the readback both on record: a copy of A.txt asked to arrive as
+// sub/B.txt came back as sub/A.txt. So the name that has to be free in the
+// destination is the source's spelling, and a copy that also renames is one task
+// plus one rename by id.
+//
+// A copy inside the directory that already holds the source cannot be done at
+// all: the copy would have to take a name its own source is holding, and the
+// drive refuses it (measured the same day as COPY failing with
+// FileAlreadyExists, and as a task stopped in the conflict state a client has to
+// answer). That case is fs.ErrorCantCopy, which lets rclone transfer instead.
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	srcObj, ok := src.(*Object)
 	if !ok {
@@ -1877,33 +1894,51 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if err := validateName(wireLeaf); err != nil {
 		return nil, err
 	}
-	// The name the task gives the copy is the destination's, so it is spelled by
-	// this remote's encoder - the bytes the destination will store - and that is
-	// the name to clear and to read back.
-	cleared, err := f.clearName(ctx, dstDirID, wireLeaf, srcObj.id)
+	stdLeaf, srcDirID, err := srcObj.fs.dirCache.FindPath(ctx, srcObj.remote, false)
 	if err != nil {
 		return nil, err
 	}
-	info, err := srcObj.fs.copyTaskInfo(ctx, srcObj, auth, wireLeaf)
+	if f.realDirID(dstDirID) == srcObj.fs.realDirID(srcDirID) {
+		return nil, fs.ErrorCantCopy
+	}
+	// The copy arrives named as its source, spelled the way the SOURCE's remote
+	// stores it: two remotes can carry different encoding options, and the name
+	// this run has to clear and then read back is the drive's bytes, not this
+	// remote's rendering of them. Move does the same thing.
+	srcLeaf := srcObj.fs.opt.Enc.FromStandardName(stdLeaf)
+	cleared, err := f.clearName(ctx, dstDirID, srcLeaf, srcObj.id)
 	if err != nil {
-		f.undoClear(ctx, cleared, wireLeaf)
+		return nil, err
+	}
+	info, err := srcObj.fs.copyTaskInfo(ctx, srcObj, auth, srcLeaf)
+	if err != nil {
+		f.undoClear(ctx, cleared, srcLeaf)
 		return nil, err
 	}
 	if _, err := srcObj.fs.runBatchTask(ctx, auth, taskCopy, []taskInfo{info}, dstDirID); err != nil {
-		f.undoClear(ctx, cleared, wireLeaf)
+		f.undoClear(ctx, cleared, srcLeaf)
 		return nil, err
 	}
 	// A successful COPY reports no id for the object it made, so it is read back
-	// from the destination listing (captured 2026-10-22), by the name the task was
-	// told to give it. The source's id is excluded from the match: a row that is
-	// the source would be reported as the copy, and every later operation on the
-	// returned object would then address the original. The drive should refuse a
-	// task that lands on the name its own source holds, so this is the case that
-	// has to be caught rather than trusted.
-	arrived, err := f.arrivedCopy(ctx, dstDirID, wireLeaf, srcObj.id)
+	// from the destination listing (captured 2026-10-22). The source's own id is
+	// excluded from the match: a row that is the source would be reported as the
+	// copy, and every later operation on the returned object would then address
+	// the original. This run refuses a copy that lands in its source's own
+	// directory before the task, so the exclusion is not what tells the two rows
+	// apart - it is the backstop for a listing that should not have had to hold
+	// both, and it costs one comparison.
+	arrived, err := f.arrivedCopy(ctx, dstDirID, srcLeaf, srcObj.id)
 	if err != nil {
-		f.undoClear(ctx, cleared, wireLeaf)
+		f.undoClear(ctx, cleared, srcLeaf)
 		return nil, fmt.Errorf("cloud189: the copy finished but the new object cannot be found in the destination: %w", err)
+	}
+	res := &uploadResult{id: arrived.ID.String(), name: srcLeaf, md5: arrived.MD5}
+	if err := f.installObject(ctx, dstDirID, wireLeaf, res, nil, true); err != nil {
+		// The copy itself is gone by now (installObject takes back what it made
+		// when it cannot finish), so the only thing left to undo is the name this
+		// run cleared for it.
+		f.undoClear(ctx, cleared, srcLeaf)
+		return nil, err
 	}
 	if cleared != nil {
 		f.dropObject(ctx, cleared, "a server-side copy took its name")
@@ -1970,10 +2005,12 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if err != nil {
 		return nil, err
 	}
-	// The name the object carries on the drive right now, which only the
-	// rename below needs: a task is told the destination's name, not this.
+	// The name the object carries on the drive right now. The task is told this,
+	// because a MOVE lands the object under its source name whatever the entry
+	// says (measured live 2026-10-24), and the name to clear in the destination
+	// is the one the arrival will wear.
 	srcLeaf := srcObj.fs.opt.Enc.FromStandardName(stdLeaf)
-	if dstDirID == srcDirID {
+	if f.realDirID(dstDirID) == srcObj.fs.realDirID(srcDirID) {
 		// A move within one directory is a rename, and no task: the drive has
 		// been measured to answer a MOVE addressed at the mover's own directory
 		// by destroying the object (measured live 2026-10-23, the suite's move
@@ -1998,22 +2035,26 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if err != nil {
 		return nil, err
 	}
-	// The task's fileName is the name the object is to have in the destination
-	// (measured live 2026-10-24: a MOVE naming a different name lands under that
-	// name), so the destination name is what has to be free, and clearing it is
-	// what makes a task that renames possible at all.
-	cleared, err := f.clearName(ctx, dstDirID, wireLeaf, srcObj.id)
+	cleared, err := f.clearName(ctx, dstDirID, srcLeaf, srcObj.id)
 	if err != nil {
 		return nil, err
 	}
-	info := taskInfo{FileID: srcObj.id, FileName: wireLeaf, IsFolder: 0, ParentID: srcParentID}
+	info := taskInfo{FileID: srcObj.id, FileName: srcLeaf, IsFolder: 0, ParentID: srcParentID}
 	if _, err := srcObj.fs.runBatchTask(ctx, auth, taskMove, []taskInfo{info}, dstDirID); err != nil {
-		f.undoClear(ctx, cleared, wireLeaf)
+		f.undoClear(ctx, cleared, srcLeaf)
 		return nil, err
 	}
-	// A move keeps the id, and the task gave the object its destination name in
-	// the destination directory, so there is nothing left to place: the object
-	// this run reports is the one the drive already has.
+	// A move keeps the id, and the task left the object in the destination under
+	// the name it moved with. installObject gives it the name rclone asked for.
+	res := &uploadResult{id: srcObj.id, name: srcLeaf, md5: srcObj.md5}
+	if err := f.installObject(ctx, dstDirID, wireLeaf, res, nil, false); err != nil {
+		// The moved object stays where the task left it, because it is the
+		// original. The name it was reaching for is this run's doing, so put back
+		// what was standing there - which only works while nothing else holds it,
+		// and says so in the log when it cannot.
+		f.undoClear(ctx, cleared, srcLeaf)
+		return nil, err
+	}
 	if cleared != nil {
 		f.dropObject(ctx, cleared, "a moved object took its name")
 	}
@@ -2036,7 +2077,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	// The helper resolves the ids, refuses a move of or onto a root, creates the
 	// destination's parent chain and requires the destination not to exist
 	// already - which is what the drive's own conflict answer wants.
-	srcID, srcDirectoryID, _, dstDirID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
+	srcID, srcDirectoryID, srcLeaf, dstDirID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
 	if err != nil {
 		return err
 	}
@@ -2044,45 +2085,56 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	if err != nil {
 		return err
 	}
-	// The task names the directory it moves - the fileName it carries is the
-	// name the directory has in the destination (measured live 2026-10-24 on a
-	// file, and a directory move takes the same task) - so the destination's
-	// spelling is what the task carries and what has to be free first. The
-	// source's own spelling never appears in the body.
+	// Named as the source remote stores it, the way Move and Copy do: two remotes
+	// of one account may carry different encodings, and the name the drive stores
+	// is the source's bytes. The destination's spelling belongs to the rename that
+	// follows the task.
+	wireSrc := srcFs.opt.Enc.FromStandardName(srcLeaf)
 	dstWire := f.opt.Enc.FromStandardName(dstLeaf)
-	cleared, err := f.clearName(ctx, dstDirID, dstWire, srcID)
+	cleared, err := f.clearName(ctx, dstDirID, wireSrc, srcID)
 	if err != nil {
 		return err
 	}
-	if srcDirectoryID == dstDirID {
+	if srcFs.realDirID(srcDirectoryID) == f.realDirID(dstDirID) {
 		// A directory renamed inside the directory that already holds it is the
 		// shape the drive answers by destroying what the task is addressed at
 		// (measured live 2026-10-23 on a file), and a directory carries a whole
 		// subtree with it. So this case is a rename, and no task.
 		if err := f.renameObject(ctx, srcID, true, dstWire); err != nil {
-			f.undoClear(ctx, cleared, dstWire)
+			f.undoClear(ctx, cleared, wireSrc)
 			return err
 		}
 	} else {
-		info := taskInfo{FileID: srcID, FileName: dstWire, IsFolder: 1, ParentID: parentID}
+		info := taskInfo{FileID: srcID, FileName: wireSrc, IsFolder: 1, ParentID: parentID}
 		if _, err := srcFs.runBatchTask(ctx, auth, taskMove, []taskInfo{info}, dstDirID); err != nil {
-			f.undoClear(ctx, cleared, dstWire)
+			f.undoClear(ctx, cleared, wireSrc)
 			return err
 		}
-		// A directory is the one object whose task-naming behaviour is inferred
-		// from a file measurement rather than measured on a directory, so the
-		// name is read back before anything is deleted for it: whoever held the
-		// destination name only goes once the moved directory is standing in it.
-		// The drive keeps its listings a second or two behind, so the window is
-		// waited out the way a created directory's id is.
-		arrived, err := f.awaitRow(ctx, dstDirID, dstWire)
+		// Read the arrival back before anything parked is deleted: the destination
+		// must hold the moved directory under the name the task left it in, and if
+		// it does not then this run has not earned removing what was there. The
+		// drive keeps its listings a second or two behind, so the window is waited
+		// out the way a created directory's id is.
+		arrived, err := f.awaitRow(ctx, dstDirID, wireSrc)
 		if err != nil {
-			f.undoClear(ctx, cleared, dstWire)
+			f.undoClear(ctx, cleared, wireSrc)
 			return err
 		}
 		if arrived.ID.String() != srcID {
-			f.undoClear(ctx, cleared, dstWire)
-			return fserrors.NoRetryError(fmt.Errorf("cloud189: the directory move left something other than the moved directory under %q", truncate(dstWire, 60)))
+			f.undoClear(ctx, cleared, wireSrc)
+			return fserrors.NoRetryError(fmt.Errorf("cloud189: the directory move left something other than the moved directory under %q", truncate(wireSrc, 60)))
+		}
+		// The task carries no destination name: the directory arrives under the
+		// name it moved with. When that is not the name rclone asked for, rename it
+		// here - the id is the moved directory's, and the destination name was
+		// verified free before the task started. A rename that fails leaves the
+		// directory on the drive under the arrival name, which the destination
+		// cache must then not claim to know.
+		if dstWire != wireSrc {
+			if err := f.renameObject(ctx, srcID, true, dstWire); err != nil {
+				f.dirCache.FlushDir(dstRemote)
+				return err
+			}
 		}
 	}
 	srcFs.dirCache.FlushDir(srcRemote)

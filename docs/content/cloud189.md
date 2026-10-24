@@ -342,32 +342,35 @@ and the objects were still on the drive. So `failedCount`, `skipCount` and
 `successedCount` decide, and a task that reports fewer successes than objects were
 sent is an error, as is one that skipped anything.
 
-A task names the object it produces: the `fileName` a `COPY` or `MOVE` entry
-carries is the name the object has where it lands, not a description of the
-source (measured live 2026-10-24, both directions). So a server-side copy or move
-that also renames is one task, and no rename follows it - but the name the task
-asks for has to be free before the task starts.
+The `fileName` a `COPY` or `MOVE` entry carries is **ignored**: the object lands in
+the target folder under its **source's** name (measured live 2026-10-24, with the
+command and the readback both kept: a copy of `A.txt` asked to arrive as
+`sub/B.txt` came back as `sub/A.txt`, and a move of `deep/M.txt` asked to arrive as
+`sub3/N.txt` came back as `sub3/M.txt`). So a server-side copy or move that also
+renames is one task plus one rename by id, and the name that has to be free in the
+destination before the task starts is the source's spelling.
 
-`COPY` reports no id for the object it made (unlike `MOVE` and `DELETE`, which
-do). The new object is therefore read back from the destination listing, by the
-name the task was told to give it, and the source's own id is excluded from the
-match. The one listing where that exclusion is load-bearing is the one where the
-source itself holds the name - a copy of an object onto the name it already
-carries, which the drive is asked to refuse at the conflict rather than to
-duplicate. Handing back the source row instead would make every later operation
-on the "copy" address the original.
+`COPY` reports no id for the object it made (unlike `MOVE` and `DELETE`, which do),
+so the new object is read back from the destination listing by the name it arrived
+under, excluding the source's own id. Handing back a row that is the source would
+make every later operation on the "copy" address the original.
 
-A `MOVE` into the directory that already holds the object is a different story:
-addressed at its own directory, the task has been measured to destroy the object
-(2026-10-23, on a file). So both `Move` and `DirMove` do that case as a plain
-rename and start no task - for a directory the subtree rides along with it.
+A copy inside the directory that already holds its source cannot be done at all:
+the copy would have to take a name its own source is holding, and the drive refuses
+that instead of duplicating the object (measured as `COPY` failing with
+`FileAlreadyExists`, and on 2026-10-23 as a task stopped in the state that waits
+for a client to answer). `Copy` returns `fs.ErrorCantCopy` for it, which lets rclone
+transfer the bytes. A move into the directory that already holds the object is
+equally not a task, and for a worse reason: addressed at its own directory, the task
+has been measured to destroy the object (2026-10-23, on a file). So both `Move` and
+`DirMove` do that case as a plain rename and start no task - for a directory the
+subtree rides along with it.
 
-A directory move is the one place the naming rule rests on an inference: what was
-measured was a file, and a directory takes the same task shape. So before the
-object that was parked out of the destination's way is deleted, the destination is
-read back and must name the moved directory - and it is read back patiently,
-because the drive keeps its listings a second or two behind. Nothing that was
-already on the drive is deleted for a move that cannot be seen.
+The object a directory move leaves behind is checked before anything is deleted for
+it: the destination must hold the moved directory under the name the task left it
+in, and the drive keeps its listings a second or two behind, so that readback waits
+the way a created directory's id does. Nothing that was already on the drive is
+deleted for a move that cannot be seen.
 
 ### When the name is already taken
 
@@ -380,9 +383,9 @@ rclone clears the name first, addressing objects by id throughout:
 2. rename the object this run made into the name it wanted,
 3. delete the parked object.
 
-For an upload all three are rclone's own renames. For a server-side copy or move
-step 2 is the task, which is why the name is cleared before the task is started
-rather than after.
+For an upload all three steps are rclone's own renames. For a server-side copy or
+move the arrival takes step 2's place: the task runs while the name it will land on
+is clear, and step 2 then renames the arrival into the name rclone asked for.
 
 The window in which the name holds nothing is one rename. If step 2 fails, the
 parked object is given its name back before anything else - on a context detached
