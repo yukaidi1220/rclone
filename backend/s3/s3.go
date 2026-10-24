@@ -3344,11 +3344,18 @@ func (f *Fs) publicLink(ctx context.Context, remote string, expire fs.Duration, 
 	if strings.HasSuffix(remote, "/") {
 		return "", fs.ErrorCantShareDirectories
 	}
-	obj, err := f.NewObject(ctx, remote)
-	if err != nil {
-		return "", err
+	// Presigning is local; the Stat below only exists to pin the link to the
+	// version we just looked at, so do it only when a version switch is on.
+	// With the switches off the link names the key, not a version, and a missing
+	// object is not detected until the link is opened.
+	var versionID *string
+	if f.opt.Versions || f.opt.VersionAt.IsSet() {
+		obj, err := f.NewObject(ctx, remote)
+		if err != nil {
+			return "", err
+		}
+		versionID = obj.(*Object).versionID
 	}
-	o := obj.(*Object)
 	if expire > maxExpireDuration {
 		fs.Logf(f, "Public Link: Reducing expiry to %v as %v is greater than the max time allowed", maxExpireDuration, expire)
 		expire = maxExpireDuration
@@ -3356,7 +3363,7 @@ func (f *Fs) publicLink(ctx context.Context, remote string, expire fs.Duration, 
 	bucket, bucketPath := f.split(remote)
 	req.Bucket = &bucket
 	req.Key = &bucketPath
-	req.VersionId = o.versionID
+	req.VersionId = versionID
 	httpReq, err := s3.NewPresignClient(f.c).PresignGetObject(ctx, req, s3.WithPresignExpires(time.Duration(expire)))
 	if err != nil {
 		return "", err
@@ -4017,7 +4024,10 @@ func (f *Fs) purge(ctx context.Context, dir string, oldOnly bool) error {
 	}
 	// If the user explicitly set --s3-versions, trust that the bucket is
 	// versioned even if GetBucketVersioning fails (e.g. missing permission).
-	versioned := f.opt.Versions || f.isVersioned(ctx)
+	// Asking the bucket whether it is versioned is a version-control request in
+	// its own right, so skip it unless --s3-versions is on or the caller asked
+	// for old versions by name.
+	versioned := f.opt.Versions || (oldOnly && f.isVersioned(ctx))
 	if !versioned && oldOnly {
 		fs.Infof(f, "bucket is not versioned so not removing old versions")
 		return nil
