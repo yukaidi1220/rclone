@@ -763,3 +763,15 @@ backends:
    # The server shows new/deleted entries in the parent listing seconds to
    # tens of seconds late, so fstest's retry ladder needs headroom.
    listretries: 10
+ - backend:  "cloud189"
+   remote:   "TestCloud189:"
+   # bisync compares and repairs modification times, which this drive stamps
+   # itself and offers no way to set, and a rename or move refreshes them
+   ignoretests:
+     - cmd/bisync
+   fastlist: false
+   extratime: 2.0
+   # Everything is an asynchronous task, polled to completion, and the listing
+   # keeps answering a deleted row for about a second after the task reports
+   # done, so the retry ladder needs headroom.
+   listretries: 5

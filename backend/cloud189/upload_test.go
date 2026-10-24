@@ -874,6 +874,64 @@ func TestPutSwapsOutAFileTheDriveListedWithoutAParent(t *testing.T) {
 	require.EqualValues(t, -11, *drive.tasks[0].infos[0].ParentID, "this listing was of the space root, which the drive spells -11")
 }
 
+// TestPutLooksUpTheWantedNameByTheStoredSpelling is the upload half of the
+// character table. The drive stores an upload onto a name that is in use beside
+// the first object, under a name of its own, so the new bytes arrive under that
+// invented name and the swap has to find whoever holds the name rclone wanted -
+// by the bytes the drive stores, which for "a:b" are "a：b". Encoding that
+// spelling a second time asks for a name that is not on the drive, and the object
+// standing in the way stops being visible.
+func TestPutLooksUpTheWantedNameByTheStoredSpelling(t *testing.T) {
+	drive := &fakeDrive{
+		t:          t,
+		commitName: "a(20261024091500):b",
+		// the personal endpoint's row shape: a file row carries no parentId, so
+		// the parent the delete task has to name comes out of the listing walked
+		listing: `{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[` +
+			`{"id":"7000000000000000002","name":"a：b","size":10,"type":"1"}]}}`,
+	}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase))
+
+	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("a:b", int64(len(content))))
+	require.NoError(t, err)
+
+	require.Len(t, drive.renames, 2, "the holder parked, the upload installed")
+	require.Equal(t, "7000000000000000002", drive.renames[0].id, "found by the spelling the drive stores")
+	require.True(t, strings.HasPrefix(drive.renames[0].name, "rclone-park-"))
+	require.Equal(t, "9000000000000001", drive.renames[1].id)
+	require.Equal(t, "a：b", drive.renames[1].name, "the upload given the stored spelling of the name")
+	require.Len(t, drive.tasks, 1, "and the parked object is taken off the drive")
+	require.Equal(t, taskDelete, drive.tasks[0].taskType)
+	require.Equal(t, "7000000000000000002", drive.tasks[0].infos[0].FileID)
+	require.NotNil(t, drive.tasks[0].infos[0].ParentID, "its parent comes from the listing that found it")
+	require.EqualValues(t, -11, *drive.tasks[0].infos[0].ParentID)
+}
+
+// TestInstallLeavesAnObjectThatAlreadyHoldsTheName: the swap looks the wanted name
+// up to find whoever holds it, and parks that before moving the new object in. If
+// the listing answers with the object being installed - the drive already carries
+// it under the wanted name, whatever the commit echo spelled - then the thing in
+// the way is itself: parking it would move the new bytes aside and the delete that
+// finishes the swap would take them off the drive.
+func TestInstallLeavesAnObjectThatAlreadyHoldsTheName(t *testing.T) {
+	drive := &fakeDrive{
+		t:          t,
+		commitName: "movie(20261024100000).bin",
+		listing: `{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[` +
+			`{"id":"9000000000000001","name":"movie.bin","size":10,"type":"1"}]}}`,
+	}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase))
+
+	obj, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
+	require.NoError(t, err)
+	require.Equal(t, "9000000000000001", obj.(*Object).id)
+
+	require.Empty(t, drive.renames, "nothing is parked when the holder of the name is the object itself")
+	require.Empty(t, drive.tasks, "and nothing is deleted")
+}
+
 // TestPutRefusesToOverwriteADirectory: a name can be held by a directory, and a
 // file must not displace it.
 func TestPutRefusesToOverwriteADirectory(t *testing.T) {

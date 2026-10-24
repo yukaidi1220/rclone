@@ -342,11 +342,32 @@ and the objects were still on the drive. So `failedCount`, `skipCount` and
 `successedCount` decide, and a task that reports fewer successes than objects were
 sent is an error, as is one that skipped anything.
 
-A `COPY` always arrives named after its source, and reports no id for the object
-it made (unlike `MOVE` and `DELETE`, which do). The new object is therefore read
-back from the destination listing, and the source's own id is excluded from the
-match - which matters in the one case that has no other way to tell them apart: a
-copy in the same directory, where the listing holds both under the same name.
+A task names the object it produces: the `fileName` a `COPY` or `MOVE` entry
+carries is the name the object has where it lands, not a description of the
+source (measured live 2026-10-24, both directions). So a server-side copy or move
+that also renames is one task, and no rename follows it - but the name the task
+asks for has to be free before the task starts.
+
+`COPY` reports no id for the object it made (unlike `MOVE` and `DELETE`, which
+do). The new object is therefore read back from the destination listing, by the
+name the task was told to give it, and the source's own id is excluded from the
+match. The one listing where that exclusion is load-bearing is the one where the
+source itself holds the name - a copy of an object onto the name it already
+carries, which the drive is asked to refuse at the conflict rather than to
+duplicate. Handing back the source row instead would make every later operation
+on the "copy" address the original.
+
+A `MOVE` into the directory that already holds the object is a different story:
+addressed at its own directory, the task has been measured to destroy the object
+(2026-10-23, on a file). So both `Move` and `DirMove` do that case as a plain
+rename and start no task - for a directory the subtree rides along with it.
+
+A directory move is the one place the naming rule rests on an inference: what was
+measured was a file, and a directory takes the same task shape. So before the
+object that was parked out of the destination's way is deleted, the destination is
+read back and must name the moved directory - and it is read back patiently,
+because the drive keeps its listings a second or two behind. Nothing that was
+already on the drive is deleted for a move that cannot be seen.
 
 ### When the name is already taken
 
@@ -359,15 +380,32 @@ rclone clears the name first, addressing objects by id throughout:
 2. rename the object this run made into the name it wanted,
 3. delete the parked object.
 
+For an upload all three are rclone's own renames. For a server-side copy or move
+step 2 is the task, which is why the name is cleared before the task is started
+rather than after.
+
 The window in which the name holds nothing is one rename. If step 2 fails, the
-parked object is given its name back before anything else, and the object this
-run made is deleted - an object that was already on the drive is never deleted by
-a failure handler.
+parked object is given its name back before anything else - on a context detached
+from the caller's, since the commonest way to fail part-way through a swap is the
+user stopping the run, and an object left named `rclone-park-…` reads to the next
+`rclone sync` as a file to delete. For an upload the object this run made is then
+deleted; a task that failed made nothing, so there is nothing to take back. The
+one case with no clean answer is a `COPY` whose task reported success but whose
+object cannot be read back out of the destination: it stays on the drive, because
+an object with no known id cannot be addressed, and the error says so.
 
 A directory is never moved aside for a file, and a file is never replaced by a
 name that a directory holds: the delete that follows a successful task is
 recursive, so clearing a name by parking a subtree would put that subtree one
 failed step from removal. Both cases are refused locally.
+
+An `rclone-park-…` object left on the drive means a swap was interrupted. The
+restore runs on a context detached from the caller's, so stopping a run with
+Ctrl-C and a request timeout both still hand the name back; what survives neither
+is the process being killed outright. The parked object is then the version that
+held that name before the run, sitting beside the one that holds it now, and
+`rclone sync` counts it as an extra file - so look at it before letting a sync
+delete it.
 
 ### Directories and deletion
 
