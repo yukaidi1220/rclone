@@ -281,9 +281,20 @@ func SliceAggMD5(partDigests [][]byte, fileMd5Hex string) string {
 // presigned PUT it hands back for that part, so a part's digest has to be known
 // before its URL exists. Captured 2026-10-22.
 func PartInfo(partDigests [][]byte) string {
+	return PartInfoFrom(partDigests, 1)
+}
+
+// PartInfoFrom is PartInfo for a page of a file's parts, starting at first.
+//
+// The number in each entry is the part the URL will be for, not the entry's
+// position in this list: asking for "21-<digest>,22-<digest>" gets URLs whose
+// partNumber is 21 and 22, while asking for the same digests as "1-<digest>,..."
+// gets URLs for parts 1 and 2. Measured 2026-10-25 against the family space,
+// which is what makes a page of a large file addressable at all.
+func PartInfoFrom(partDigests [][]byte, first int) string {
 	parts := make([]string, 0, len(partDigests))
 	for i, d := range partDigests {
-		parts = append(parts, fmt.Sprintf("%d-%s", i+1, base64.StdEncoding.EncodeToString(d)))
+		parts = append(parts, fmt.Sprintf("%d-%s", first+i, base64.StdEncoding.EncodeToString(d)))
 	}
 	return strings.Join(parts, ",")
 }

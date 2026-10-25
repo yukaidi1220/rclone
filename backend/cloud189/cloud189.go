@@ -15,6 +15,7 @@ import (
 	"html"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path"
@@ -81,6 +82,15 @@ const (
 	ladderPartsLow  = 999
 	ladderPartsHigh = 1999
 	ladderMinScale  = 5
+
+	// How many parts one getMultiUploadUrls call may carry. The encrypted
+	// partInfo rides in the query string and the gateway refuses a request line
+	// over about 4 KiB with HTTP 414; measured 2026-10-25, 65 parts (3890 bytes
+	// of URI) is accepted and 70 (4146) is refused. The official client asks
+	// for 20 at a time, which is what its captured 1248-char params holds, so
+	// that is the page size here too: it leaves ample room under the limit for
+	// a longer uploadFileId.
+	partURLsPerPage = 20
 
 	// Download links are minted per space with a lifetime the client cannot
 	// choose: the personal link's expired parameter sits about 5 minutes after
@@ -3208,17 +3218,44 @@ type uploadURLsResponse struct {
 	UploadURLs map[string]partEndpoint `json:"uploadUrls"`
 }
 
-// partURLs asks for every part's presigned URL in one call.
+// partURLs asks for every part's presigned URL, a page of parts per call.
+//
+// It cannot be one call: the encrypted partInfo rides in the query string and
+// the gateway refuses a request line over about 4 KiB with HTTP 414 (measured
+// 2026-10-25: 65 parts accepted, 70 refused). A 6.69 GiB file plans 685 parts at
+// 10 MiB, whose partInfo is 19.7 KiB of plaintext - HTTP 414, every time.
+//
+// The endpoint takes a page: each entry carries the part number the URL is for,
+// so "21-<digest>,22-<digest>" gets partNumber 21 and 22 back. That is what the
+// official client does - its captured 74-part upload asked for 20 parts in a
+// 1248-char params - and it is the only thing that makes a large file
+// addressable. The catch is that api.PartInfo numbers from 1, so a page built
+// with it would ask for parts 1..20 every time; the numbering has to come from
+// the part's own index, which is what api.PartInfoFrom does.
 //
 // TODO: whether a family upload needs familyId here as well as in the init is
 // not captured; the uploadFileId already binds the session, so nothing is sent.
 func (f *Fs) partURLs(ctx context.Context, uploadFileID string, st *stagedSource) ([]partEndpoint, error) {
-	params := []api.Param{
-		{Key: "uploadFileId", Value: uploadFileID},
-		{Key: "partInfo", Value: api.PartInfo(st.partMD5s)},
-	}
 	if len(st.plans) == 0 {
 		return nil, nil
+	}
+	out := make([]partEndpoint, 0, len(st.plans))
+	for start := 0; start < len(st.plans); start += partURLsPerPage {
+		end := min(start+partURLsPerPage, len(st.plans))
+		eps, err := f.partURLsPage(ctx, uploadFileID, st, start, end)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, eps...)
+	}
+	return out, nil
+}
+
+// partURLsPage fetches the URLs for plans[start:end] in one request.
+func (f *Fs) partURLsPage(ctx context.Context, uploadFileID string, st *stagedSource, start, end int) ([]partEndpoint, error) {
+	params := []api.Param{
+		{Key: "uploadFileId", Value: uploadFileID},
+		{Key: "partInfo", Value: api.PartInfoFrom(st.partMD5s[start:end], start+1)},
 	}
 	data, err := f.callEncrypted(ctx, http.MethodGet, f.uploadPath("getMultiUploadUrls"), params)
 	if err != nil {
@@ -3231,13 +3268,16 @@ func (f *Fs) partURLs(ctx context.Context, uploadFileID string, st *stagedSource
 	if err := uploadAnswerCode(resp.Code); err != nil {
 		return nil, err
 	}
-	out := make([]partEndpoint, len(st.plans))
-	for i, p := range st.plans {
-		ep, ok := resp.UploadURLs[fmt.Sprintf("partNumber_%d", p.Index)]
+	out := make([]partEndpoint, 0, end-start)
+	for i := start; i < end; i++ {
+		// The answer is keyed by the part number that was asked for, so a page
+		// starting at part 21 comes back as partNumber_21.
+		key := fmt.Sprintf("partNumber_%d", st.plans[i].Index)
+		ep, ok := resp.UploadURLs[key]
 		if !ok || ep.RequestURL == "" {
-			return nil, fserrors.NoRetryError(fmt.Errorf("cloud189: the server gave no upload URL for part %d of %d", p.Index, len(st.plans)))
+			return nil, fserrors.NoRetryError(fmt.Errorf("cloud189: the server gave no upload URL for part %d of %d", st.plans[i].Index, len(st.plans)))
 		}
-		out[i] = ep
+		out = append(out, ep)
 	}
 	return out, nil
 }
@@ -3348,15 +3388,37 @@ func (f *Fs) putPartOnce(ctx context.Context, idx int, st *stagedSource, target 
 	}
 	req.Header.Set("user-agent", dartUserAgent)
 	req.ContentLength = part.Size
+	// Which storage node answered, and whether the connection was reused, is
+	// what tells a slow part apart from a slow path: one node behind every slow
+	// part is a different problem from every part landing somewhere new.
+	var peerAddr string
+	var reusedConn bool
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			if info.Conn != nil {
+				peerAddr = info.Conn.RemoteAddr().String()
+			}
+			reusedConn = info.Reused
+		},
+	}))
+	host := ""
+	if u, perr := url.Parse(target); perr == nil {
+		host = u.Host
+	}
+	t0 := time.Now()
 	res, err := f.partClient.Do(req)
 	if err != nil {
 		// The transport quotes the URL it failed on, and that URL is a live
 		// signature for this part.
-		return fmt.Errorf("cloud189: part %d: %w", idx+1, scrubErr(err, target))
+		return fmt.Errorf("cloud189: part %d via %s -> %s: %w", idx+1, host, peerAddr, scrubErr(err, target))
 	}
 	defer func() { _ = res.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
 	if res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusMultipleChoices {
+		elapsed := time.Since(t0)
+		fs.Debugf(f, "cloud189: uploaded part %d/%d (%v) via %s -> %s (reused=%v) in %v (%s)",
+			idx+1, len(st.plans), fs.SizeSuffix(part.Size), host, peerAddr, reusedConn,
+			elapsed.Round(time.Millisecond), fs.SizeSuffix(float64(part.Size)/elapsed.Seconds()).ByteRateUnit())
 		return nil
 	}
 	return fmt.Errorf("cloud189: part %d refused by the storage layer with HTTP %d: %s", idx+1, res.StatusCode,
@@ -3422,23 +3484,42 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, dirID, name string, size 
 // uploadStaged is the protocol itself, for bytes that are already staged and
 // hashed.
 func (f *Fs) uploadStaged(ctx context.Context, st *stagedSource, dirID, name string, size int64) (*uploadResult, error) {
+	t0 := time.Now()
 	uploadFileID, rapid, err := f.beginUpload(ctx, dirID, name, st, size)
 	if err != nil {
 		return nil, err
 	}
+	parts := len(st.plans)
+	if rapid {
+		// The init carries the digests and the server answers whether it already
+		// holds that content. A hit moves no byte, which is the single fact a
+		// migration log has to be able to show: without this line a rapid
+		// transfer and a real one look identical apart from how long they took.
+		fs.Logf(f, "cloud189: %s (%v): rapid transfer - the drive already held this content, no part uploaded, %v", name, fs.SizeSuffix(size), time.Since(t0).Round(time.Millisecond))
+	} else {
+		fs.Debugf(f, "cloud189: %s (%v): %d parts of %v, uploadFileId accepted in %v",
+			name, fs.SizeSuffix(size), parts, fs.SizeSuffix(st.partSize), time.Since(t0).Round(time.Millisecond))
+	}
 	if !rapid {
+		tParts := time.Now()
 		eps, err := f.partURLs(ctx, uploadFileID, st)
 		if err != nil {
 			return nil, err
 		}
+		fs.Debugf(f, "cloud189: %s: %d part URLs in %d pages of %d, %v", name, len(eps),
+			(len(eps)+partURLsPerPage-1)/partURLsPerPage, partURLsPerPage, time.Since(tParts).Round(time.Millisecond))
 		if err := f.putParts(ctx, name, st, eps); err != nil {
 			return nil, err
 		}
+		fs.Debugf(f, "cloud189: %s: all %d parts uploaded in %v (%v)", name, parts,
+			time.Since(tParts).Round(time.Millisecond), fs.SizeSuffix(float64(size)/time.Since(tParts).Seconds()).ByteRateUnit())
 	}
+	tCommit := time.Now()
 	res, err := f.commitUpload(ctx, uploadFileID)
 	if err != nil {
 		return nil, err
 	}
+	fs.Debugf(f, "cloud189: %s: commit returned %q in %v (total %v)", name, res.name, time.Since(tCommit).Round(time.Millisecond), time.Since(t0).Round(time.Millisecond))
 	if !rapid {
 		// The account counts bytes as they arrive. Keeping a local count of what
 		// this process has sent is what makes the next file's pre-check honest
