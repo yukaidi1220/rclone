@@ -114,13 +114,16 @@ func TestGateLetsASpaceyDriveThrough(t *testing.T) {
 
 // TestGateHonoursTheSingleFileCeiling is the permanent one: a file over the
 // account's ceiling cannot go up today at all, so there is nothing to re-read.
-func TestGateHonoursTheSingleFileCeiling(t *testing.T) {
+// TestGateDoesNotRefuseOnTheAccountsSingleFileNumber: the account publishes
+// transFileSize, but on the accounts measured it is not a limit that bites - it
+// carries the same number as the day's allowance, and the allowance is what
+// refuses. A local per-file refusal keyed on it would invent a cap the drive does
+// not enforce, so only --cloud189-max_file_size refuses here.
+func TestGateDoesNotRefuseOnTheAccountsSingleFileNumber(t *testing.T) {
 	drive := &fakeDrive{t: t, transDayFlow: miB(100), transFileSize: miB(1), usedDayFlow: 0}
 	f := newQuotaFs(t, drive)
 	_, err := f.Put(context.Background(), bytes.NewReader(pattern(int(miB(2)))), staticObject("over.bin", miB(2)))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "single-file ceiling")
-	require.Equal(t, 1, drive.privReads, "a permanent limit needs no refresh to state")
+	require.NoError(t, err, "a file above the published number still uploads when the day has room")
 }
 
 // TestMaxFileSizeOverridesTheAccount lets a person keep a run inside a budget.
