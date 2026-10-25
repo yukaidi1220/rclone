@@ -93,6 +93,9 @@ type fakeDrive struct {
 	echoWrongMD5    bool                         // the commit reports a digest that is not the file
 	keyPartsFromOne bool                         // number every answer from 1, ignoring the parts asked for
 	blankURLPart    int                          // answer this part number with an empty URL
+	skewFirstPut    bool                         // answer the first PUT 403 RequestTimeTooSkewed, then accept
+	skewed          bool                         // set once the skewed answer has been given
+	wrongDigestPart int                          // sign this part's URL with another digest
 	createBodies    []string                     // the raw form body of each createBatchTask
 	createKeys      []string                     // the sessionkey header each create was signed with
 	apiKeys         []string                     // "path sessionkey" for every signed API call
@@ -230,13 +233,17 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if d.blankURLPart == key {
 				u = ""
 			}
+			hdr := d.headerFor(plain["partInfo"], pos+1)
+			if d.wrongDigestPart == i {
+				hdr = d.headerFor(api.PartInfo([][]byte{md5Of([]byte("another part"))}), 1)
+			}
 			urls[fmt.Sprintf("partNumber_%d", key)] = map[string]any{
 				// A presigned URL of the shape the service returns: the signature
 				// lives in the query. (The download link's query arrives HTML-
 				// escaped; nothing measured says the same of these, so they are
 				// served here unescaped and the code is not asked to guess.)
 				"requestURL":    u,
-				"requestHeader": d.headerFor(plain["partInfo"], pos+1),
+				"requestHeader": hdr,
 			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"code": "SUCCESS", "uploadUrls": urls})
@@ -556,8 +563,19 @@ func (d *fakeDrive) storeRead(w http.ResponseWriter, r *http.Request) {
 func (d *fakeDrive) storePart(w http.ResponseWriter, r *http.Request, body []byte) {
 	d.mu.Lock()
 	refuse := (d.refuseFirstPut && len(d.puts) == 0) || d.refuseAllPuts
+	skew := d.skewFirstPut && !d.skewed
+	if skew {
+		d.skewed = true
+	}
 	d.puts = append(d.puts, putCall{part: path.Base(r.URL.Path), headers: flattenHeaders(r.Header), body: body, contentLength: r.ContentLength})
 	d.mu.Unlock()
+	if skew {
+		// The storage layer refuses a URL whose signed Date is too old. The bytes
+		// arrived and matched, so this is not a digest problem: only a newer URL
+		// can fix it.
+		writeJSON(w, http.StatusForbidden, map[string]any{"Error": map[string]any{"Code": "RequestTimeTooSkewed"}})
+		return
+	}
 	if refuse {
 		// The storage layer quotes back the request it refused, query and all.
 		writeJSON(w, http.StatusBadRequest, map[string]any{"Error": "SignatureDoesNotMatch", "RequestPath": r.URL.String()})
@@ -653,9 +671,18 @@ func TestUploadMintsOneURLPerPart(t *testing.T) {
 		require.True(t, asked[fmt.Sprint(i)], "part %d was never asked for", i)
 	}
 
-	// Every part went up with its own digest, and the request for a part came
-	// before the part itself.
+	// Every part went up with its own digest, and the URL that carried it named
+	// the part whose bytes those are: a slot swap would show up here even though
+	// each PUT's digest matches its own body.
 	require.Len(t, drive.puts, parts)
+	for _, put := range drive.puts {
+		var n int
+		_, err := fmt.Sscanf(put.part, "part%d", &n)
+		require.NoError(t, err, "unexpected storage path %q", put.part)
+		start := int64(n-1) * fakePartBase
+		end := min(start+fakePartBase, int64(len(content)))
+		require.Equal(t, content[start:end], put.body, "the PUT to %s carried another part's bytes", put.part)
+	}
 	sent := map[string]bool{}
 	for _, put := range drive.puts {
 		d := base64.StdEncoding.EncodeToString(md5Of(put.body))
@@ -672,14 +699,27 @@ func TestUploadMintsOneURLPerPart(t *testing.T) {
 // from 1 would be handed part 1's URL for every part, and uploading through it
 // writes one part's bytes into another part's slot. The upload must refuse.
 func TestUploadRefusesAURLKeyedFromOne(t *testing.T) {
+	noWaiting(t)
 	drive := &fakeDrive{t: t, keyPartsFromOne: true}
 	f := newFakeFs(t, drive)
 	content := pattern(int(fakePartBase) * 3)
 
 	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("big.bin", int64(len(content))))
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "gave no upload URL for part")
-	require.Empty(t, drive.puts, "no part is sent through a URL that belongs to another part")
+	require.Contains(t, err.Error(), "gave no upload URL for part 2")
+
+	// Parts that were already in flight may still have been sent, which is fine:
+	// what must never happen is bytes going up under a URL that names another
+	// part. Check that by looking at what each accepted PUT actually carried.
+	for _, put := range drive.puts {
+		var n int
+		_, perr := fmt.Sscanf(put.part, "part%d", &n)
+		require.NoError(t, perr, "unexpected storage path %q", put.part)
+		start := int64(n-1) * fakePartBase
+		end := min(start+fakePartBase, int64(len(content)))
+		require.Equal(t, len(content[start:end]), len(put.body), "the PUT to %s carried another part's bytes", put.part)
+		require.Equal(t, content[start:end][:16], put.body[:16], "the PUT to %s carried another part's bytes", put.part)
+	}
 }
 
 // TestUploadRefusesAPartWithNoURLLine: a present entry whose URL is empty is
@@ -693,6 +733,38 @@ func TestUploadRefusesAPartWithNoURLLine(t *testing.T) {
 	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "gave no upload URL for part 2")
+}
+
+// TestARefusedPartURLIsMintedAgain is the RequestTimeTooSkewed case end to end:
+// the storage layer refuses a PUT because the URL it carries is too old, and the
+// retry asks for a newer URL instead of replaying the refused one. Without the
+// mint inside the attempt loop this test cannot pass, because the fake signs one
+// URL per part per request and the second attempt would have nothing new.
+func TestARefusedPartURLIsMintedAgain(t *testing.T) {
+	noWaiting(t)
+	drive := &fakeDrive{t: t, skewFirstPut: true}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase))
+
+	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
+	require.NoError(t, err, "a URL refused as too old must not fail the file")
+	require.Len(t, drive.puts, 2, "the part was sent twice: once refused, once accepted")
+	require.Len(t, drive.urlPlains, 2, "each attempt asked for its own URL")
+	require.Equal(t, drive.urlPlains[0]["partInfo"], drive.urlPlains[1]["partInfo"], "and asked for the same part")
+}
+
+// TestUploadRefusesAURLSignedForAnotherPart pins the digest check: an answer
+// carrying another part's Content-MD5 is not a URL this part can be sent
+// through, and no fixture should ever be able to talk the upload into it.
+func TestUploadRefusesAURLSignedForAnotherPart(t *testing.T) {
+	noWaiting(t)
+	drive := &fakeDrive{t: t, wrongDigestPart: 2}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase) * 3)
+
+	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "carries another part's digest")
 }
 
 func flattenHeaders(h http.Header) map[string]string {
