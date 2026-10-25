@@ -8,6 +8,7 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -82,15 +83,6 @@ const (
 	ladderPartsLow  = 999
 	ladderPartsHigh = 1999
 	ladderMinScale  = 5
-
-	// How many parts one getMultiUploadUrls call may carry. The encrypted
-	// partInfo rides in the query string and the gateway refuses a request line
-	// over about 4 KiB with HTTP 414; measured 2026-10-25, 65 parts (3890 bytes
-	// of URI) is accepted and 70 (4146) is refused. The official client asks
-	// for 20 at a time, which is what its captured 1248-char params holds, so
-	// that is the page size here too: it leaves ample room under the limit for
-	// a longer uploadFileId.
-	partURLsPerPage = 20
 
 	// Download links are minted per space with a lifetime the client cannot
 	// choose: the personal link's expired parameter sits about 5 minutes after
@@ -3218,68 +3210,56 @@ type uploadURLsResponse struct {
 	UploadURLs map[string]partEndpoint `json:"uploadUrls"`
 }
 
-// partURLs asks for every part's presigned URL, a page of parts per call.
+// partURL mints the presigned URL for one part, asked for immediately before
+// that part is sent and asked for again on every retry.
 //
-// It cannot be one call: the encrypted partInfo rides in the query string and
-// the gateway refuses a request line over about 4 KiB with HTTP 414 (measured
-// 2026-10-25: 65 parts accepted, 70 refused). A 6.69 GiB file plans 685 parts at
-// 10 MiB, whose partInfo is 19.7 KiB of plaintext - HTTP 414, every time.
+// Two measured reasons for one part per call rather than the whole file:
 //
-// The endpoint takes a page: each entry carries the part number the URL is for,
-// so "21-<digest>,22-<digest>" gets partNumber 21 and 22 back. That is what the
-// official client does - its captured 74-part upload asked for 20 parts in a
-// 1248-char params - and it is the only thing that makes a large file
-// addressable. The catch is that api.PartInfo numbers from 1, so a page built
-// with it would ask for parts 1..20 every time; the numbering has to come from
-// the part's own index, which is what api.PartInfoFrom does.
+//   - The signature carries the time it was issued. A URL minted for a whole
+//     file and used minutes later is refused by the storage layer with HTTP 403
+//     RequestTimeTooSkewed (measured 2026-10-26 on part 12 of a 102-part file),
+//     and the PUT replays the Date header from the mint, so the only cure is a
+//     newer URL.
+//   - The encrypted partInfo rides in the request line, which the gateway
+//     refuses over about 4 KiB with HTTP 414 (measured 2026-10-25: 65 parts
+//     accepted, 70 refused). One part per call keeps that request tiny whatever
+//     the file's part count, so there is no page size to tune and no 414 to hit.
+//
+// The part number is the part's real index, not its position in a batch: the
+// server keys its answer by the number asked for (measured 2026-10-25), and a
+// one-part page numbered from 1 every time would keep returning part 1's URL.
 //
 // TODO: whether a family upload needs familyId here as well as in the init is
 // not captured; the uploadFileId already binds the session, so nothing is sent.
-func (f *Fs) partURLs(ctx context.Context, uploadFileID string, st *stagedSource) ([]partEndpoint, error) {
-	if len(st.plans) == 0 {
-		return nil, nil
-	}
-	out := make([]partEndpoint, 0, len(st.plans))
-	for start := 0; start < len(st.plans); start += partURLsPerPage {
-		end := min(start+partURLsPerPage, len(st.plans))
-		eps, err := f.partURLsPage(ctx, uploadFileID, st, start, end)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, eps...)
-	}
-	return out, nil
-}
-
-// partURLsPage fetches the URLs for plans[start:end] in one request.
-func (f *Fs) partURLsPage(ctx context.Context, uploadFileID string, st *stagedSource, start, end int) ([]partEndpoint, error) {
+func (f *Fs) partURL(ctx context.Context, uploadFileID string, st *stagedSource, idx int) (partEndpoint, error) {
+	plan := st.plans[idx]
 	params := []api.Param{
 		{Key: "uploadFileId", Value: uploadFileID},
-		{Key: "partInfo", Value: api.PartInfoFrom(st.partMD5s[start:end], start+1)},
+		{Key: "partInfo", Value: api.PartInfoFrom(st.partMD5s[idx:idx+1], plan.Index)},
 	}
 	data, err := f.callEncrypted(ctx, http.MethodGet, f.uploadPath("getMultiUploadUrls"), params)
 	if err != nil {
-		return nil, err
+		return partEndpoint{}, err
 	}
 	var resp uploadURLsResponse
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, fmt.Errorf("cloud189: decoding getMultiUploadUrls: %w", err)
+		return partEndpoint{}, fmt.Errorf("cloud189: decoding getMultiUploadUrls: %w", err)
 	}
 	if err := uploadAnswerCode(resp.Code); err != nil {
-		return nil, err
+		return partEndpoint{}, err
 	}
-	out := make([]partEndpoint, 0, end-start)
-	for i := start; i < end; i++ {
-		// The answer is keyed by the part number that was asked for, so a page
-		// starting at part 21 comes back as partNumber_21.
-		key := fmt.Sprintf("partNumber_%d", st.plans[i].Index)
-		ep, ok := resp.UploadURLs[key]
-		if !ok || ep.RequestURL == "" {
-			return nil, fserrors.NoRetryError(fmt.Errorf("cloud189: the server gave no upload URL for part %d of %d", st.plans[i].Index, len(st.plans)))
-		}
-		out = append(out, ep)
+	ep, ok := resp.UploadURLs[fmt.Sprintf("partNumber_%d", plan.Index)]
+	if !ok || ep.RequestURL == "" {
+		return partEndpoint{}, fserrors.NoRetryError(fmt.Errorf("cloud189: the server gave no upload URL for part %d of %d", plan.Index, len(st.plans)))
 	}
-	return out, nil
+	// The promise that this URL is for this part is the digest the storage layer
+	// will check the bytes against. If it is not the digest that was asked for,
+	// the answer belongs to another part and sending through it would write one
+	// part's bytes into another part's slot.
+	if want := base64.StdEncoding.EncodeToString(st.partMD5s[idx]); !strings.Contains(ep.RequestHeader, want) {
+		return partEndpoint{}, fserrors.NoRetryError(fmt.Errorf("cloud189: the upload URL for part %d carries another part's digest", plan.Index))
+	}
+	return ep, nil
 }
 
 // partRetryDelay is how long to wait before trying a part again. It is a
@@ -3307,23 +3287,24 @@ var partRetryDelay = func(attempt, partIndex int) time.Duration {
 // refused with HTTP 400 could be sent again on the same presigned URL and the
 // upload then committed with the right digest, so a bad part does not poison the
 // session and the file does not have to start over.
-func (f *Fs) putParts(ctx context.Context, name string, st *stagedSource, eps []partEndpoint) error {
-	if len(eps) == 0 {
+func (f *Fs) putParts(ctx context.Context, name, uploadFileID string, st *stagedSource) error {
+	n := len(st.plans)
+	if n == 0 {
 		return nil
 	}
-	if len(eps) == 1 {
-		return f.putPart(ctx, name, 0, 1, st, eps[0])
+	if n == 1 {
+		return f.putPart(ctx, name, 0, 1, st, uploadFileID)
 	}
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(f.opt.UploadConcurrency)
-	for i := range eps {
+	for i := 0; i < n; i++ {
 		if gctx.Err() != nil {
 			// A part that ran out of attempts cancels the rest. Launching them
 			// anyway would only send requests the upload cannot use.
 			break
 		}
 		i := i
-		g.Go(func() error { return f.putPart(gctx, name, i, len(eps), st, eps[i]) })
+		g.Go(func() error { return f.putPart(gctx, name, i, n, st, uploadFileID) })
 	}
 	if err := g.Wait(); err != nil {
 		return err
@@ -3336,21 +3317,26 @@ func (f *Fs) putParts(ctx context.Context, name string, st *stagedSource, eps []
 // Exhausting them is marked NoLowLevelRetry: the copy engine then stops
 // re-uploading the whole file, while --retries is still free to re-run the
 // transfer with a fresh session.
-func (f *Fs) putPart(ctx context.Context, name string, idx, total int, st *stagedSource, ep partEndpoint) error {
-	headers := api.ParseRequestHeader(ep.RequestHeader)
-	target, err := f.partURLFor(ep.RequestURL)
-	if err != nil {
-		return fserrors.NoLowLevelRetryError(err)
-	}
+func (f *Fs) putPart(ctx context.Context, name string, idx, total int, st *stagedSource, uploadFileID string) error {
 	attempts := max(fs.GetConfig(ctx).LowLevelRetries, 1)
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		err := f.putPartOnce(ctx, idx, st, target, headers)
+		// A fresh URL every attempt, not one carried in from outside the loop:
+		// the signature is dated, and a retry of a URL that was refused for
+		// being too old would be refused for being too old again.
+		ep, err := f.partURL(ctx, uploadFileID, st, idx)
 		if err == nil {
-			return nil
+			var target string
+			target, err = f.partURLFor(ep.RequestURL)
+			if err == nil {
+				err = f.putPartOnce(ctx, idx, st, target, api.ParseRequestHeader(ep.RequestHeader))
+				if err == nil {
+					return nil
+				}
+			}
 		}
 		if fserrors.IsNoRetryError(err) || fserrors.IsNoLowLevelRetryError(err) {
 			return err
@@ -3359,7 +3345,7 @@ func (f *Fs) putPart(ctx context.Context, name string, idx, total int, st *stage
 		if attempt == attempts {
 			break
 		}
-		fs.Debugf(f, "cloud189: %s: part %d/%d attempt %d/%d failed, retrying: %v", name, idx+1, total, attempt, attempts, err)
+		fs.Debugf(f, "cloud189: %s: part %d/%d attempt %d/%d failed, retrying with a fresh URL: %v", name, idx+1, total, attempt, attempts, err)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -3502,13 +3488,10 @@ func (f *Fs) uploadStaged(ctx context.Context, st *stagedSource, dirID, name str
 	}
 	if !rapid {
 		tParts := time.Now()
-		eps, err := f.partURLs(ctx, uploadFileID, st)
-		if err != nil {
-			return nil, err
-		}
-		fs.Debugf(f, "cloud189: %s: %d part URLs in %d pages of %d, %v", name, len(eps),
-			(len(eps)+partURLsPerPage-1)/partURLsPerPage, partURLsPerPage, time.Since(tParts).Round(time.Millisecond))
-		if err := f.putParts(ctx, name, st, eps); err != nil {
+		// Each part's URL is minted just before that part is sent, so there is no
+		// list of URLs to fetch here and nothing that can go stale while the file
+		// uploads.
+		if err := f.putParts(ctx, name, uploadFileID, st); err != nil {
 			return nil, err
 		}
 		fs.Debugf(f, "cloud189: %s: all %d parts uploaded in %v (%v)", name, parts,
