@@ -81,10 +81,11 @@ and always settable with `rclone config set <remote> <key> <value>`:
 - `--cloud189-no_refresh`: never exchange the access token again after the
   remote is opened. By default a request the server refuses with
   `InvalidSessionKey` is retried once on a freshly exchanged session. Measured
-  2026-10-22, that exchange is safe to share: it keeps the session secret, hands
-  out a new session key, and the key it replaces keeps working, so the official
-  client is not signed out. Set this to make rclone fail loudly instead of
-  touching the login at all.
+  2026-10-22 and 2026-10-25, that exchange is safe to share: it hands out a new
+  session key (the secret usually changes too) and the key it replaces keeps
+  answering, so the official client and other runs are not signed out - six
+  exchanges in a row left six keys alive at the same time. Set this to make
+  rclone fail loudly instead of touching the login at all.
 - `--cloud189-hard_delete`: delete permanently. The drive has no delete that
   skips the recycle bin, so rclone deletes normally and then clears exactly the
   entries it just put there. See
@@ -149,8 +150,11 @@ same response carries a second key, `familySessionKey`, which is what signs ever
 field is read separately, so a server that changes that does not silently break
 family traffic.
 
-The exchange does not revoke the session it replaces, so a remote and the
-official client can be open at the same time.
+The exchange does not revoke the session it replaces: six exchanges in a row, one
+after another, left all six keys answering at once (2026-10-25), so a run, the
+official client and other runs can be open at the same time. How long an old key
+keeps answering, and whether an account holds any cap on how many can coexist,
+has not been measured.
 
 When the server rejects a session mid-run, rclone exchanges it and rebuilds the
 one request that failed. The request reports which key it was signed with, so
