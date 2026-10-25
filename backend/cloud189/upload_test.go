@@ -560,6 +560,25 @@ func (d *fakeDrive) storeRead(w http.ResponseWriter, r *http.Request) {
 // storePart is the storage layer. It compares the arriving bytes with the
 // Content-MD5 it signed into the URL, which is the earliest and hardest check in
 // this protocol - earlier than anything the drive itself does.
+// putCalls and urlRequests copy under the lock. A request that was aborted when
+// the upload gave up can still be arriving when the test looks, so reading the
+// slices directly is a data race (caught by -race in CI).
+func (d *fakeDrive) putCalls() []putCall {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]putCall, len(d.puts))
+	copy(out, d.puts)
+	return out
+}
+
+func (d *fakeDrive) urlRequests() []map[string]string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]map[string]string, len(d.urlPlains))
+	copy(out, d.urlPlains)
+	return out
+}
+
 func (d *fakeDrive) storePart(w http.ResponseWriter, r *http.Request, body []byte) {
 	d.mu.Lock()
 	refuse := (d.refuseFirstPut && len(d.puts) == 0) || d.refuseAllPuts
@@ -660,9 +679,10 @@ func TestUploadMintsOneURLPerPart(t *testing.T) {
 	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("big.bin", int64(len(content))))
 	require.NoError(t, err)
 
-	require.Len(t, drive.urlPlains, parts, "one URL request per part")
+	urls := drive.urlRequests()
+	require.Len(t, urls, parts, "one URL request per part")
 	asked := map[string]bool{}
-	for _, plain := range drive.urlPlains {
+	for _, plain := range urls {
 		require.Equal(t, 1, partsFromInfo(plain["partInfo"]), "a request carried more than one part: %q", plain["partInfo"])
 		num, _, _ := strings.Cut(plain["partInfo"], "-")
 		asked[num] = true
@@ -674,8 +694,9 @@ func TestUploadMintsOneURLPerPart(t *testing.T) {
 	// Every part went up with its own digest, and the URL that carried it named
 	// the part whose bytes those are: a slot swap would show up here even though
 	// each PUT's digest matches its own body.
-	require.Len(t, drive.puts, parts)
-	for _, put := range drive.puts {
+	puts := drive.putCalls()
+	require.Len(t, puts, parts)
+	for _, put := range puts {
 		var n int
 		_, err := fmt.Sscanf(put.part, "part%d", &n)
 		require.NoError(t, err, "unexpected storage path %q", put.part)
@@ -684,7 +705,7 @@ func TestUploadMintsOneURLPerPart(t *testing.T) {
 		require.Equal(t, content[start:end], put.body, "the PUT to %s carried another part's bytes", put.part)
 	}
 	sent := map[string]bool{}
-	for _, put := range drive.puts {
+	for _, put := range puts {
 		d := base64.StdEncoding.EncodeToString(md5Of(put.body))
 		require.Equal(t, d, put.headers["content-md5"], "a PUT whose digest is not its own bytes")
 		sent[d] = true
@@ -711,7 +732,7 @@ func TestUploadRefusesAURLKeyedFromOne(t *testing.T) {
 	// Parts that were already in flight may still have been sent, which is fine:
 	// what must never happen is bytes going up under a URL that names another
 	// part. Check that by looking at what each accepted PUT actually carried.
-	for _, put := range drive.puts {
+	for _, put := range drive.putCalls() {
 		var n int
 		_, perr := fmt.Sscanf(put.part, "part%d", &n)
 		require.NoError(t, perr, "unexpected storage path %q", put.part)
@@ -748,9 +769,10 @@ func TestARefusedPartURLIsMintedAgain(t *testing.T) {
 
 	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
 	require.NoError(t, err, "a URL refused as too old must not fail the file")
-	require.Len(t, drive.puts, 2, "the part was sent twice: once refused, once accepted")
-	require.Len(t, drive.urlPlains, 2, "each attempt asked for its own URL")
-	require.Equal(t, drive.urlPlains[0]["partInfo"], drive.urlPlains[1]["partInfo"], "and asked for the same part")
+	require.Len(t, drive.putCalls(), 2, "the part was sent twice: once refused, once accepted")
+	urls := drive.urlRequests()
+	require.Len(t, urls, 2, "each attempt asked for its own URL")
+	require.Equal(t, urls[0]["partInfo"], urls[1]["partInfo"], "and asked for the same part")
 }
 
 // TestUploadRefusesAURLSignedForAnotherPart pins the digest check: an answer
@@ -895,7 +917,7 @@ func TestPutLandsUnderItsName(t *testing.T) {
 	// Every part went up as the storage layer asked for it. Parts run
 	// concurrently, so they are looked up by the URL they were sent to rather
 	// than by the order they arrived in.
-	require.Len(t, drive.puts, 3)
+	require.Len(t, drive.putCalls(), 3)
 	for i := range 3 {
 		name := fmt.Sprintf("part%d", i+1)
 		put := putFor(t, drive, name)
@@ -911,7 +933,7 @@ func TestPutLandsUnderItsName(t *testing.T) {
 	// The declared digests are what the URLs were issued against, one part per
 	// call and each carrying that part's real number.
 	var asked []string
-	for _, plain := range drive.urlPlains {
+	for _, plain := range drive.urlRequests() {
 		asked = append(asked, plain["partInfo"])
 	}
 	sort.Strings(asked)
@@ -1374,10 +1396,12 @@ func TestRefusedPartIsSentAgainWithAFreshURL(t *testing.T) {
 
 	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("again.bin", int64(len(content))))
 	require.NoError(t, err, "a part refused on its first attempt must still complete the upload")
-	require.Len(t, drive.puts, 2, "the same part was sent twice")
-	require.Equal(t, drive.puts[0].body, drive.puts[1].body)
-	require.Len(t, drive.urlPlains, 2, "the retry minted a fresh URL instead of replaying the refused one")
-	require.Equal(t, drive.urlPlains[0]["partInfo"], drive.urlPlains[1]["partInfo"], "and asked for the same part")
+	puts := drive.putCalls()
+	require.Len(t, puts, 2, "the same part was sent twice")
+	require.Equal(t, puts[0].body, puts[1].body)
+	urls := drive.urlRequests()
+	require.Len(t, urls, 2, "the retry minted a fresh URL instead of replaying the refused one")
+	require.Equal(t, urls[0]["partInfo"], urls[1]["partInfo"], "and asked for the same part")
 }
 
 // TestPartRetriesStopAtLowLevelRetries: a part that never succeeds must fail the
@@ -1393,7 +1417,7 @@ func TestPartRetriesStopAtLowLevelRetries(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "attempts")
 	require.True(t, fserrors.IsNoLowLevelRetryError(err), "the exhausted part must stop the low level ladder, not restart it")
-	require.Equal(t, max(fs.GetConfig(context.Background()).LowLevelRetries, 1), len(drive.puts))
+	require.Equal(t, max(fs.GetConfig(context.Background()).LowLevelRetries, 1), len(drive.putCalls()))
 	// The upload never got to the commit, so nothing was left half written.
 	require.Empty(t, sequenceContains(sequenceOf(drive), "POST /person/commitMultiUploadFile"))
 }
@@ -1647,7 +1671,7 @@ func TestChunkWriterEndToEnd(t *testing.T) {
 	}
 	require.NoError(t, w.Close(context.Background()))
 
-	require.Len(t, drive.puts, 3)
+	require.Len(t, drive.putCalls(), 3)
 	require.Equal(t, "cut.bin", drive.initPlains[0]["fileName"])
 	require.Equal(t, upperHex(content), drive.initPlains[0]["fileMd5"])
 	require.Equal(t, expectedSliceMD5(content, fakePartBase), drive.initPlains[0]["sliceMd5"])
