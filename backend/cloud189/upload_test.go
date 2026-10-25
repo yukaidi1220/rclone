@@ -91,6 +91,7 @@ type fakeDrive struct {
 	listings        map[string]string            // per-directory listings, keyed by folderId
 	echoWrongMD5    bool                         // the commit reports a digest that is not the file
 	keyPartsFromOne bool                         // number every answer from 1, ignoring the parts asked for
+	blankURLPart    int                          // answer this part number with an empty URL
 	createBodies    []string                     // the raw form body of each createBatchTask
 	createKeys      []string                     // the sessionkey header each create was signed with
 	apiKeys         []string                     // "path sessionkey" for every signed API call
@@ -224,12 +225,16 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if d.keyPartsFromOne {
 				key = pos + 1
 			}
+			u := "http://" + r.Host + fmt.Sprintf("/store/part%d?X-Amz-Signature=PART-SIGNATURE-%d&a=1&b=2", i, i)
+			if d.blankURLPart == key {
+				u = ""
+			}
 			urls[fmt.Sprintf("partNumber_%d", key)] = map[string]any{
 				// A presigned URL of the shape the service returns: the signature
 				// lives in the query. (The download link's query arrives HTML-
 				// escaped; nothing measured says the same of these, so they are
 				// served here unescaped and the code is not asked to guess.)
-				"requestURL":    "http://" + r.Host + fmt.Sprintf("/store/part%d?X-Amz-Signature=PART-SIGNATURE-%d&a=1&b=2", i, i),
+				"requestURL":    u,
 				"requestHeader": d.headerFor(plain["partInfo"], pos+1),
 			}
 		}
@@ -672,6 +677,19 @@ func TestUploadRefusesAPageKeyedFromOne(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "gave no upload URL for part")
 	require.Empty(t, drive.puts, "no part is sent through a URL that belongs to another part")
+}
+
+// TestUploadRefusesAPartWithNoURLLine: a present entry whose URL is empty is
+// not an upload target. Sending through it would fail the PUT on an empty
+// address, and the part would be reported missing only at commit.
+func TestUploadRefusesAPartWithNoURLLine(t *testing.T) {
+	drive := &fakeDrive{t: t, blankURLPart: 2}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase) * 3)
+
+	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "gave no upload URL for part 2")
 }
 
 func flattenHeaders(h http.Header) map[string]string {
