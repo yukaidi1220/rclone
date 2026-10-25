@@ -3250,14 +3250,18 @@ func (f *Fs) partURL(ctx context.Context, uploadFileID string, st *stagedSource,
 	}
 	ep, ok := resp.UploadURLs[fmt.Sprintf("partNumber_%d", plan.Index)]
 	if !ok || ep.RequestURL == "" {
-		return partEndpoint{}, fserrors.NoRetryError(fmt.Errorf("cloud189: the server gave no upload URL for part %d of %d", plan.Index, len(st.plans)))
+		// Deliberately not marked NoRetry. The caller asks once per part, and a
+		// file of many parts would otherwise be abandoned by a single unusable
+		// answer, with --retries unable to help. The retry asks again, and only
+		// exhaustion is marked, so --retries can still re-run the whole file.
+		return partEndpoint{}, fmt.Errorf("cloud189: the server gave no upload URL for part %d of %d", plan.Index, len(st.plans))
 	}
 	// The promise that this URL is for this part is the digest the storage layer
 	// will check the bytes against. If it is not the digest that was asked for,
 	// the answer belongs to another part and sending through it would write one
 	// part's bytes into another part's slot.
 	if want := base64.StdEncoding.EncodeToString(st.partMD5s[idx]); !strings.Contains(ep.RequestHeader, want) {
-		return partEndpoint{}, fserrors.NoRetryError(fmt.Errorf("cloud189: the upload URL for part %d carries another part's digest", plan.Index))
+		return partEndpoint{}, fmt.Errorf("cloud189: the upload URL for part %d carries another part's digest", plan.Index)
 	}
 	return ep, nil
 }
@@ -3331,11 +3335,14 @@ func (f *Fs) putPart(ctx context.Context, name string, idx, total int, st *stage
 		if err == nil {
 			var target string
 			target, err = f.partURLFor(ep.RequestURL)
-			if err == nil {
-				err = f.putPartOnce(ctx, idx, st, target, api.ParseRequestHeader(ep.RequestHeader))
-				if err == nil {
-					return nil
-				}
+			if err != nil {
+				// A URL this build cannot turn into a request (a broken
+				// upload_zone, say) is the state of the configuration, not of the
+				// network: retrying it only buys another mint.
+				return fserrors.NoLowLevelRetryError(err)
+			}
+			if err = f.putPartOnce(ctx, idx, st, target, api.ParseRequestHeader(ep.RequestHeader)); err == nil {
+				return nil
 			}
 		}
 		if fserrors.IsNoRetryError(err) || fserrors.IsNoLowLevelRetryError(err) {
