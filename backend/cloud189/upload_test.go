@@ -80,22 +80,23 @@ type fakeDrive struct {
 	urlPlains   []map[string]string
 	commitPlain map[string]string
 
-	fileDataExists string // "1" means the content is already on the drive
-	commitName     string // the name the commit reports; empty means the requested one
-	commitID       string
-	commitIDBare   bool                         // answer the id as a bare number, the way the capture does
-	failInstall    bool                         // the rename that should give the new object its name collides
-	refuseFirstPut bool                         // the storage layer answers the first PUT 400, then accepts it
-	refuseAllPuts  bool                         // and never accepts one after that
-	listing        string                       // JSON the listing answers with
-	listings       map[string]string            // per-directory listings, keyed by folderId
-	echoWrongMD5   bool                         // the commit reports a digest that is not the file
-	createBodies   []string                     // the raw form body of each createBatchTask
-	createKeys     []string                     // the sessionkey header each create was signed with
-	apiKeys        []string                     // "path sessionkey" for every signed API call
-	listingFn      func(r *http.Request) string // a drive whose contents change as the test goes
-	taskStates     []int64                      // the taskStatus values the polls answer, in order
-	taskSubs       int                          // object count of the task the next task poll answers
+	fileDataExists  string // "1" means the content is already on the drive
+	commitName      string // the name the commit reports; empty means the requested one
+	commitID        string
+	commitIDBare    bool                         // answer the id as a bare number, the way the capture does
+	failInstall     bool                         // the rename that should give the new object its name collides
+	refuseFirstPut  bool                         // the storage layer answers the first PUT 400, then accepts it
+	refuseAllPuts   bool                         // and never accepts one after that
+	listing         string                       // JSON the listing answers with
+	listings        map[string]string            // per-directory listings, keyed by folderId
+	echoWrongMD5    bool                         // the commit reports a digest that is not the file
+	keyPartsFromOne bool                         // number every answer from 1, ignoring the parts asked for
+	createBodies    []string                     // the raw form body of each createBatchTask
+	createKeys      []string                     // the sessionkey header each create was signed with
+	apiKeys         []string                     // "path sessionkey" for every signed API call
+	listingFn       func(r *http.Request) string // a drive whose contents change as the test goes
+	taskStates      []int64                      // the taskStatus values the polls answer, in order
+	taskSubs        int                          // object count of the task the next task poll answers
 
 	// The download link and the storage layer on the way down.
 	downloadLink string            // what getFileDownloadUrl answers; empty means the escaped link below
@@ -214,16 +215,22 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.mu.Lock()
 		d.urlPlains = append(d.urlPlains, plain)
 		d.mu.Unlock()
-		n := partsFromInfo(plain["partInfo"])
+		// The answer is keyed by the part numbers the request carried, which is
+		// what makes a page of a large file addressable (measured 2026-10-25).
+		nums := partNumbersFromInfo(t, plain["partInfo"])
 		urls := map[string]any{}
-		for i := 1; i <= n; i++ {
-			urls[fmt.Sprintf("partNumber_%d", i)] = map[string]any{
+		for pos, i := range nums {
+			key := i
+			if d.keyPartsFromOne {
+				key = pos + 1
+			}
+			urls[fmt.Sprintf("partNumber_%d", key)] = map[string]any{
 				// A presigned URL of the shape the service returns: the signature
 				// lives in the query. (The download link's query arrives HTML-
 				// escaped; nothing measured says the same of these, so they are
 				// served here unescaped and the code is not asked to guess.)
 				"requestURL":    "http://" + r.Host + fmt.Sprintf("/store/part%d?X-Amz-Signature=PART-SIGNATURE-%d&a=1&b=2", i, i),
-				"requestHeader": d.headerFor(plain["partInfo"], i),
+				"requestHeader": d.headerFor(plain["partInfo"], pos+1),
 			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"code": "SUCCESS", "uploadUrls": urls})
@@ -578,11 +585,93 @@ func digestsFromPartInfo(t *testing.T, partInfo string) [][]byte {
 	return out
 }
 
+// partNumbersFromInfo returns the part numbers a partInfo asks for, in order.
+func partNumbersFromInfo(t *testing.T, partInfo string) []int {
+	t.Helper()
+	var out []int
+	for _, item := range strings.Split(partInfo, ",") {
+		num, _, ok := strings.Cut(item, "-")
+		if !ok {
+			t.Fatalf("partInfo item %q is not number-digest", item)
+		}
+		n, err := strconv.Atoi(num)
+		if err != nil {
+			t.Fatalf("partInfo item %q has a bad number: %v", item, err)
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
 func partsFromInfo(partInfo string) int {
 	if partInfo == "" {
 		return 0
 	}
 	return len(strings.Split(partInfo, ","))
+}
+
+// TestUploadAsksForPartURLsInPages: the encrypted partInfo rides in the query
+// string and the gateway refuses a request line over about 4 KiB with HTTP 414
+// (measured 2026-10-25: 65 parts accepted, 70 refused), so a file with more
+// parts than one page is asked for page by page. Each page has to carry its
+// parts' REAL numbers: the server keys the answer by the number asked for, and
+// numbering every page from 1 would ask for the first parts again.
+func TestUploadAsksForPartURLsInPages(t *testing.T) {
+	const parts = 2*partURLsPerPage + 7
+	drive := &fakeDrive{t: t}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase) * parts)
+
+	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("big.bin", int64(len(content))))
+	require.NoError(t, err)
+
+	pages := (parts + partURLsPerPage - 1) / partURLsPerPage
+	require.Len(t, drive.urlPlains, pages, "%d parts at %d per page", parts, partURLsPerPage)
+	var asked []string
+	for i, plain := range drive.urlPlains {
+		n := partsFromInfo(plain["partInfo"])
+		require.LessOrEqual(t, n, partURLsPerPage, "page %d carried %d parts", i+1, n)
+		for _, item := range strings.Split(plain["partInfo"], ",") {
+			num, _, _ := strings.Cut(item, "-")
+			asked = append(asked, num)
+		}
+	}
+	// Every part number from 1 to parts, once, in order.
+	want := make([]string, 0, parts)
+	for i := 1; i <= parts; i++ {
+		want = append(want, fmt.Sprint(i))
+	}
+	require.Equal(t, want, asked, "the pages together asked for every part once, in order")
+
+	// And each part's bytes went up with its own digest.
+	require.Len(t, drive.puts, parts)
+	sent := map[string]bool{}
+	for _, put := range drive.puts {
+		d := base64.StdEncoding.EncodeToString(md5Of(put.body))
+		require.Equal(t, d, put.headers["content-md5"], "a PUT whose digest is not its own bytes")
+		sent[d] = true
+	}
+	for i, d := range md5sOfParts(content, fakePartBase) {
+		require.True(t, sent[base64.StdEncoding.EncodeToString(d)], "part %d never went up", i+1)
+	}
+}
+
+// TestUploadRefusesAPageKeyedFromOne: the server keys its answer by the part
+// numbers the request carried. If it ever renumbered a page from 1 - which is
+// what api.PartInfo would ask for, and what an implementation that forgets the
+// page offset sends - the URLs would belong to the wrong parts, and uploading
+// through them writes one part's bytes into another part's slot. The upload has
+// to refuse rather than send.
+func TestUploadRefusesAPageKeyedFromOne(t *testing.T) {
+	const parts = partURLsPerPage + 3
+	drive := &fakeDrive{t: t, keyPartsFromOne: true}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase) * parts)
+
+	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("big.bin", int64(len(content))))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "gave no upload URL for part")
+	require.Empty(t, drive.puts, "no part is sent through a URL that belongs to another part")
 }
 
 func flattenHeaders(h http.Header) map[string]string {
