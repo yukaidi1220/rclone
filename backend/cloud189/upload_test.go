@@ -107,6 +107,7 @@ type fakeDrive struct {
 	readCut      []int64           // bytes to send while announcing the whole body, for each read
 	folders      map[string]string // directory name to id, for a createFolder
 	mkdirs       []string          // the directory names the drive was asked to create
+	mkdirQueries []url.Values      // the query each createFolder arrived with
 
 	// The account's own numbers. Left at zero the gates find nothing to gate on,
 	// which is what a drive that did not answer looks like to the code.
@@ -292,6 +293,7 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		name := q.Get("folderName")
 		d.mu.Lock()
 		d.mkdirs = append(d.mkdirs, name)
+		d.mkdirQueries = append(d.mkdirQueries, q)
 		id := d.folders[name]
 		d.mu.Unlock()
 		if id == "" {
