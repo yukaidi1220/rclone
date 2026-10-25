@@ -419,6 +419,18 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 			return nil, errors.New("cloudreve: set_policy needs one argument, the storage policy ID to bind this folder to")
 		}
 		return f.setPolicy(ctx, arg[0])
+	case "publiclink":
+		if len(opt) > 0 {
+			return nil, errors.New("cloudreve: the publiclink command takes no options")
+		}
+		switch {
+		case len(arg) == 1:
+			// The file is named within the remote: backend/command with
+			// fs=remote: and -a path/within/remote, or rc arg=["path/within/remote"].
+			return f.PublicLink(ctx, arg[0], fs.Duration(0), false)
+		default:
+			return nil, errors.New(`cloudreve: the publiclink command needs one argument, the file path within the remote - rc callers can instead put the file in the fs, as fs=remote:dir path=dir and name the file in arg`)
+		}
 	}
 	return nil, fs.ErrorCommandNotFound
 }

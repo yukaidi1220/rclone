@@ -192,6 +192,18 @@ it knows; run the policy command to see the IDs available under a pool.
 Undoing a binding needs the ID the policy command reported beforehand - the site
 has no "inherit again" value. Binding affects where new files land; it does not
 move what is already there.`,
+		}, {
+			Name:  "publiclink",
+			Short: "Create a share link for a file, as rclone link does.",
+			Long: `Returns a public share URL for one file, the same URL that the link
+command produces. Exists so that rc callers (an OpenList rclone driver, for
+example) can fetch links without shelling out to the rclone binary.
+
+    rclone backend publiclink remote:some/folder file.ext
+
+Via the rc API the folder goes in fs/path and the file name in arg:
+
+    rclone rc backend/command command=publiclink fs=remote: path=some/folder -a file.ext`,
 		}},
 	})
 }
