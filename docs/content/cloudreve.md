@@ -362,3 +362,11 @@ Binding changes where **new** files go and leaves what is already there alone. T
 site has no "inherit again" value, so undoing a binding means naming the policy the
 `policy` command reported beforehand. See [folders](#folders) for how a folder's
 policy is resolved.
+
+`rclone backend publiclink remote:folder file.ext` returns a public share URL for
+one path, the same URL that [link](/commands/rclone_link/) produces, so scripts and
+rc callers can fetch links without shelling out to a second binary. Via the rc
+command `backend/command`, name the path in `arg` relative to the remote root (the
+handler reads `fs`, `command`, `opt` and `arg` only):
+
+    rclone rc backend/command command=publiclink fs=remote: -a some/folder/file.ext
