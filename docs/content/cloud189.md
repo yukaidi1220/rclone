@@ -102,12 +102,13 @@ and always settable with `rclone config set <remote> <key> <value>`:
   privilege (`1` on a plain account, `5` on a platinum one, read from
   `getUserPrivilegesV2`) but nothing measured shows it enforced against this
   number, so raising it is a local choice about memory and connections.
-- `--cloud189-max_file_size`: refuse files larger than this. With the default `0`
-  the account's own single-file privilege (`transFileSize`) is used. On both
-  accounts measured, `transFileSize` equals the day's transfer allowance
-  (`transDayFlow`) exactly, so the limit in force is the transfer budget that is
-  left rather than a per-file size the account keeps. Both are int64 max on an
-  upgraded account, which is why no limit is hardcoded anywhere.
+- `--cloud189-max_file_size`: refuse files larger than this. The default `0`
+  applies no per-file limit. The account also publishes `transFileSize`, but it
+  is not a limit that bites: on the accounts measured it carries the same number
+  as the day's allowance (`transDayFlow`), and the allowance is what actually
+  refuses a file. Both are int64 max on an upgraded account, which is why no
+  limit is hardcoded anywhere, and why the backend does not turn that number
+  into a per-file cap the drive does not enforce.
 - `--cloud189-no_quota_check`: skip the pre-checks and let the server refuse
   instead - see [Quota and space pre-checks](#quota-and-space-pre-checks).
 - `--cloud189-fatal_if_no_space`: make an exhausted day allowance or a full drive
@@ -500,7 +501,7 @@ before reading the source or writing a temp file, what the server is known to
 refuse:
 
 - a file that would take the run over the day's allowance,
-- a file larger than the account's single-file ceiling,
+- a file larger than `--cloud189-max_file_size`, when that is set,
 - a file larger than the free space on the drive.
 
 Those figures are re-read when a refusal is about to be made, so an allowance
@@ -516,10 +517,9 @@ otherwise look like an unlimited account.
 The server's own refusals are `UserDayFlowOverLimited` and
 `InsufficientStorageSpace`. Neither can clear itself during a run, so both stop
 the retries of the file that hit them; `--cloud189-fatal_if_no_space` turns them
-into a run-ending error. The single-file ceiling is not one of those two: a file
-over it is refused without another attempt, whether the ceiling came from the
-account or from `--cloud189-max_file_size`, and the rest of the run carries on
-whatever `fatal_if_no_space` says. `--cloud189-no_quota_check` skips the
+into a run-ending error. A file over `--cloud189-max_file_size` is not one of
+those two: it is refused without another attempt and the rest of the run
+carries on whatever `fatal_if_no_space` says. `--cloud189-no_quota_check` skips the
 pre-checks and leaves the server to refuse: that saves the two requests per run,
 `getUserPrivilegesV2` and `getUserInfo`, not the transfer.
 
