@@ -76,8 +76,11 @@ and always settable with `rclone config set <remote> <key> <value>`:
 - `--cloud189-family_id`: the numeric id of the family space, for example
   `900000001`. Required when the account belongs to more than one family drive.
 - `--cloud189-root_folder_id`: the directory to treat as the root. Leave blank
-  for the top level of the space. This is the escape hatch for a brand new
-  family drive, which has no listing to read its real directory id from.
+  for the top level of the space. A family drive that has never held anything
+  cannot name its own root, so its first folder is created without a parent
+  (that is how the official client makes its transfer folder); this option is
+  the escape hatch for the paths that still need the number, which are the
+  destructive ones.
 - `--cloud189-no_refresh`: never exchange the access token again after the
   remote is opened. By default a request the server refuses with
   `InvalidSessionKey` is retried once on a freshly exchanged session. Measured
@@ -468,7 +471,10 @@ A family remote whose root id could not be read refuses `Purge` and `Rmdir`
 outright: the id is learnt from a listing, that listing came back empty once on a
 drive that still held 24 GiB, and a purge aimed at the alias behind it deleted
 what the alias named. Nothing destructive is sent until `family_id` or
-`root_folder_id` names the drive.
+`root_folder_id` names the drive. Creating a folder is the exception: a
+top-level one is made without naming a parent, which is the only shape the
+server accepts on a drive that has never held anything, so a migration can
+start there.
 
 `Purge` of a directory is likewise a single recursive `DELETE`, so a deep tree
 costs one request rather than one per entry. `Purge` of a remote's own root
