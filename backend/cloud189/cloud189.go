@@ -212,10 +212,11 @@ func init() {
 			Name: "no_refresh",
 			Help: "Never exchange the access token again once the remote has been opened.\n\n" +
 				"By default a request the server refuses with InvalidSessionKey is retried once on a freshly " +
-				"exchanged session. That is safe to share: measured 2026-10-22, exchanging again keeps the " +
-				"secret and hands out a new session key while the old key keeps working, so the official " +
-				"client is not signed out. Set this if you want rclone to fail loudly instead of touching " +
-				"the login at all.",
+				"exchanged session. That is safe to share: measured 2026-10-22 and 2026-10-25, exchanging " +
+				"again hands out a new session key (the secret usually changes as well) and the key it " +
+				"replaces keeps answering, so the official client and other runs are not signed out - six " +
+				"exchanges in a row left six keys alive at once. Set this if you want rclone to fail " +
+				"loudly instead of touching the login at all.",
 			Default:  false,
 			Advanced: true,
 		}, {
