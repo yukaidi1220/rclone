@@ -153,7 +153,7 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	t := d.t
-	bodyBytes, _ := io.ReadAll(r.Body)
+	bodyBytes, bodyErr := io.ReadAll(r.Body)
 	params := r.URL.Query().Get("params")
 	if r.Method == http.MethodPost {
 		if v, err := url.ParseQuery(string(bodyBytes)); err == nil && v.Get("params") != "" {
@@ -480,6 +480,14 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				d.storeRead(w, r)
 				return
 			}
+			if bodyErr != nil {
+				// The client gave the upload up while this part was in flight, and
+				// the transport delivered a truncated request. Those bytes are not a
+				// claim about the part's digest, so they are neither recorded nor
+				// checked: a cancelled upload says nothing about the part it dropped.
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
 			d.storePart(w, r, bodyBytes)
 			return
 		}
@@ -557,7 +565,7 @@ func (d *fakeDrive) storePart(w http.ResponseWriter, r *http.Request, body []byt
 	}
 	sum := md5.Sum(body)
 	if base64.StdEncoding.EncodeToString(sum[:]) != r.Header.Get("Content-MD5") {
-		d.t.Errorf("%s: the bytes sent do not match the Content-MD5 the server issued", r.URL.Path)
+		d.t.Errorf("%s: the bytes sent do not match the Content-MD5 the server issued (body=%d got=%s want=%s)", r.URL.Path, len(body), base64.StdEncoding.EncodeToString(sum[:]), r.Header.Get("Content-MD5"))
 		writeJSON(w, http.StatusBadRequest, map[string]any{"Error": "DigestMismatch"})
 		return
 	}
