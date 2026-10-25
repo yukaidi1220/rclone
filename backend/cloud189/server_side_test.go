@@ -1719,6 +1719,34 @@ func TestMkdirCreatesTheDirectoryOnce(t *testing.T) {
 	require.Equal(t, 1, script.walksOf(rootID), "nor is anything listed again")
 }
 
+// TestMkdirOfTheFirstFolderInAnEmptyFamilyDriveNamesNoParent: a family drive that
+// has never held anything lists no entries, so there is no row to read the numeric
+// root id from - and the family createFolder refuses the 0 alias. The one shape the
+// server accepts there leaves parentId out, which is how the official client makes
+// its own transfer folder (measured 2026-10-25 from a capture of the PC client).
+func TestMkdirOfTheFirstFolderInAnEmptyFamilyDriveNamesNoParent(t *testing.T) {
+	const newID = "900000000000000021"
+	drive := &fakeDrive{t: t, folders: map[string]string{"s3-bak": newID}}
+	f := newFakeFs(t, drive)
+	f.opt.Space = spaceFamily
+	f.familyID = famID
+	f.familyRootID = ""
+	f.dirCache = dircache.New("", familyRootAlias, f)
+	drive.listingFn = newListingScript(map[string][]string{
+		rootID: {emptyListing()}, // the parent walk: the drive is empty
+		newID:  {emptyListing()}, // the create's read-back
+	}).fn
+
+	require.NoError(t, f.Mkdir(context.Background(), "s3-bak"))
+	require.Equal(t, []string{"s3-bak"}, drive.mkdirs)
+	require.Len(t, drive.mkdirQueries, 1)
+	q := drive.mkdirQueries[0]
+	require.Equal(t, famID, q.Get("familyId"))
+	require.Equal(t, "s3-bak", q.Get("folderName"))
+	require.Empty(t, q.Get("parentId"),
+		"an empty family drive has no numeric root id, so the folder is created without naming a parent")
+}
+
 // TestNilObjectStringIsTheNilConvention: the suite hands every backend a typed
 // nil and expects "<nil>" back, the same a plain interface would print.
 func TestNilObjectStringIsTheNilConvention(t *testing.T) {
