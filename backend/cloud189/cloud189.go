@@ -1538,14 +1538,18 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	)
 	if f.family() {
 		// The family endpoint is a GET and calls its parent parentId, not
-		// parentFolderId. It also refuses the 0 alias, so the numeric root id is
-		// what a top-level folder names; when that id could not be read there is
-		// nothing to name.
+		// parentFolderId. It refuses the 0 alias, so a top-level folder names the
+		// numeric root id - and on a drive that has never held anything there is
+		// no entry to read that id from. Leaving parentId out is the one shape the
+		// server accepts there: the official client's own transfer folder is made
+		// exactly that way (OpenList drivers/189pc/utils.go: createFamilyTransferFolder
+		// sends only folderName + familyId), and the folder lands at the drive root.
 		pathID = f.realDirID(pathID)
-		if pathID == familyRootAlias {
-			return "", errors.New("cloud189: cannot create a directory in an empty family drive - its root id is not known, so give family_id a value that lets the root be listed")
+		if pathID == familyRootAlias && f.familyRootID == "" {
+			q = f.get(fmt.Sprintf("familyId=%s&folderName=%s", url.QueryEscape(f.familyID), url.QueryEscape(name)))
+		} else {
+			q = f.get(fmt.Sprintf("familyId=%s&parentId=%s&folderName=%s", url.QueryEscape(f.familyID), url.QueryEscape(pathID), url.QueryEscape(name)))
 		}
-		q = f.get(fmt.Sprintf("familyId=%s&parentId=%s&folderName=%s", url.QueryEscape(f.familyID), url.QueryEscape(pathID), url.QueryEscape(name)))
 		requestURI = "/family/file/createFolder.action"
 		body, err = f.call(ctx, f.apiBase, http.MethodGet, requestURI, q, "")
 	} else {
