@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -615,14 +616,17 @@ func partsFromInfo(partInfo string) int {
 	return len(strings.Split(partInfo, ","))
 }
 
-// TestUploadAsksForPartURLsInPages: the encrypted partInfo rides in the query
-// string and the gateway refuses a request line over about 4 KiB with HTTP 414
-// (measured 2026-10-25: 65 parts accepted, 70 refused), so a file with more
-// parts than one page is asked for page by page. Each page has to carry its
-// parts' REAL numbers: the server keys the answer by the number asked for, and
-// numbering every page from 1 would ask for the first parts again.
-func TestUploadAsksForPartURLsInPages(t *testing.T) {
-	const parts = 2*partURLsPerPage + 7
+// TestUploadMintsOneURLPerPart: each part's URL is asked for on its own, just
+// before that part is sent.
+//
+// Two measured reasons. The request line carries the part's digest and the
+// gateway refuses anything over about 4 KiB, which a large file's whole part
+// list does not fit into (HTTP 414 at 70 parts). And the URL is signed with the
+// time it was issued, so a URL minted up front and used minutes later is
+// refused with RequestTimeTooSkewed. One part per call fixes both: the request
+// stays tiny and no URL is older than the part it belongs to.
+func TestUploadMintsOneURLPerPart(t *testing.T) {
+	const parts = 7
 	drive := &fakeDrive{t: t}
 	f := newFakeFs(t, drive)
 	content := pattern(int(fakePartBase) * parts)
@@ -630,25 +634,19 @@ func TestUploadAsksForPartURLsInPages(t *testing.T) {
 	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("big.bin", int64(len(content))))
 	require.NoError(t, err)
 
-	pages := (parts + partURLsPerPage - 1) / partURLsPerPage
-	require.Len(t, drive.urlPlains, pages, "%d parts at %d per page", parts, partURLsPerPage)
-	var asked []string
-	for i, plain := range drive.urlPlains {
-		n := partsFromInfo(plain["partInfo"])
-		require.LessOrEqual(t, n, partURLsPerPage, "page %d carried %d parts", i+1, n)
-		for _, item := range strings.Split(plain["partInfo"], ",") {
-			num, _, _ := strings.Cut(item, "-")
-			asked = append(asked, num)
-		}
+	require.Len(t, drive.urlPlains, parts, "one URL request per part")
+	asked := map[string]bool{}
+	for _, plain := range drive.urlPlains {
+		require.Equal(t, 1, partsFromInfo(plain["partInfo"]), "a request carried more than one part: %q", plain["partInfo"])
+		num, _, _ := strings.Cut(plain["partInfo"], "-")
+		asked[num] = true
 	}
-	// Every part number from 1 to parts, once, in order.
-	want := make([]string, 0, parts)
 	for i := 1; i <= parts; i++ {
-		want = append(want, fmt.Sprint(i))
+		require.True(t, asked[fmt.Sprint(i)], "part %d was never asked for", i)
 	}
-	require.Equal(t, want, asked, "the pages together asked for every part once, in order")
 
-	// And each part's bytes went up with its own digest.
+	// Every part went up with its own digest, and the request for a part came
+	// before the part itself.
 	require.Len(t, drive.puts, parts)
 	sent := map[string]bool{}
 	for _, put := range drive.puts {
@@ -661,17 +659,14 @@ func TestUploadAsksForPartURLsInPages(t *testing.T) {
 	}
 }
 
-// TestUploadRefusesAPageKeyedFromOne: the server keys its answer by the part
-// numbers the request carried. If it ever renumbered a page from 1 - which is
-// what api.PartInfo would ask for, and what an implementation that forgets the
-// page offset sends - the URLs would belong to the wrong parts, and uploading
-// through them writes one part's bytes into another part's slot. The upload has
-// to refuse rather than send.
-func TestUploadRefusesAPageKeyedFromOne(t *testing.T) {
-	const parts = partURLsPerPage + 3
+// TestUploadRefusesAURLKeyedFromOne: the server keys its answer by the part
+// number the request carried. An implementation that numbered every request
+// from 1 would be handed part 1's URL for every part, and uploading through it
+// writes one part's bytes into another part's slot. The upload must refuse.
+func TestUploadRefusesAURLKeyedFromOne(t *testing.T) {
 	drive := &fakeDrive{t: t, keyPartsFromOne: true}
 	f := newFakeFs(t, drive)
-	content := pattern(int(fakePartBase) * parts)
+	content := pattern(int(fakePartBase) * 3)
 
 	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("big.bin", int64(len(content))))
 	require.Error(t, err)
@@ -833,22 +828,37 @@ func TestPutLandsUnderItsName(t *testing.T) {
 		require.Equal(t, "application/octet-stream", put.headers["content-type"])
 		require.EqualValues(t, len(want), put.contentLength, "the length the storage layer signed for")
 	}
-	// The declared digests are what the URLs were issued against.
-	require.Equal(t, api.PartInfo(md5sOfParts(content, fakePartBase)), drive.urlPlains[0]["partInfo"])
+	// The declared digests are what the URLs were issued against, one part per
+	// call and each carrying that part's real number.
+	var asked []string
+	for _, plain := range drive.urlPlains {
+		asked = append(asked, plain["partInfo"])
+	}
+	sort.Strings(asked)
+	want := make([]string, 0, 3)
+	for i, d := range md5sOfParts(content, fakePartBase) {
+		want = append(want, api.PartInfoFrom([][]byte{d}, i+1))
+	}
+	sort.Strings(want)
+	require.Equal(t, want, asked)
 
 	// The commit named the session, and nothing else was needed.
 	require.Equal(t, "900000000000002_3_1792658503979", drive.commitPlain["uploadFileId"])
 	require.Empty(t, drive.renames, "an upload that lands where it was asked is not renamed")
 	require.Empty(t, drive.tasks, "and nothing is deleted")
 
-	require.Equal(t, []string{
-		"POST /person/initMultiUpload",
-		"GET /person/getMultiUploadUrls",
-		"PUT /store/part",
-		"PUT /store/part",
-		"PUT /store/part",
-		"POST /person/commitMultiUploadFile",
-	}, sequenceOf(drive))
+	// Counts rather than an exact order: the parts upload concurrently, so the
+	// GETs and PUTs interleave differently from run to run.
+	counts := map[string]int{}
+	for _, step := range sequenceOf(drive) {
+		counts[step]++
+	}
+	require.Equal(t, map[string]int{
+		"POST /person/initMultiUpload":       1,
+		"GET /person/getMultiUploadUrls":     3, // one per part
+		"PUT /store/part":                    3,
+		"POST /person/commitMultiUploadFile": 1,
+	}, counts)
 }
 
 func md5sOfParts(content []byte, partSize int64) [][]byte {
@@ -1273,9 +1283,10 @@ func TestRapidTransferSendsNoBytes(t *testing.T) {
 	}, sequenceOf(drive))
 }
 
-// TestRefusedPartIsSentAgainOnTheSameURL is the measured retry radius: one part
-// refused does not doom the file, and the URL it came back on still works.
-func TestRefusedPartIsSentAgainOnTheSameURL(t *testing.T) {
+// TestRefusedPartIsSentAgainWithAFreshURL is the measured retry radius: one part
+// refused does not doom the file, and the retry asks for a new URL rather than
+// replaying the one that was refused.
+func TestRefusedPartIsSentAgainWithAFreshURL(t *testing.T) {
 	noWaiting(t)
 	drive := &fakeDrive{t: t, refuseFirstPut: true}
 	f := newFakeFs(t, drive)
@@ -1285,7 +1296,8 @@ func TestRefusedPartIsSentAgainOnTheSameURL(t *testing.T) {
 	require.NoError(t, err, "a part refused on its first attempt must still complete the upload")
 	require.Len(t, drive.puts, 2, "the same part was sent twice")
 	require.Equal(t, drive.puts[0].body, drive.puts[1].body)
-	require.Len(t, drive.urlPlains, 1, "the part URLs were fetched once, not re-fetched per attempt")
+	require.Len(t, drive.urlPlains, 2, "the retry minted a fresh URL instead of replaying the refused one")
+	require.Equal(t, drive.urlPlains[0]["partInfo"], drive.urlPlains[1]["partInfo"], "and asked for the same part")
 }
 
 // TestPartRetriesStopAtLowLevelRetries: a part that never succeeds must fail the
