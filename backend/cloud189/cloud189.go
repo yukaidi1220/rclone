@@ -2861,10 +2861,12 @@ func (f *Fs) gateUpload(ctx context.Context, name string, size int64) error {
 		}
 		q.mu.Lock()
 	}
+	// Only a limit this run was given is applied here. The account also publishes
+	// transFileSize, but on the accounts measured it is not a limit that bites: it
+	// carries the same number as the day's allowance, which is the one that refuses
+	// (2026-10-25, checked against the platform's own behaviour). Refusing on it
+	// would be inventing a per-file cap the drive does not enforce.
 	limit := int64(f.opt.MaxFileSize)
-	if limit <= 0 {
-		limit = q.transFileSize
-	}
 	dayFlow := q.transDayFlow
 	used := q.usedDayFlow + q.sent
 	free, spaceKnown := q.available, q.spaceKnown
@@ -2872,16 +2874,12 @@ func (f *Fs) gateUpload(ctx context.Context, name string, size int64) error {
 
 	if limit > 0 && size > limit {
 		// This is not one of the two conditions that only the next day or a cleared
-		// drive can fix, and the ceiling may be the caller's own option rather than
-		// anything the account said. So it stops this file and says where the number
-		// came from, without ending the run under fatal_if_no_space.
-		whose := "the single-file ceiling this account publishes"
-		if f.opt.MaxFileSize > 0 {
-			whose = "--cloud189-max_file_size"
-		}
+		// drive can fix, and it is this run's own option. So it stops this file and
+		// says where the number came from, without ending the run under
+		// fatal_if_no_space.
 		// A plain error, not an apiError: nothing was sent, so printing it as a
 		// server answer with an HTTP status would be a lie about where it came from.
-		return fserrors.NoRetryError(fmt.Errorf("cloud189: %s is %s and %s is %s (%s)", name, fs.SizeSuffix(size), whose, fs.SizeSuffix(limit), codeLocalSizeCeiling))
+		return fserrors.NoRetryError(fmt.Errorf("cloud189: %s is %s and --cloud189-max_file_size is %s (%s)", name, fs.SizeSuffix(size), fs.SizeSuffix(limit), codeLocalSizeCeiling))
 	}
 	// usedDayFlow moves while a run is going - other programs, the official
 	// client, another machine - so a projected overrun is checked against the
@@ -2967,7 +2965,7 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 		usedFlow, hasUsed := priv.UsedDayFlow()
 		fileLimit, hasFileLimit := priv.ValueOf("transFileSize")
 		if hasLimit && hasUsed {
-			fs.Logf(f, "cloud189: transfer allowance %s of %s used today; single file ceiling %s",
+			fs.Logf(f, "cloud189: transfer allowance %s of %s used today; the account also publishes a single-file number (%s), which is not a limit this backend enforces - it carries the same value as the allowance on the accounts measured",
 				fs.SizeSuffix(usedFlow), fs.SizeSuffix(limit), humanSize(fileLimit, hasFileLimit))
 		}
 	}
