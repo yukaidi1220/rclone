@@ -194,7 +194,22 @@ type FileExtended struct {
 	ExtendedInfo struct {
 		StoragePolicy *Policy      `json:"storage_policy,omitempty"`
 		DirectLinks   []DirectLink `json:"direct_links,omitempty"`
+		Entities      []Entity     `json:"entities,omitempty"`
 	} `json:"extended_info,omitempty"`
+}
+
+// Entity is one stored copy of a file: the version an upload writes, or an older
+// one the account's retention keeps.
+//
+// CreatedAt is when this copy was made, which for an upload in progress is when
+// its session began. The file's own created_at does not move when a new version
+// is uploaded, so only this timestamp says how long the running upload has been
+// going.
+type Entity struct {
+	ID        string    `json:"id"`
+	Type      int       `json:"type"`
+	Size      int64     `json:"size"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // CreateSessionRequest is the body of PUT /file/upload.
