@@ -194,22 +194,41 @@ func withinAny(path string, prefixes []string) bool {
 // placeholderAge reports how old the unfinished upload behind a lock is, and
 // false when the entry at that path is not an unfinished upload rclone can read
 //
-// The placeholder is created when the session begins, so its age is how long the
-// upload claiming the name has been going. Nothing else on the wire says whether
-// that upload is still alive: measured on a live site the entry exposes only its
-// session id with no expiry, and the conflict payload carries no timestamp.
+// Measured on a live site: a new file's placeholder carries the file's
+// created_at, which is the session's start. An overwrite is different - the file
+// row keeps the age of the file it replaces, and the session only adds a new
+// entity whose created_at is the start of this upload. Reading the file row
+// there would report the age of the old file, so an overwrite of anything older
+// than the threshold would always look stale and always be broken. The newest
+// entity is the only timestamp that tracks the running upload in both cases.
 func (f *Fs) placeholderAge(ctx context.Context, serverPath string) (time.Duration, bool) {
-	entry, err := f.entryAtServerPath(ctx, serverPath)
-	if err != nil || !uploading(entry) {
+	file, err := f.extendedAtServerPath(ctx, serverPath)
+	if err != nil || !uploading(&file.File) {
 		return 0, false
 	}
-	age := time.Since(entry.CreatedAt)
+	at, ok := latestEntityTime(file)
+	if !ok {
+		return 0, false
+	}
+	age := time.Since(at)
 	if age < 0 {
 		// A server clock behind this one proves nothing, and treating it as proof
 		// would release locks that were just created.
 		return 0, false
 	}
 	return age, true
+}
+
+// latestEntityTime is when the newest version of the file was made, which for an
+// upload in progress is when its session began
+func latestEntityTime(file *api.FileExtended) (time.Time, bool) {
+	var newest time.Time
+	for _, entity := range file.ExtendedInfo.Entities {
+		if entity.CreatedAt.After(newest) {
+			newest = entity.CreatedAt
+		}
+	}
+	return newest, !newest.IsZero()
 }
 
 // refuseToRelease explains why a lock may not be released, or returns "" when it
