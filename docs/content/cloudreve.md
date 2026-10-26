@@ -254,7 +254,10 @@ from the kill, and rclone handles both:
   opt-in: set it above the time your longest upload takes and a name whose running
   upload is older than that is released and written. It stays off (0) by default,
   because taking a younger lock means both sessions are live and whichever callback
-  reaches the server first files the name.
+  reaches the server first files the name. At 0 nothing times a lock out: the server
+  has no sweep, so a name left locked by a killed upload stays locked until it is
+  released by hand (`DELETE /api/v4/file/lock` with the tokens the conflict named)
+  or the site restarts. That is the price of never cutting off a live upload.
   Deleting is the exception, and it does not wait: asking to remove an entry locked by
   a half-written upload means wanting it gone, and leaving it locked is the deadlock
   where a folder cannot be purged because one file inside it was interrupted. Either
