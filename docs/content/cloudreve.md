@@ -246,12 +246,15 @@ from the kill, and rclone handles both:
 - Writing over a locked name is refused by default. The server's `40073` answer names
   the lock's token, its path and the account holding it, but nothing that says
   whether the upload behind it is still running: a conflict carries no timestamp, and
-  the unfinished entry the lock holds exposes only its session id, with no expiry. So
-  rclone will not break that lock to write - it reports the name as locked and says
-  who holds it. `drop_stale_locks_after` is the opt-in: set it above the time your
-  longest upload takes and a name whose placeholder is older than that is released and
-  written. It stays off (0) by default, because taking a younger lock means both
-  sessions are live and whichever callback reaches the server first files the name.
+  the unfinished entry the lock holds exposes only its session id, with no expiry.
+  The one trace of age is the newest version of that file, dated at the start of the
+  upload that is writing it - an overwrite leaves the file's own `created_at` alone,
+  so that is not the timestamp to read. rclone will not break a lock to write: it
+  reports the name as locked and says who holds it. `drop_stale_locks_after` is the
+  opt-in: set it above the time your longest upload takes and a name whose running
+  upload is older than that is released and written. It stays off (0) by default,
+  because taking a younger lock means both sessions are live and whichever callback
+  reaches the server first files the name.
   Deleting is the exception, and it does not wait: asking to remove an entry locked by
   a half-written upload means wanting it gone, and leaving it locked is the deadlock
   where a folder cannot be purged because one file inside it was interrupted. Either

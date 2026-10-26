@@ -2049,15 +2049,21 @@ func holder(path, token, owner, application string) api.LockConflict {
 // placeholderBehind answers GET /file/info with the entry an unfinished upload
 // left behind, aged by age. That age is the only evidence the site gives that the
 // upload holding a lock has stopped.
+// placeholderBehind answers for an entry an unfinished upload holds. The age is
+// carried by the newest entity, as a live site does it: the file row of an
+// overwrite keeps the age of the file being replaced.
 func placeholderBehind(age time.Duration) siteHandler {
 	return func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
-		reply(w, api.CodeSuccess, api.File{
+		created := time.Now().Add(-age)
+		file := api.FileExtended{File: api.File{
 			Type:      api.FileTypeFile,
 			ID:        "PH1",
 			Name:      "f.txt",
-			CreatedAt: time.Now().Add(-age),
+			CreatedAt: created,
 			Metadata:  map[string]string{api.MetadataUploadSessionID: "S-OLD"},
-		})
+		}}
+		file.ExtendedInfo.Entities = []api.Entity{{ID: "E1", Size: 10, CreatedAt: created}}
+		reply(w, api.CodeSuccess, file)
 	}
 }
 
@@ -2196,6 +2202,49 @@ func TestUnitUploadLeavesAFreshLockAlone(t *testing.T) {
 		"and names the wait that would let it go")
 	assert.Equal(t, 0, s.count("DELETE", "/api/v4/file/lock"), "nothing was released")
 	assert.Equal(t, 1, s.count("PUT", "/api/v4/file/upload"), "and the upload was not re-asked")
+}
+
+// TestUnitOverwriteAgesTheSessionNotTheFile checks the timestamp the age rule is
+// read from. An overwrite leaves the file row carrying the age of the file it
+// replaces and adds a new entity dated at this session's start; measured on a
+// live site the row said 105s while the entity said 3s. Reading the row would
+// make every overwrite of an older file look stale and break the upload holding
+// it, so the fresh entity has to win.
+func TestUnitOverwriteAgesTheSessionNotTheFile(t *testing.T) {
+	f, s := newSite(t, "", configmap.Simple{
+		"drop_stale_locks": "true", "drop_stale_locks_after": "5m",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME"})
+		case rec.method == "PUT" && rec.path == "/api/v4/file/upload":
+			reply(w, api.CodeLockConflict,
+				[]api.LockConflict{holder(driveRoot+"dir/f.txt", "TOK1", "ME", "upload")})
+		case rec.path == "/api/v4/file/info":
+			file := api.FileExtended{File: api.File{
+				Type:      api.FileTypeFile,
+				ID:        "PH1",
+				Name:      "f.txt",
+				CreatedAt: time.Now().Add(-3 * time.Hour), // the file being replaced
+				Metadata:  map[string]string{api.MetadataUploadSessionID: "S-OLD"},
+			}}
+			file.ExtendedInfo.Entities = []api.Entity{
+				{ID: "E2", Size: 10, CreatedAt: time.Now().Add(-3 * time.Second)}, // this upload
+				{ID: "E1", Size: 9, CreatedAt: time.Now().Add(-3 * time.Hour)},
+			}
+			reply(w, api.CodeSuccess, file)
+		default:
+			s.t.Fatalf("a lock whose entity is this young must not be released: %s %s", rec.method, rec.path)
+		}
+	})
+	src := fsobject.NewStaticObjectInfo("dir/f.txt", time.Now(), 7, false, nil, nil)
+	_, err := f.Put(testCtx(), strings.NewReader("content"), src)
+	require.Error(t, err)
+	assert.Equal(t, api.CodeLockConflict, codeOf(err))
+	assert.Contains(t, err.Error(), "uploaded only 3s ago",
+		"the age is the running upload's, not the age of the file it replaces")
+	assert.Equal(t, 0, s.count("DELETE", "/api/v4/file/lock"), "the old file's age did not unlock anything")
+	assert.Equal(t, 1, s.count("PUT", "/api/v4/file/upload"))
 }
 
 // TestUnitUploadLeavesItsOwnLockAlone checks the same-process case: while an

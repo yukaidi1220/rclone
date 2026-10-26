@@ -161,7 +161,7 @@ func init() {
 			Advanced: true,
 		}, {
 			Name:     "drop_stale_locks_after",
-			Help:     "How long an upload lock must have stood before an upload may take the name over.\n\nThe server gives no way to tell a live upload from a dead one: a lock conflict carries no timestamp and the placeholder it locks exposes only its session id, not an expiry, so the age of that placeholder is the only evidence available. Taking a younger lock starts a race - both sessions live, whichever callback reaches the server first files the name, the other is refused as a lost lock and its bytes are discarded.\n\n0, the default, never breaks a lock on account of an upload: the name is reported as locked and the transfer fails. Set it above the time the longest upload to this site takes to let an interrupted upload's name be reused.",
+			Help:     "How long an upload must have been running before a new upload may take its name over.\n\nThe server gives no way to tell a live upload from a dead one: a lock conflict carries no timestamp and the entry it locks exposes only its session id, not an expiry. The age of the newest version of that file is the only evidence there is - it is dated when the running upload started, while the file's own created_at is left alone when a file is overwritten. Taking a younger lock starts a race - both sessions live, whichever callback reaches the server first files the name, the other is refused as a lost lock and its bytes are discarded.\n\n0, the default, never breaks a lock on account of an upload: the name is reported as locked and the transfer fails. Set it above the time the longest upload to this site takes to let an interrupted upload's name be reused.",
 			Default:  fs.Duration(0),
 			Advanced: true,
 		}, {
@@ -887,9 +887,17 @@ func (f *Fs) entryBy(ctx context.Context, params map[string]string) (*api.File, 
 	return file, nil
 }
 
-// entryAtServerPath reads one entry the site named, placeholder included
-func (f *Fs) entryAtServerPath(ctx context.Context, serverPath string) (*api.File, error) {
-	return f.entryBy(ctx, map[string]string{"uri": driveRoot + strings.TrimPrefix(serverPath, "/")})
+// extendedAtServerPath reads one entry together with its versions, which is what
+// dates an upload in progress
+func (f *Fs) extendedAtServerPath(ctx context.Context, serverPath string) (*api.FileExtended, error) {
+	query := url.Values{}
+	query.Set("uri", driveRoot+strings.TrimPrefix(serverPath, "/"))
+	query.Set("extended", "true")
+	file := new(api.FileExtended)
+	if err := f.call(ctx, "GET", "/file/info", query, nil, file); err != nil {
+		return nil, err
+	}
+	return file, nil
 }
 
 // serverPath is the path the site reports for a remote name, which is the form a
