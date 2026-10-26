@@ -3270,10 +3270,22 @@ func (f *Fs) partURL(ctx context.Context, uploadFileID string, st *stagedSource,
 		return partEndpoint{}, fmt.Errorf("cloud189: the upload URL for part %d is addressed to part %q", plan.Index, got)
 	}
 	want := base64.StdEncoding.EncodeToString(st.partMD5s[idx])
-	if got := api.ParseRequestHeader(ep.RequestHeader)["Content-MD5"]; got != want {
+	if got := headerValue(api.ParseRequestHeader(ep.RequestHeader), "Content-MD5"); got != want {
 		return partEndpoint{}, fmt.Errorf("cloud189: the upload URL for part %d was signed for digest %q, not %q", plan.Index, got, want)
 	}
 	return ep, nil
+}
+
+// headerValue reads one header the storage layer issued, ignoring the case it
+// spelled the name with: the names are compared case-insensitively everywhere
+// else in HTTP, and a casing change must not turn into an upload refusal.
+func headerValue(h map[string]string, name string) string {
+	for k, v := range h {
+		if strings.EqualFold(k, name) {
+			return v
+		}
+	}
+	return ""
 }
 
 // partRetryDelay is how long to wait before trying a part again. It is a
