@@ -1622,15 +1622,14 @@ func TestUnitCommandArgumentsAreChecked(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "takes no options")
 
-	// publiclink refuses shapes that would not name exactly one file within the
-	// remote; the empty-argument case matters because it would otherwise publish
-	// the whole drive root.
+	// downloadurl refuses shapes that would not name exactly one file within
+	// the remote; the empty-argument case would resolve to the drive root.
 	for _, args := range [][]string{nil, {"a", "b"}, {""}} {
-		_, err = f.Command(testCtx(), "publiclink", args, nil)
-		require.Error(t, err, "publiclink with %d arguments (%v)", len(args), args)
+		_, err = f.Command(testCtx(), "downloadurl", args, nil)
+		require.Error(t, err, "downloadurl with %d arguments (%v)", len(args), args)
 		assert.Contains(t, err.Error(), "needs one argument")
 	}
-	_, err = f.Command(testCtx(), "publiclink", []string{"f.txt"}, map[string]string{"x": "1"})
+	_, err = f.Command(testCtx(), "downloadurl", []string{"f.txt"}, map[string]string{"x": "1"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "takes no options")
 
