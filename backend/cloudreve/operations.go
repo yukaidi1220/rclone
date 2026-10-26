@@ -248,13 +248,21 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 // deleteUris asks the site to remove the given URIs
 //
 // An entry an interrupted upload left behind cannot be deleted while its lock is
-// held, so a conflict is answered the same way an upload answers it: release this
-// account's own stale lock and ask once more.
+// held, so a conflict is answered the same way an upload answers it - release the
+// lock, but only the ones this request is actually working on. A folder delete
+// names every lock under it, and the ones whose placeholder is young belong to
+// uploads that are running now.
 func (f *Fs) deleteUris(ctx context.Context, uris []string) error {
 	request := &api.DeleteRequest{Uris: uris, SkipSoftDelete: f.opt.SkipSoftDelete}
 	err := f.call(ctx, "DELETE", "/file", nil, request, nil)
-	if codeOf(err) == api.CodeLockConflict && f.opt.DropStaleLocks && f.dropLocks(ctx, err) > 0 {
-		return f.call(ctx, "DELETE", "/file", nil, request, nil)
+	if codeOf(err) == api.CodeLockConflict && f.opt.DropStaleLocks {
+		dropped, why := f.dropLocks(ctx, err, serverPathsOf(uris), 0, true)
+		if dropped > 0 {
+			return f.call(ctx, "DELETE", "/file", nil, request, nil)
+		}
+		if why != "" {
+			return fmt.Errorf("%w (%s)", err, why)
+		}
 	}
 	return err
 }
