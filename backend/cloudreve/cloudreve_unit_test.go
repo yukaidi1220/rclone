@@ -2332,7 +2332,90 @@ func TestUnitUploadNeverBreaksALockByDefault(t *testing.T) {
 	assert.Equal(t, 1, s.count("PUT", "/api/v4/file/upload"))
 }
 
-// TestUnitDeleteReleasesAStaleLock checks the rule where it is looser: an entry
+// TestUnitDeleteIgnoresWhatTheClockSays checks that deleting never turns on a
+// timestamp. Two shapes have to go through: a version dated in the future because
+// the server's clock runs ahead, and a site that answers without extended_info at
+// all. Either one refusing would leave the deadlock where a stalled upload stops a
+// folder from being purged.
+func TestUnitDeleteIgnoresWhatTheClockSays(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		info siteHandler
+	}{
+		{"entity dated in the future", func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			file := api.FileExtended{File: api.File{
+				Type: api.FileTypeFile, ID: "PH1", Name: "stuck.txt",
+				Metadata: map[string]string{api.MetadataUploadSessionID: "S-OLD"}}}
+			file.ExtendedInfo.Entities = []api.Entity{{ID: "E1", Size: 10, CreatedAt: time.Now().Add(30 * time.Second)}}
+			reply(w, api.CodeSuccess, file)
+		}},
+		{"no versions reported", func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			reply(w, api.CodeSuccess, api.File{
+				Type: api.FileTypeFile, ID: "PH1", Name: "stuck.txt",
+				Metadata: map[string]string{api.MetadataUploadSessionID: "S-OLD"}})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f, s := newSite(t, "", configmap.Simple{"drop_stale_locks": "true"}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+				switch {
+				case rec.method == "GET" && rec.path == "/api/v4/user/me":
+					reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME"})
+				case rec.method == "DELETE" && rec.path == "/api/v4/file" && s.count("DELETE", "/api/v4/file") == 1:
+					reply(w, api.CodeLockConflict, []api.LockConflict{
+						holder(driveRoot+"stuck.txt", "TOKLOCK", "ME", "upload")})
+				case rec.method == "DELETE" && rec.path == "/api/v4/file/lock":
+					reply(w, api.CodeSuccess, nil)
+				case rec.method == "DELETE" && rec.path == "/api/v4/file":
+					reply(w, api.CodeSuccess, nil)
+				case rec.path == "/api/v4/file/info":
+					test.info(s, w, r, rec)
+				default:
+					s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+				}
+			})
+			o := &Object{fs: f, remote: "stuck.txt", id: "F9", size: 0}
+			require.NoError(t, o.Remove(testCtx()), "deleting must not wait on a timestamp")
+			assert.Equal(t, 1, s.count("DELETE", "/api/v4/file/lock"), "the lock was released")
+			assert.Equal(t, 2, s.count("DELETE", "/api/v4/file"), "refused once, deleted on the retry")
+		})
+	}
+}
+
+// TestUnitCallbackReadBackNeedsAModTime checks the read-back used when the callback
+// reports a name nobody holds. A source with no modified time sent no
+// last_modified, so the server stamped its own and there is nothing to compare: the
+// file could be another run's work.
+func TestUnitCallbackReadBackNeedsAModTime(t *testing.T) {
+	f, s := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME"})
+		case rec.method == "PUT" && rec.path == "/api/v4/file/upload":
+			reply(w, api.CodeSuccess, api.UploadSession{
+				SessionID: "S1", ChunkSize: 7, CallbackSecret: "SEC",
+				UploadURLs: []string{s.srv.URL + "/part"},
+			})
+		case rec.method == "PUT" && rec.path == "/part":
+			w.Header().Set("ETag", `"E1"`)
+			reply(w, api.CodeSuccess, nil)
+		case rec.method == "GET" && rec.path == "/api/v4/callback/s3/S1/SEC":
+			reply(w, api.CodeLockConflict, nil)
+		case rec.method == "GET" && rec.path == "/api/v4/file/info":
+			reply(w, api.CodeSuccess, api.File{
+				Type: api.FileTypeFile, ID: "F1", Size: 7, UpdatedAt: time.Now()})
+		case rec.method == "DELETE" && rec.path == "/api/v4/file/upload":
+			reply(w, api.CodeSuccess, nil)
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+	src := fsobject.NewStaticObjectInfo("dir/f.txt", time.Time{}, 7, false, nil, nil)
+	_, err := f.Put(testCtx(), strings.NewReader("content"), src)
+	require.Error(t, err, "a file of the right size is not proof without a modified time")
+	assert.Equal(t, api.CodeLockConflict, codeOf(err))
+	assert.Equal(t, 1, s.count("DELETE", "/api/v4/file/upload"), "the session gave the name up")
+}
+
 // locked by an upload that started seconds ago is deleted anyway, because asking
 // to remove that entry is asking for the upload to lose the name - and leaving it
 // locked is the deadlock where a folder cannot be purged. A lock on a path this

@@ -203,11 +203,17 @@ func withinAny(path string, prefixes []string) bool {
 // entity is the only timestamp that tracks the running upload in both cases.
 func (f *Fs) placeholderAge(ctx context.Context, serverPath string) (time.Duration, bool) {
 	file, err := f.extendedAtServerPath(ctx, serverPath)
-	if err != nil || !uploading(&file.File) {
+	if err != nil {
+		return 0, false
+	}
+	if !uploading(&file.File) {
 		return 0, false
 	}
 	at, ok := latestEntityTime(file)
 	if !ok {
+		// No version came back, so there is no timestamp for this upload: the file
+		// row carries the age of the file being replaced, which overstates it. Do
+		// not fall back to that - it would release a lock that is merely young.
 		return 0, false
 	}
 	age := time.Since(at)
@@ -254,12 +260,16 @@ func (f *Fs) refuseToRelease(ctx context.Context, conflict api.LockConflict, pre
 	case f.nameTakenHere(path, self):
 		return path + ": another upload of this run holds it"
 	}
-	age, known := f.placeholderAge(ctx, path)
-	if !known {
-		return path + ": the entry it locks is not an unfinished upload rclone can read"
-	}
+	// Deleting asks for that entry to go away, so the age of whatever holds it
+	// decides nothing: an unreadable timestamp must not turn a delete into the
+	// deadlock where a purged folder stays because one file inside it stalled.
+	// Writing is the other way round, and needs the age below.
 	if byDeleting {
 		return ""
+	}
+	age, known := f.placeholderAge(ctx, path)
+	if !known {
+		return path + ": the entry it locks is not an unfinished upload rclone can read, so nothing says the upload behind it has stopped"
 	}
 	after := time.Duration(f.opt.StaleLockAfter)
 	if after <= 0 {
@@ -300,6 +310,13 @@ func (f *Fs) startSession(ctx context.Context, remote string, src fs.ObjectInfo,
 // confirmFiled answers the one question a failed callback leaves open: is the
 // file there, carrying what this upload set out to write
 func (f *Fs) confirmFiled(ctx context.Context, remote string, src fs.ObjectInfo) (*api.File, bool) {
+	// Without a modified time the upload sent no last_modified, so the server
+	// stamped its own and there is nothing to compare: any file of this size would
+	// look like this upload's work, including one another run wrote.
+	modTime := src.ModTime(ctx)
+	if modTime.IsZero() {
+		return nil, false
+	}
 	file, err := f.statFile(ctx, remote)
 	if err != nil {
 		return nil, false
@@ -309,7 +326,7 @@ func (f *Fs) confirmFiled(ctx context.Context, remote string, src fs.ObjectInfo)
 	}
 	// The same comparison rclone itself uses for "unchanged", at the precision
 	// this backend documents: whole seconds.
-	diff := src.ModTime(ctx).Sub(file.UpdatedAt)
+	diff := modTime.Sub(file.UpdatedAt)
 	if diff < 0 {
 		diff = -diff
 	}
