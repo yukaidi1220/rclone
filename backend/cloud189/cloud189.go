@@ -3256,12 +3256,22 @@ func (f *Fs) partURL(ctx context.Context, uploadFileID string, st *stagedSource,
 		// exhaustion is marked, so --retries can still re-run the whole file.
 		return partEndpoint{}, fmt.Errorf("cloud189: the server gave no upload URL for part %d of %d", plan.Index, len(st.plans))
 	}
-	// The promise that this URL is for this part is the digest the storage layer
-	// will check the bytes against. If it is not the digest that was asked for,
-	// the answer belongs to another part and sending through it would write one
-	// part's bytes into another part's slot.
-	if want := base64.StdEncoding.EncodeToString(st.partMD5s[idx]); !strings.Contains(ep.RequestHeader, want) {
-		return partEndpoint{}, fmt.Errorf("cloud189: the upload URL for part %d carries another part's digest", plan.Index)
+	// Three things have to agree before this URL is used: the key it came back
+	// under, the part number the URL itself addresses, and the digest the
+	// storage layer will check the bytes against. The key alone is the server's
+	// word; the other two are what the bytes are routed by and checked against,
+	// so a misrouted or mislabelled answer is refused here rather than uploaded
+	// into the wrong slot.
+	u, perr := url.Parse(ep.RequestURL)
+	if perr != nil {
+		return partEndpoint{}, fmt.Errorf("cloud189: the upload URL for part %d cannot be parsed", plan.Index)
+	}
+	if got := u.Query().Get("partNumber"); got != strconv.Itoa(plan.Index) {
+		return partEndpoint{}, fmt.Errorf("cloud189: the upload URL for part %d is addressed to part %q", plan.Index, got)
+	}
+	want := base64.StdEncoding.EncodeToString(st.partMD5s[idx])
+	if got := api.ParseRequestHeader(ep.RequestHeader)["Content-MD5"]; got != want {
+		return partEndpoint{}, fmt.Errorf("cloud189: the upload URL for part %d was signed for digest %q, not %q", plan.Index, got, want)
 	}
 	return ep, nil
 }
@@ -3288,9 +3298,10 @@ var partRetryDelay = func(attempt, partIndex int) time.Duration {
 // putParts uploads every part, retrying only the part that failed.
 //
 // The retry radius is one part: measured 2026-10-22, a part the storage layer
-// refused with HTTP 400 could be sent again on the same presigned URL and the
-// upload then committed with the right digest, so a bad part does not poison the
-// session and the file does not have to start over.
+// refused with HTTP 400 did not poison the session - the upload still committed
+// with the right digest once that part arrived - so one bad part does not make
+// the file start over. What a retry does need is a new URL, which is why the
+// mint lives inside the attempt loop rather than before it.
 func (f *Fs) putParts(ctx context.Context, name, uploadFileID string, st *stagedSource) error {
 	n := len(st.plans)
 	if n == 0 {
