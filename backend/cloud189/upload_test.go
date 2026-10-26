@@ -63,7 +63,7 @@ type taskCall struct {
 
 type putCall struct {
 	part          string // the URL the storage layer was addressed at, e.g. part2
-	signature     string // X-Amz-Signature of that URL, so two mints are distinguishable
+	signature     string // uploadId of that URL, so two mints are distinguishable
 	headers       map[string]string
 	body          []byte
 	contentLength int64
@@ -85,20 +85,23 @@ type fakeDrive struct {
 	fileDataExists  string // "1" means the content is already on the drive
 	commitName      string // the name the commit reports; empty means the requested one
 	commitID        string
-	commitIDBare    bool                         // answer the id as a bare number, the way the capture does
-	failInstall     bool                         // the rename that should give the new object its name collides
-	refuseFirstPut  bool                         // the storage layer answers the first PUT 400, then accepts it
-	refuseAllPuts   bool                         // and never accepts one after that
-	listing         string                       // JSON the listing answers with
-	listings        map[string]string            // per-directory listings, keyed by folderId
-	echoWrongMD5    bool                         // the commit reports a digest that is not the file
-	keyPartsFromOne bool                         // number every answer from 1, ignoring the parts asked for
-	blankURLPart    int                          // answer this part number with an empty URL
-	skewFirstPut    bool                         // answer the first PUT 403 RequestTimeTooSkewed, then accept
-	skewed          bool                         // set once the skewed answer has been given
-	mints           int                          // one per presigned URL handed out, so two mints differ
+	commitIDBare    bool              // answer the id as a bare number, the way the capture does
+	failInstall     bool              // the rename that should give the new object its name collides
+	refuseFirstPut  bool              // the storage layer answers the first PUT 400, then accepts it
+	refuseAllPuts   bool              // and never accepts one after that
+	listing         string            // JSON the listing answers with
+	listings        map[string]string // per-directory listings, keyed by folderId
+	echoWrongMD5    bool              // the commit reports a digest that is not the file
+	keyPartsFromOne bool              // number every answer from 1, ignoring the parts asked for
+	blankURLPart    int               // answer this part number with an empty URL
+	skewFirstPut    bool              // answer the first PUT 403 RequestTimeTooSkewed, then accept
+	skewed          bool              // set once the skewed answer has been given
+	// mints counts the presigned URLs handed out, so two mints of the same part
+	// differ. It is touched from concurrent handlers, so it moves under mu.
+	mints           int
 	wrongDigestPart int                          // sign this part's URL with another digest
 	misrouteURLPart int                          // address this part's URL at another part number
+	digestHintPart  int                          // put the right digest in another field and a wrong one in Content-MD5
 	createBodies    []string                     // the raw form body of each createBatchTask
 	createKeys      []string                     // the sessionkey header each create was signed with
 	apiKeys         []string                     // "path sessionkey" for every signed API call
@@ -232,9 +235,13 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if d.keyPartsFromOne {
 				key = pos + 1
 			}
+			// Same shape as the service's (captured 2026-10-25): the part number and
+			// the session go in the query, the signature travels in the
+			// Authorization header, and there is no X-Amz-Signature at all.
+			d.mu.Lock()
 			d.mints++
-			// Same shape as the service's: the part number is a query parameter of
-			// the presigned URL, and the path is the storage object.
+			mint := d.mints
+			d.mu.Unlock()
 			urlPart := i
 			if d.misrouteURLPart == i {
 				urlPart = i - 1
@@ -242,13 +249,20 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					urlPart = i + 1
 				}
 			}
-			u := "http://" + r.Host + fmt.Sprintf("/store/part%d?partNumber=%d&X-Amz-Signature=PART-SIGNATURE-%d&a=1&b=2", i, urlPart, d.mints)
+			u := "http://" + r.Host + fmt.Sprintf("/store/part%d?partNumber=%d&uploadId=2~MINT-%d&a=1&b=2", i, urlPart, mint)
 			if d.blankURLPart == key {
 				u = ""
 			}
 			hdr := d.headerFor(plain["partInfo"], pos+1)
 			if d.wrongDigestPart == i {
 				hdr = d.headerFor(api.PartInfo([][]byte{md5Of([]byte("another part"))}), 1)
+			}
+			if d.digestHintPart == i {
+				// The digest the client asked for appears in the header, but not as
+				// the value of Content-MD5: a substring test would accept this.
+				want := base64.StdEncoding.EncodeToString(digestsFromPartInfo(t, plain["partInfo"])[0])
+				hdr = strings.Replace(hdr, "Content-MD5="+want,
+					"Content-MD5="+base64.StdEncoding.EncodeToString([]byte("not this one")), 1) + "&X-Md5-Hint=" + want
 			}
 			urls[fmt.Sprintf("partNumber_%d", key)] = map[string]any{
 				// A presigned URL of the shape the service returns: the signature
@@ -603,7 +617,7 @@ func (d *fakeDrive) storePart(w http.ResponseWriter, r *http.Request, body []byt
 	if skew {
 		d.skewed = true
 	}
-	d.puts = append(d.puts, putCall{part: path.Base(r.URL.Path), signature: r.URL.Query().Get("X-Amz-Signature"),
+	d.puts = append(d.puts, putCall{part: path.Base(r.URL.Path), signature: r.URL.Query().Get("uploadId"),
 		headers: flattenHeaders(r.Header), body: body, contentLength: r.ContentLength})
 	d.mu.Unlock()
 	if skew {
@@ -632,6 +646,7 @@ func (d *fakeDrive) storePart(w http.ResponseWriter, r *http.Request, body []byt
 func (d *fakeDrive) headerFor(partInfo string, index int) string {
 	digests := digestsFromPartInfo(d.t, partInfo)
 	return "Content-Type=application/octet-stream" +
+		"&Date=" + time.Now().UTC().Format(http.TimeFormat) +
 		"&Content-MD5=" + base64.StdEncoding.EncodeToString(digests[index-1]) +
 		"&x-amz-limit=rate=12800" +
 		"&Authorization=AWS fakeaccesskeyid00:fakesignaturevalue=="
@@ -765,6 +780,7 @@ func TestUploadRefusesAURLKeyedFromOne(t *testing.T) {
 // not an upload target. Sending through it would fail the PUT on an empty
 // address, and the part would be reported missing only at commit.
 func TestUploadRefusesAPartWithNoURLLine(t *testing.T) {
+	noWaiting(t)
 	drive := &fakeDrive{t: t, blankURLPart: 2}
 	f := newFakeFs(t, drive)
 	content := pattern(int(fakePartBase) * 3)
@@ -823,6 +839,21 @@ func TestUploadRefusesAURLAddressedToAnotherPart(t *testing.T) {
 	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "is addressed to part")
+}
+
+// TestUploadRefusesAHeaderThatOnlyMentionsTheDigest: the digest has to be the
+// value of Content-MD5, not merely appear somewhere in the header blob. A
+// substring test would accept this answer and the PUT would then be refused by
+// the storage layer instead.
+func TestUploadRefusesAHeaderThatOnlyMentionsTheDigest(t *testing.T) {
+	noWaiting(t)
+	drive := &fakeDrive{t: t, digestHintPart: 2}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase) * 3)
+
+	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "was signed for digest")
 }
 
 func flattenHeaders(h http.Header) map[string]string {
