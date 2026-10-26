@@ -2368,6 +2368,18 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	return err
 }
 
+// PrepareDirectory creates the parent directories of remote
+//
+// fs/operations/copy calls this before opening the source object, so a directory
+// name the server rejects (RSP_CODE=4444/1009) fails the object without first
+// downloading it. It runs the same dirCache lookup Put does, so the error text
+// keeps its "failed to make directory: ..." shape and the negative cache still
+// absorbs the repeats for every other file in that directory.
+func (f *Fs) PrepareDirectory(ctx context.Context, remote string) error {
+	_, _, err := f.dirCache.FindPath(ctx, remote, true)
+	return err
+}
+
 // ------------------------------------------------------------ objects ------
 
 // findEntry looks up leaf in dirID, matching case-insensitively.

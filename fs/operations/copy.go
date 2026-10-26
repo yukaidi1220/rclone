@@ -239,6 +239,28 @@ func (c *copy) updateOrPut(ctx context.Context, in io.ReadCloser, uploadOptions 
 	return actionTaken, newDst, err
 }
 
+// directoryPreparer is implemented by destinations that can create the parent
+// directories of an upload ahead of the transfer. Declared here rather than in
+// fs so that only the copy path participates.
+type directoryPreparer interface {
+	PrepareDirectory(ctx context.Context, remote string) error
+}
+
+// prepareDestinationDirectory makes the destination's parent directories for the
+// object about to be copied, if the destination opts in.
+//
+// The reason is cost, not correctness: without this the source object is opened
+// first, so a directory name the server rejects still pays a full source
+// download per file before failing. Backends that don't implement
+// directoryPreparer are untouched and issue no extra request.
+func (c *copy) prepareDestinationDirectory(ctx context.Context) error {
+	prep, ok := c.f.(directoryPreparer)
+	if !ok {
+		return nil
+	}
+	return prep.PrepareDirectory(ctx, c.remoteForCopy)
+}
+
 // Do a manual copy by reading the bytes and writing them
 func (c *copy) manualCopy(ctx context.Context) (actionTaken string, newDst fs.Object, err error) {
 	// Remove partial files on premature exit
@@ -274,6 +296,9 @@ func (c *copy) manualCopy(ctx context.Context) (actionTaken string, newDst fs.Ob
 	}
 
 	var in io.ReadCloser
+	if err = c.prepareDestinationDirectory(ctx); err != nil {
+		return actionTaken, nil, err
+	}
 	in, err = Open(ctx, c.src, downloadOptions...)
 	if err != nil {
 		return actionTaken, nil, fmt.Errorf("failed to open source object: %w", err)
