@@ -198,6 +198,21 @@ it knows; run the policy command to see the IDs available under a pool.
 Undoing a binding needs the ID the policy command reported beforehand - the site
 has no "inherit again" value. Binding affects where new files land; it does not
 move what is already there.`,
+		}, {
+			Name:  "downloadurl",
+			Short: "Return the normal download URL of a file, as reads use.",
+			Long: `Returns the URL the backend itself downloads from (POST /file/url,
+honoring the download_host rewrite): no share is created, and the URL carries
+the server's own expiry, so re-request it when downloads start failing.
+
+    rclone backend downloadurl remote:some/folder file.ext
+
+Via the rc API, name the file in arg relative to the remote root (the
+backend/command handler reads fs, command, opt and arg only - there is no
+separate path parameter):
+
+    rclone rc backend/command command=downloadurl fs=remote: -a some/folder/file.ext
+    rclone rc backend/command command=downloadurl fs=remote:some/folder -a file.ext`,
 		}},
 	})
 }
