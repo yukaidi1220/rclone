@@ -156,13 +156,13 @@ func init() {
 			Advanced: true,
 		}, {
 			Name:     "drop_stale_locks",
-			Help:     "Release an upload lock this account left behind, instead of failing on it.\n\nAn interrupted upload keeps locking the file's name until the server's upload_session_timeout passes. With this set rclone asks the site to release the lock it is told about and retries the upload once, which costs the interrupted upload its parts. Unset to fail with the server's error instead.",
+			Help:     "Release an upload lock this account left behind, instead of failing on it.\n\nAn interrupted upload keeps locking the file's name until the server's upload_session_timeout passes. Deleting goes through this regardless of the age: asking to remove an entry locked by a half-written upload means wanting it gone, and leaving it locked is the deadlock where a folder cannot be purged. Taking the name over with a new upload needs drop_stale_locks_after set, because rclone cannot tell whether that other upload is still running.",
 			Default:  true,
 			Advanced: true,
 		}, {
 			Name:     "drop_stale_locks_after",
-			Help:     "Only release an upload lock whose placeholder is at least this old.\n\nThe server never says whether the session holding a name is still running, and the payload of a lock conflict carries no timestamp either, so the age of the placeholder the session left behind is all rclone has to go on. Release a younger lock and the two uploads race for the same name: whichever callback reaches the server first files the file, the other is answered \"Lock expired\", and its bytes are recycled. Keep this above the time the longest upload to this site takes.\n\n0 releases every lock the server names, however fresh.",
-			Default:  fs.Duration(5 * time.Minute),
+			Help:     "How long an upload lock must have stood before an upload may take the name over.\n\nThe server gives no way to tell a live upload from a dead one: a lock conflict carries no timestamp and the placeholder it locks exposes only its session id, not an expiry, so the age of that placeholder is the only evidence available. Taking a younger lock starts a race - both sessions live, whichever callback reaches the server first files the name, the other is refused as a lost lock and its bytes are discarded.\n\n0, the default, never breaks a lock on account of an upload: the name is reported as locked and the transfer fails. Set it above the time the longest upload to this site takes to let an interrupted upload's name be reused.",
+			Default:  fs.Duration(0),
 			Advanced: true,
 		}, {
 			Name:     config.ConfigEncoding,

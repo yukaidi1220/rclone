@@ -2243,14 +2243,41 @@ func TestUnitUploadKeepsALockItShouldNotTouch(t *testing.T) {
 	}
 }
 
-// TestUnitDeleteReleasesAStaleLock checks the other direction: an entry whose name
-// a killed upload locked cannot be removed until that lock is gone, so deleting it
-// releases the stale lock of that very path and asks once more. A lock on another
-// path is left alone even though this account owns it.
+// TestUnitUploadNeverBreaksALockByDefault checks the shipped default: with no age
+// configured, an upload whose name is locked fails and says why, even when the
+// placeholder behind the lock is hours old. The server cannot prove the other
+// upload is dead, so rclone does not start a race for the name.
+func TestUnitUploadNeverBreaksALockByDefault(t *testing.T) {
+	f, s := newSite(t, "", configmap.Simple{"drop_stale_locks": "true"},
+		func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			switch {
+			case rec.method == "GET" && rec.path == "/api/v4/user/me":
+				reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME"})
+			case rec.method == "PUT" && rec.path == "/api/v4/file/upload":
+				reply(w, api.CodeLockConflict,
+					[]api.LockConflict{holder(driveRoot+"dir/f.txt", "TOK1", "ME", "upload")})
+			case rec.path == "/api/v4/file/info":
+				placeholderBehind(3*time.Hour)(s, w, r, rec)
+			default:
+				s.t.Fatalf("no lock may be broken by default: %s %s", rec.method, rec.path)
+			}
+		})
+	src := fsobject.NewStaticObjectInfo("dir/f.txt", time.Now(), 7, false, nil, nil)
+	_, err := f.Put(testCtx(), strings.NewReader("content"), src)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not break those unless drop_stale_locks_after is set",
+		"the refusal names the setting that would let the name be taken over")
+	assert.Equal(t, 0, s.count("DELETE", "/api/v4/file/lock"))
+	assert.Equal(t, 1, s.count("PUT", "/api/v4/file/upload"))
+}
+
+// TestUnitDeleteReleasesAStaleLock checks the rule where it is looser: an entry
+// locked by an upload that started seconds ago is deleted anyway, because asking
+// to remove that entry is asking for the upload to lose the name - and leaving it
+// locked is the deadlock where a folder cannot be purged. A lock on a path this
+// request does not name is still left alone.
 func TestUnitDeleteReleasesAStaleLock(t *testing.T) {
-	f, s := newSite(t, "", configmap.Simple{
-		"drop_stale_locks": "true", "drop_stale_locks_after": "5m",
-	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+	f, s := newSite(t, "", configmap.Simple{"drop_stale_locks": "true"}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
 		switch {
 		case rec.method == "GET" && rec.path == "/api/v4/user/me":
 			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME"})
@@ -2268,7 +2295,7 @@ func TestUnitDeleteReleasesAStaleLock(t *testing.T) {
 		case rec.method == "DELETE" && rec.path == "/api/v4/file":
 			reply(w, api.CodeSuccess, nil)
 		case rec.path == "/api/v4/file/info":
-			placeholderBehind(time.Hour)(s, w, r, rec)
+			placeholderBehind(5*time.Second)(s, w, r, rec)
 		default:
 			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
 		}
@@ -2278,43 +2305,41 @@ func TestUnitDeleteReleasesAStaleLock(t *testing.T) {
 	assert.Equal(t, 2, s.count("DELETE", "/api/v4/file"), "refused once, deleted on the retry")
 }
 
-// TestUnitPurgeLeavesRunningUploadsAlone checks the widest version of the same
-// mistake: purging a folder is told about every lock under it, and the ones whose
-// placeholder is young belong to uploads that are going on right now. Only the
-// stale one may go.
-func TestUnitPurgeLeavesRunningUploadsAlone(t *testing.T) {
-	f, s := newSite(t, "", configmap.Simple{
-		"drop_stale_locks": "true", "drop_stale_locks_after": "5m",
-	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
-		uri := rec.query.Get("uri")
-		switch {
-		case rec.method == "GET" && rec.path == "/api/v4/user/me":
-			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME"})
-		case rec.path == "/api/v4/file/info" && strings.HasSuffix(uri, "live.txt"):
-			placeholderBehind(time.Minute)(s, w, r, rec)
-		case rec.path == "/api/v4/file/info" && strings.HasSuffix(uri, "stale.txt"):
-			placeholderBehind(3*time.Hour)(s, w, r, rec)
-		case rec.path == "/api/v4/file/info":
-			reply(w, api.CodeSuccess, api.File{Type: api.FileTypeFolder, ID: "D1", Name: "dir"})
-		case rec.method == "DELETE" && rec.path == "/api/v4/file" && s.count("DELETE", "/api/v4/file") == 1:
-			reply(w, api.CodeLockConflict, []api.LockConflict{
-				holder(driveRoot+"dir/live.txt", "TOKLIVE", "ME", "upload"),
-				holder(driveRoot+"dir/stale.txt", "TOKSTALE", "ME", "upload"),
-			})
-		case rec.method == "DELETE" && rec.path == "/api/v4/file/lock":
-			request := new(api.UnlockRequest)
-			require.NoError(t, json.Unmarshal([]byte(rec.body), request))
-			assert.Equal(t, []string{"TOKSTALE"}, request.Tokens,
-				"the upload that started a minute ago keeps its lock")
-			reply(w, api.CodeSuccess, nil)
-		case rec.method == "DELETE" && rec.path == "/api/v4/file":
-			reply(w, api.CodeSuccess, nil)
-		default:
-			s.t.Fatalf("unexpected request %s %s %s", rec.method, rec.path, uri)
-		}
-	})
+// TestUnitPurgeReleasesEveryLockUnderItsPaths checks the folder case of the delete
+// rule: purging is told about every lock under the folder, and each unfinished
+// upload inside it loses its lock however young it is, because the request asked
+// for those entries to go. A lock outside the folder is still nobody to touch.
+func TestUnitPurgeReleasesEveryLockUnderItsPaths(t *testing.T) {
+	f, s := newSite(t, "", configmap.Simple{"drop_stale_locks": "true"},
+		func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			uri := rec.query.Get("uri")
+			switch {
+			case rec.method == "GET" && rec.path == "/api/v4/user/me":
+				reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME"})
+			case rec.path == "/api/v4/file/info" && strings.HasSuffix(uri, ".txt"):
+				placeholderBehind(time.Minute)(s, w, r, rec)
+			case rec.path == "/api/v4/file/info":
+				reply(w, api.CodeSuccess, api.File{Type: api.FileTypeFolder, ID: "D1", Name: "dir"})
+			case rec.method == "DELETE" && rec.path == "/api/v4/file" && s.count("DELETE", "/api/v4/file") == 1:
+				reply(w, api.CodeLockConflict, []api.LockConflict{
+					holder(driveRoot+"dir/live.txt", "TOKLIVE", "ME", "upload"),
+					holder(driveRoot+"dir/stale.txt", "TOKSTALE", "ME", "upload"),
+					holder(driveRoot+"other/deep.txt", "TOKOUTSIDE", "ME", "upload"),
+				})
+			case rec.method == "DELETE" && rec.path == "/api/v4/file/lock":
+				request := new(api.UnlockRequest)
+				require.NoError(t, json.Unmarshal([]byte(rec.body), request))
+				assert.Equal(t, []string{"TOKLIVE", "TOKSTALE"}, request.Tokens,
+					"everything under the purged folder, and nothing beside it")
+				reply(w, api.CodeSuccess, nil)
+			case rec.method == "DELETE" && rec.path == "/api/v4/file":
+				reply(w, api.CodeSuccess, nil)
+			default:
+				s.t.Fatalf("unexpected request %s %s %s", rec.method, rec.path, uri)
+			}
+		})
 	require.NoError(t, f.Purge(testCtx(), "dir"))
-	assert.Equal(t, 2, s.count("DELETE", "/api/v4/file"), "the purge went through once the stale lock was gone")
+	assert.Equal(t, 2, s.count("DELETE", "/api/v4/file"), "the purge went through once those locks were gone")
 }
 
 // TestUnitAbandonSurvivesTheCallersCancellation checks the one call that must go

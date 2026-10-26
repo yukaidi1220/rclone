@@ -243,27 +243,29 @@ from the kill, and rclone handles both:
   placeholders from listings and answers `object not found` when one is named
   directly: an entry nobody can open is not a file, and showing it would make a
   re-run compare its transfer against zero bytes.
-- Writing that name again can release the lock. The server's `40073` answer names
+- Writing over a locked name is refused by default. The server's `40073` answer names
   the lock's token, its path and the account holding it, but nothing that says
-  whether the upload behind it is still running. So rclone releases a lock only when
-  every one of these holds: this account owns it, an upload took it, its path is the
-  one this request is writing, no other upload in the same rclone run holds that
-  name, and the placeholder the session left behind is at least
-  `drop_stale_locks_after` old, 5 minutes by default. That age is the only evidence
-  the site gives that an upload has stopped, so keep the threshold above the time
-  your longest upload takes. Anything failing these checks is left alone, and the
-  reason appears in the error. Deleting goes through the same release, restricted to
-  the paths the delete names, so a folder an interrupted upload locked can be purged
-  without waiting. Set `drop_stale_locks` off to get the server's error untouched.
+  whether the upload behind it is still running: a conflict carries no timestamp, and
+  the unfinished entry the lock holds exposes only its session id, with no expiry. So
+  rclone will not break that lock to write - it reports the name as locked and says
+  who holds it. `drop_stale_locks_after` is the opt-in: set it above the time your
+  longest upload takes and a name whose placeholder is older than that is released and
+  written. It stays off (0) by default, because taking a younger lock means both
+  sessions are live and whichever callback reaches the server first files the name.
+  Deleting is the exception, and it does not wait: asking to remove an entry locked by
+  a half-written upload means wanting it gone, and leaving it locked is the deadlock
+  where a folder cannot be purged because one file inside it was interrupted. Either
+  way a lock is only broken when this account owns it, it was taken by an upload, and
+  its path is one this request names; anything else is left alone and the reason
+  appears in the error. Set `drop_stale_locks` off to get the server's answer untouched.
 
-What that costs: a lock old enough to release belongs to an upload that is gone, so
-its parts are discarded and that file has to be sent again. Two runs of the **same
-account** writing the **same name** at once is undefined whichever way this is
-answered: both sessions can be live, and whichever callback reaches the server first
-files the name while the other is refused as a lost lock and its bytes are discarded.
-What the checks above prevent is rclone *causing* that race, by cutting off an upload
-that is merely young or one running in the same process. Keep concurrent runs to
-different names.
+What that costs: breaking a lock discards the parts of the upload that held it, so
+that file has to be sent again. Two runs of the **same account** writing the **same
+name** at once has no correct answer - both sessions can be live, whichever callback
+arrives first files the name, the other is refused as a lost lock and its bytes are
+discarded - so rclone no longer creates that situation: it will not take over a name
+another upload holds, in this process or at any age below the threshold you set.
+Keep concurrent runs to different names.
 
 A second shape of `40073` belongs here. The server also answers `Lock expired` with
 no holders listed, and that is what a callback hears when the file **was** filed and
@@ -275,8 +277,9 @@ than sending it a second time.
 A failed upload that rclone itself abandons releases the lock immediately, and it
 does so even after the caller has been cancelled - Ctrl-C still sends the abandon.
 
-To clear a lock by hand, which is what rclone does under `drop_stale_locks`, the
-token comes from the conflict answer and is released with:
+To clear a lock by hand - which is what rclone does when deleting the entry it
+locks, or when `drop_stale_locks_after` says the lock is old enough to take over -
+the token comes from the conflict answer and is released with:
 
 ```
 DELETE /api/v4/file/lock

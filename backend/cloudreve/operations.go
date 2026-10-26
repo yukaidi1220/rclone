@@ -256,7 +256,7 @@ func (f *Fs) deleteUris(ctx context.Context, uris []string) error {
 	request := &api.DeleteRequest{Uris: uris, SkipSoftDelete: f.opt.SkipSoftDelete}
 	err := f.call(ctx, "DELETE", "/file", nil, request, nil)
 	if codeOf(err) == api.CodeLockConflict && f.opt.DropStaleLocks {
-		dropped, why := f.dropLocks(ctx, err, serverPathsOf(uris), 0)
+		dropped, why := f.dropLocks(ctx, err, serverPathsOf(uris), 0, true)
 		if dropped > 0 {
 			return f.call(ctx, "DELETE", "/file", nil, request, nil)
 		}
