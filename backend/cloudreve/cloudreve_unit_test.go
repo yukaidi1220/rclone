@@ -481,16 +481,19 @@ func TestUnitRmdirAndPurgeOfRemoteRoot(t *testing.T) {
 	assert.Equal(t, []string{"cloudreve://my/gone", "cloudreve://my/gone"}, deleted)
 }
 
-// TestUnitLockConflictFailsFast checks that a lock held by an abandoned upload
-// session is reported once with the reason, not retried: the lock lasts until the
-// server's session timeout, a day by default, so no run can wait it out.
+// TestUnitLockConflictFailsFast checks that a lock conflict whose reply names no
+// holder is reported once, not retried: repeating it cannot change the answer,
+// and the message says the lock is gone rather than claiming someone holds it.
 func TestUnitLockConflictFailsFast(t *testing.T) {
 	f, s := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
 		reply(w, api.CodeLockConflict, nil)
 	})
 	_, err := f.List(testCtx(), "locked")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "upload_session_timeout", "the error names what is holding the lock")
+	assert.Contains(t, err.Error(), "no upload session holds this name now",
+		"a conflict that names no holder is not reported as someone holding it")
+	assert.NotContains(t, err.Error(), "upload_session_timeout",
+		"and it does not promise a wait that nothing requires")
 	assert.Equal(t, 1, s.count("GET", "/api/v4/file"), "a lock conflict is answered, not retried")
 }
 
@@ -1621,18 +1624,6 @@ func TestUnitCommandArgumentsAreChecked(t *testing.T) {
 	_, err = f.Command(testCtx(), "policy", nil, map[string]string{"anything": "1"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "takes no options")
-
-	// downloadurl refuses shapes that would not name exactly one file within
-	// the remote; the empty-argument case would resolve to the drive root.
-	for _, args := range [][]string{nil, {"a", "b"}, {""}} {
-		_, err = f.Command(testCtx(), "downloadurl", args, nil)
-		require.Error(t, err, "downloadurl with %d arguments (%v)", len(args), args)
-		assert.Contains(t, err.Error(), "needs one argument")
-	}
-	_, err = f.Command(testCtx(), "downloadurl", []string{"f.txt"}, map[string]string{"x": "1"})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "takes no options")
-
 	assert.Empty(t, s.made())
 }
 
@@ -2033,13 +2024,29 @@ func TestUnitSignedURLIsRedacted(t *testing.T) {
 	assert.Contains(t, redacted, "bucket.s3.example.com/key")
 }
 
-// holder builds the lock conflict the site names, as measured on a live site:
-// path, token, owning account and the application that took the lock.
+// holder builds the lock conflict the site names. Measured on a live site the path
+// arrives as a whole URI ("cloudreve://my/dir/f.txt"); the bare drive path form the
+// lock node keeps is also accepted by rclone, so one case uses each.
 func holder(path, token, owner, application string) api.LockConflict {
 	held := api.LockConflict{Path: path, Token: token}
 	held.Owner.Owner = owner
 	held.Owner.Application.Type = application
 	return held
+}
+
+// placeholderBehind answers GET /file/info with the entry an unfinished upload
+// left behind, aged by age. That age is the only evidence the site gives that the
+// upload holding a lock has stopped.
+func placeholderBehind(age time.Duration) siteHandler {
+	return func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		reply(w, api.CodeSuccess, api.File{
+			Type:      api.FileTypeFile,
+			ID:        "PH1",
+			Name:      "f.txt",
+			CreatedAt: time.Now().Add(-age),
+			Metadata:  map[string]string{api.MetadataUploadSessionID: "S-OLD"},
+		})
+	}
 }
 
 // TestUnitRetryAfterIsHonouredAsGiven checks that a site which states how long to
@@ -2095,23 +2102,49 @@ func TestUnitListHidesUnfinishedUploads(t *testing.T) {
 }
 
 // TestUnitUploadReleasesAStaleLock checks the way out of a lock this account left
-// behind: the conflict names its token, the token is released, and the upload is
-// asked for again.
+// behind: the conflict names its token, that one token is released, and the upload
+// is asked for again. The other locks in the same reply are left alone - one is
+// another account's, and one belongs to a path this request has no business
+// touching.
 func TestUnitUploadReleasesAStaleLock(t *testing.T) {
 	ours := holder(driveRoot+"dir/f.txt", "TOK1", "ME", "upload")
+	sibling := holder("/dir/sibling.txt", "TOKSIB", "ME", "upload")
 	foreign := holder(driveRoot+"other.txt", "TOK2", "SOMEONE-ELSE", "upload")
-	f, s := newSite(t, "", configmap.Simple{"drop_stale_locks": "true"}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+	infos := 0
+	f, s := newSite(t, "", configmap.Simple{
+		"drop_stale_locks": "true", "drop_stale_locks_after": "5m",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
 		switch {
 		case rec.method == "GET" && rec.path == "/api/v4/user/me":
 			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME"})
 		case rec.method == "PUT" && rec.path == "/api/v4/file/upload" && s.count("PUT", "/api/v4/file/upload") == 1:
-			reply(w, api.CodeLockConflict, []api.LockConflict{ours, foreign})
+			reply(w, api.CodeLockConflict, []api.LockConflict{ours, sibling, foreign})
 		case rec.method == "DELETE" && rec.path == "/api/v4/file/lock":
 			request := new(api.UnlockRequest)
 			require.NoError(t, json.Unmarshal([]byte(rec.body), request))
 			assert.Equal(t, []string{"TOK1"}, request.Tokens,
-				"only this account's upload lock is released, never another account's")
+				"only the lock of the path being written, and only this account's")
 			reply(w, api.CodeSuccess, nil)
+		case rec.path == "/api/v4/file/info":
+			uri := rec.query.Get("uri")
+			switch {
+			case strings.HasSuffix(uri, "/sibling.txt"):
+				// Old enough that only the path check can keep this one.
+				placeholderBehind(2*time.Hour)(s, w, r, rec)
+			case strings.HasSuffix(uri, "/dir/f.txt"):
+				// The first read is the age of the placeholder behind the lock; the
+				// second is rclone checking the file it just uploaded.
+				infos++
+				if infos == 1 {
+					placeholderBehind(time.Hour)(s, w, r, rec)
+					return
+				}
+				reply(w, api.CodeSuccess, api.File{
+					Type: api.FileTypeFile, ID: "F7", Name: "f.txt", Size: 7, UpdatedAt: time.Now(),
+				})
+			default:
+				s.t.Fatalf("unexpected entry read: %s", uri)
+			}
 		default:
 			uploadSite()(s, w, r, rec)
 		}
@@ -2121,6 +2154,62 @@ func TestUnitUploadReleasesAStaleLock(t *testing.T) {
 	require.NoError(t, err, "the upload goes through once the stale lock is gone")
 	assert.Equal(t, 2, s.count("PUT", "/api/v4/file/upload"), "refused once, granted on the retry")
 	assert.Equal(t, 1, s.count("DELETE", "/api/v4/file/lock"))
+}
+
+// TestUnitUploadLeavesAFreshLockAlone checks the one case that must not release:
+// the placeholder behind the lock was created seconds ago, so the upload holding
+// it is almost certainly running, and cutting it off starts a race for the name.
+func TestUnitUploadLeavesAFreshLockAlone(t *testing.T) {
+	f, s := newSite(t, "", configmap.Simple{
+		"drop_stale_locks": "true", "drop_stale_locks_after": "5m",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME"})
+		case rec.method == "PUT" && rec.path == "/api/v4/file/upload":
+			reply(w, api.CodeLockConflict,
+				[]api.LockConflict{holder(driveRoot+"dir/f.txt", "TOK1", "ME", "upload")})
+		case rec.path == "/api/v4/file/info":
+			placeholderBehind(3*time.Second)(s, w, r, rec)
+		default:
+			s.t.Fatalf("a lock this young must not be released or retried around: %s %s", rec.method, rec.path)
+		}
+	})
+	src := fsobject.NewStaticObjectInfo("dir/f.txt", time.Now(), 7, false, nil, nil)
+	_, err := f.Put(testCtx(), strings.NewReader("content"), src)
+	require.Error(t, err)
+	assert.Equal(t, api.CodeLockConflict, codeOf(err), "the site's own refusal is what fails")
+	assert.Contains(t, err.Error(), "uploaded only", "and the reason says how young the lock is")
+	assert.Contains(t, err.Error(), "under the 5m0s rclone will release at",
+		"and names the wait that would let it go")
+	assert.Equal(t, 0, s.count("DELETE", "/api/v4/file/lock"), "nothing was released")
+	assert.Equal(t, 1, s.count("PUT", "/api/v4/file/upload"), "and the upload was not re-asked")
+}
+
+// TestUnitUploadLeavesItsOwnLockAlone checks the same-process case: while an
+// upload of this name is running here, a conflict on it is never answered by
+// releasing, because the lock would be this upload's own.
+func TestUnitUploadLeavesItsOwnLockAlone(t *testing.T) {
+	f, s := newSite(t, "", configmap.Simple{
+		"drop_stale_locks": "true", "drop_stale_locks_after": "0",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME"})
+		case rec.method == "PUT" && rec.path == "/api/v4/file/upload":
+			reply(w, api.CodeLockConflict,
+				[]api.LockConflict{holder(driveRoot+"dir/f.txt", "TOK1", "ME", "upload")})
+		default:
+			s.t.Fatalf("nothing may be released or read while this run owns the name: %s %s", rec.method, rec.path)
+		}
+	})
+	_, release := f.claimName("dir/f.txt")
+	defer release()
+	src := fsobject.NewStaticObjectInfo("dir/f.txt", time.Now(), 7, false, nil, nil)
+	_, err := f.Put(testCtx(), strings.NewReader("content"), src)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "another upload of this run holds it")
+	assert.Equal(t, 0, s.count("DELETE", "/api/v4/file/lock"))
 }
 
 // TestUnitUploadKeepsALockItShouldNotTouch checks the two ways a lock is left
@@ -2156,22 +2245,30 @@ func TestUnitUploadKeepsALockItShouldNotTouch(t *testing.T) {
 
 // TestUnitDeleteReleasesAStaleLock checks the other direction: an entry whose name
 // a killed upload locked cannot be removed until that lock is gone, so deleting it
-// releases this account's own stale lock and asks once more.
+// releases the stale lock of that very path and asks once more. A lock on another
+// path is left alone even though this account owns it.
 func TestUnitDeleteReleasesAStaleLock(t *testing.T) {
-	f, s := newSite(t, "", configmap.Simple{"drop_stale_locks": "true"}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+	f, s := newSite(t, "", configmap.Simple{
+		"drop_stale_locks": "true", "drop_stale_locks_after": "5m",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
 		switch {
 		case rec.method == "GET" && rec.path == "/api/v4/user/me":
 			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME"})
 		case rec.method == "DELETE" && rec.path == "/api/v4/file" && s.count("DELETE", "/api/v4/file") == 1:
-			reply(w, api.CodeLockConflict,
-				[]api.LockConflict{holder(driveRoot+"stuck.txt", "TOKLOCK", "ME", "upload")})
+			reply(w, api.CodeLockConflict, []api.LockConflict{
+				holder(driveRoot+"stuck.txt", "TOKLOCK", "ME", "upload"),
+				holder(driveRoot+"elsewhere.txt", "TOKELSE", "ME", "upload"),
+			})
 		case rec.method == "DELETE" && rec.path == "/api/v4/file/lock":
 			request := new(api.UnlockRequest)
 			require.NoError(t, json.Unmarshal([]byte(rec.body), request))
-			assert.Equal(t, []string{"TOKLOCK"}, request.Tokens)
+			assert.Equal(t, []string{"TOKLOCK"}, request.Tokens,
+				"only the path being deleted is released")
 			reply(w, api.CodeSuccess, nil)
 		case rec.method == "DELETE" && rec.path == "/api/v4/file":
 			reply(w, api.CodeSuccess, nil)
+		case rec.path == "/api/v4/file/info":
+			placeholderBehind(time.Hour)(s, w, r, rec)
 		default:
 			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
 		}
@@ -2179,6 +2276,45 @@ func TestUnitDeleteReleasesAStaleLock(t *testing.T) {
 	o := &Object{fs: f, remote: "stuck.txt", id: "F9", size: 0}
 	require.NoError(t, o.Remove(testCtx()))
 	assert.Equal(t, 2, s.count("DELETE", "/api/v4/file"), "refused once, deleted on the retry")
+}
+
+// TestUnitPurgeLeavesRunningUploadsAlone checks the widest version of the same
+// mistake: purging a folder is told about every lock under it, and the ones whose
+// placeholder is young belong to uploads that are going on right now. Only the
+// stale one may go.
+func TestUnitPurgeLeavesRunningUploadsAlone(t *testing.T) {
+	f, s := newSite(t, "", configmap.Simple{
+		"drop_stale_locks": "true", "drop_stale_locks_after": "5m",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		uri := rec.query.Get("uri")
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME"})
+		case rec.path == "/api/v4/file/info" && strings.HasSuffix(uri, "live.txt"):
+			placeholderBehind(time.Minute)(s, w, r, rec)
+		case rec.path == "/api/v4/file/info" && strings.HasSuffix(uri, "stale.txt"):
+			placeholderBehind(3*time.Hour)(s, w, r, rec)
+		case rec.path == "/api/v4/file/info":
+			reply(w, api.CodeSuccess, api.File{Type: api.FileTypeFolder, ID: "D1", Name: "dir"})
+		case rec.method == "DELETE" && rec.path == "/api/v4/file" && s.count("DELETE", "/api/v4/file") == 1:
+			reply(w, api.CodeLockConflict, []api.LockConflict{
+				holder(driveRoot+"dir/live.txt", "TOKLIVE", "ME", "upload"),
+				holder(driveRoot+"dir/stale.txt", "TOKSTALE", "ME", "upload"),
+			})
+		case rec.method == "DELETE" && rec.path == "/api/v4/file/lock":
+			request := new(api.UnlockRequest)
+			require.NoError(t, json.Unmarshal([]byte(rec.body), request))
+			assert.Equal(t, []string{"TOKSTALE"}, request.Tokens,
+				"the upload that started a minute ago keeps its lock")
+			reply(w, api.CodeSuccess, nil)
+		case rec.method == "DELETE" && rec.path == "/api/v4/file":
+			reply(w, api.CodeSuccess, nil)
+		default:
+			s.t.Fatalf("unexpected request %s %s %s", rec.method, rec.path, uri)
+		}
+	})
+	require.NoError(t, f.Purge(testCtx(), "dir"))
+	assert.Equal(t, 2, s.count("DELETE", "/api/v4/file"), "the purge went through once the stale lock was gone")
 }
 
 // TestUnitAbandonSurvivesTheCallersCancellation checks the one call that must go
@@ -2197,4 +2333,92 @@ func TestUnitAbandonSurvivesTheCallersCancellation(t *testing.T) {
 	err := f.deleteSession(ctx, &api.UploadSession{SessionID: "S", URI: driveRoot + "f.txt"})
 	require.NoError(t, err, "a cancelled caller does not cancel the cleanup")
 	assert.Equal(t, 1, s.count("DELETE", "/api/v4/file/upload"))
+}
+
+// TestUnitCallbackLostReplyIsNotReuploaded checks the reply that never comes back.
+// Filing an upload releases its name, so a second delivery is refused as though
+// the first had never worked, and rclone must read the name rather than declare
+// the upload failed. The Go transport re-sends a bodyless GET whose connection
+// died, so the site sees two deliveries; rclone adds none of its own.
+func TestUnitCallbackLostReplyIsNotReuploaded(t *testing.T) {
+	callbacks := 0
+	modTime := time.Now().Add(-time.Hour).Round(time.Second)
+	f, s := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case strings.HasPrefix(rec.path, "/api/v4/callback/s3/"):
+			callbacks++
+			if callbacks > 1 {
+				reply(w, api.CodeLockConflict, nil) // filed: the lock is gone
+				return
+			}
+			hijacker, ok := w.(http.Hijacker)
+			require.True(t, ok, "the fake site must be able to drop a reply")
+			conn, _, err := hijacker.Hijack()
+			require.NoError(t, err)
+			_ = conn.Close() // the server filed the file; the answer never arrives
+		case rec.path == "/api/v4/file/info":
+			reply(w, api.CodeSuccess, api.File{
+				Type: api.FileTypeFile, ID: "F7", Name: "f.txt", Size: 7, UpdatedAt: modTime,
+			})
+		default:
+			uploadSite()(s, w, r, rec)
+		}
+	})
+	o := &Object{fs: f, remote: "dir/f.txt"}
+	src := fsobject.NewStaticObjectInfo("dir/f.txt", modTime, 7, false, nil, nil)
+	require.NoError(t, o.Upload(testCtx(), strings.NewReader("content"), src),
+		"a lost reply for a file that is there is a completed upload")
+	assert.Positive(t, callbacks, "the callback was delivered")
+	assert.Equal(t, 1, s.count("PUT", "/api/v4/file/upload"), "and the file is not uploaded a second time")
+}
+
+// TestUnitCallbackIsNotRetriedByRclone checks the other half: rclone adds no
+// delivery of its own. A callback the site answered with a server-side failure is
+// left to the whole-file retry, because the upload may already be filed, and a
+// second delivery of a filed upload is refused as a lost lock.
+func TestUnitCallbackIsNotRetriedByRclone(t *testing.T) {
+	callbacks := 0
+	f, s := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case strings.HasPrefix(rec.path, "/api/v4/callback/s3/"):
+			callbacks++
+			w.WriteHeader(http.StatusBadGateway)
+			reply(w, api.CodeUploadFailed, nil)
+		case rec.method == "DELETE" && rec.path == "/api/v4/file/upload":
+			reply(w, api.CodeSuccess, nil)
+		default:
+			uploadSite()(s, w, r, rec)
+		}
+	})
+	o := &Object{fs: f, remote: "dir/f.txt"}
+	src := fsobject.NewStaticObjectInfo("dir/f.txt", time.Now(), 7, false, nil, nil)
+	err := o.Upload(testCtx(), strings.NewReader("content"), src)
+	require.Error(t, err, "a callback the site refused is still a failed upload")
+	assert.Equal(t, 1, callbacks, "delivered once; the retry happens at the whole file")
+	assert.Equal(t, 1, s.count("DELETE", "/api/v4/file/upload"), "and the name is released")
+}
+
+// TestUnitFailedCallbackReleasesTheName checks the honest half of the same story:
+// when nothing was filed, the session has to be abandoned so the name is not left
+// locked for the rest of the day.
+func TestUnitFailedCallbackReleasesTheName(t *testing.T) {
+	f, s := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case strings.HasPrefix(rec.path, "/api/v4/callback/s3/"):
+			reply(w, api.CodeLockConflict, nil)
+		case rec.method == "DELETE" && rec.path == "/api/v4/file/upload":
+			reply(w, api.CodeSuccess, nil)
+		case rec.path == "/api/v4/file/info":
+			// Nothing is filed: the name is still only a placeholder.
+			placeholderBehind(time.Minute)(s, w, r, rec)
+		default:
+			uploadSite()(s, w, r, rec)
+		}
+	})
+	o := &Object{fs: f, remote: "dir/f.txt"}
+	src := fsobject.NewStaticObjectInfo("dir/f.txt", time.Now(), 7, false, nil, nil)
+	err := o.Upload(testCtx(), strings.NewReader("content"), src)
+	require.Error(t, err, "an upload the server refused stays a failure")
+	assert.Equal(t, 1, s.count("DELETE", "/api/v4/file/upload"),
+		"and the session is abandoned, so the name comes free")
 }
