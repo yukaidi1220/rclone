@@ -113,7 +113,7 @@ func (f *Fs) createSession(ctx context.Context, remote string, src fs.ObjectInfo
 	if codeOf(err) != api.CodeLockConflict || !f.opt.DropStaleLocks {
 		return session, err
 	}
-	dropped, why := f.dropLocks(ctx, err, []string{f.serverPath(remote)}, self)
+	dropped, why := f.dropLocks(ctx, err, []string{f.serverPath(remote)}, self, false)
 	if dropped == 0 {
 		if why != "" {
 			return nil, fmt.Errorf("%w (%s)", err, why)
@@ -191,13 +191,14 @@ func withinAny(path string, prefixes []string) bool {
 	return false
 }
 
-// lockAge reports how old the placeholder behind a lock is, or false when the
-// server gives no evidence about it
+// placeholderAge reports how old the unfinished upload behind a lock is, and
+// false when the entry at that path is not an unfinished upload rclone can read
 //
 // The placeholder is created when the session begins, so its age is how long the
 // upload claiming the name has been going. Nothing else on the wire says whether
-// that upload is still alive.
-func (f *Fs) lockAge(ctx context.Context, serverPath string) (time.Duration, bool) {
+// that upload is still alive: measured on a live site the entry exposes only its
+// session id with no expiry, and the conflict payload carries no timestamp.
+func (f *Fs) placeholderAge(ctx context.Context, serverPath string) (time.Duration, bool) {
 	entry, err := f.entryAtServerPath(ctx, serverPath)
 	if err != nil || !uploading(entry) {
 		return 0, false
@@ -213,7 +214,14 @@ func (f *Fs) lockAge(ctx context.Context, serverPath string) (time.Duration, boo
 
 // refuseToRelease explains why a lock may not be released, or returns "" when it
 // may be
-func (f *Fs) refuseToRelease(ctx context.Context, conflict api.LockConflict, prefixes []string, uid string, self uint64) string {
+//
+// Deleting is the looser rule: the request wants that very entry gone, so breaking
+// the lock of an unfinished upload is doing what was asked - and leaving it locked
+// is the deadlock where a folder cannot be purged because one half-written file
+// inside it was interrupted. Writing is the stricter rule: taking over a name
+// someone may be uploading now starts a race for it, so the operator has to ask
+// for that by setting an age worth waiting for.
+func (f *Fs) refuseToRelease(ctx context.Context, conflict api.LockConflict, prefixes []string, uid string, self uint64, byDeleting bool) string {
 	path := conflictPath(conflict.Path)
 	switch {
 	case conflict.Token == "":
@@ -227,11 +235,18 @@ func (f *Fs) refuseToRelease(ctx context.Context, conflict api.LockConflict, pre
 	case f.nameTakenHere(path, self):
 		return path + ": another upload of this run holds it"
 	}
-	age, known := f.lockAge(ctx, path)
+	age, known := f.placeholderAge(ctx, path)
 	if !known {
-		return path + ": its placeholder cannot be read, so nothing says the upload behind it has stopped"
+		return path + ": the entry it locks is not an unfinished upload rclone can read"
+	}
+	if byDeleting {
+		return ""
 	}
 	after := time.Duration(f.opt.StaleLockAfter)
+	if after <= 0 {
+		return path + ": held by an upload started " + age.Round(time.Second).String() +
+			" ago, and rclone does not break those unless drop_stale_locks_after is set"
+	}
 	if age < after {
 		return fmt.Sprintf("%s: uploaded only %s ago, under the %s rclone will release at",
 			path, age.Round(time.Second), after)
@@ -319,7 +334,7 @@ func (f *Fs) deleteSession(ctx context.Context, session *api.UploadSession) erro
 // path, and the placeholder behind it is at least StaleLockAfter old. The server
 // has no way to say whether a holder is still running, so that age is the only
 // evidence that an upload has stopped.
-func (f *Fs) dropLocks(ctx context.Context, err error, prefixes []string, self uint64) (int, string) {
+func (f *Fs) dropLocks(ctx context.Context, err error, prefixes []string, self uint64, byDeleting bool) (int, string) {
 	conflicts := lockConflicts(err)
 	if len(conflicts) == 0 {
 		return 0, "the server named no holder, so there is no lock to release"
@@ -334,7 +349,7 @@ func (f *Fs) dropLocks(ctx context.Context, err error, prefixes []string, self u
 	tokens := []string{}
 	refused := []string{}
 	for _, conflict := range conflicts {
-		if reason := f.refuseToRelease(ctx, conflict, prefixes, uid, self); reason != "" {
+		if reason := f.refuseToRelease(ctx, conflict, prefixes, uid, self, byDeleting); reason != "" {
 			refused = append(refused, reason)
 			continue
 		}
