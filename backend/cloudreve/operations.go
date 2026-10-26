@@ -419,6 +419,17 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 			return nil, errors.New("cloudreve: set_policy needs one argument, the storage policy ID to bind this folder to")
 		}
 		return f.setPolicy(ctx, arg[0])
+	case "downloadurl":
+		if len(opt) > 0 {
+			return nil, errors.New("cloudreve: the downloadurl command takes no options")
+		}
+		if len(arg) != 1 || arg[0] == "" {
+			return nil, errors.New("cloudreve: the downloadurl command needs one argument, the file path within the remote - rc callers can put the folder in the fs, as fs=remote:dir, and name the file in arg")
+		}
+		// The normal download URL every read goes through (POST /file/url,
+		// honoring download_host), not a share link: no share is created, and
+		// the URL carries the server's own expiry.
+		return f.downloadURL(ctx, arg[0])
 	}
 	return nil, fs.ErrorCommandNotFound
 }
