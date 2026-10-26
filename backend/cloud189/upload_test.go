@@ -63,6 +63,7 @@ type taskCall struct {
 
 type putCall struct {
 	part          string // the URL the storage layer was addressed at, e.g. part2
+	signature     string // X-Amz-Signature of that URL, so two mints are distinguishable
 	headers       map[string]string
 	body          []byte
 	contentLength int64
@@ -95,7 +96,9 @@ type fakeDrive struct {
 	blankURLPart    int                          // answer this part number with an empty URL
 	skewFirstPut    bool                         // answer the first PUT 403 RequestTimeTooSkewed, then accept
 	skewed          bool                         // set once the skewed answer has been given
+	mints           int                          // one per presigned URL handed out, so two mints differ
 	wrongDigestPart int                          // sign this part's URL with another digest
+	misrouteURLPart int                          // address this part's URL at another part number
 	createBodies    []string                     // the raw form body of each createBatchTask
 	createKeys      []string                     // the sessionkey header each create was signed with
 	apiKeys         []string                     // "path sessionkey" for every signed API call
@@ -229,7 +232,17 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if d.keyPartsFromOne {
 				key = pos + 1
 			}
-			u := "http://" + r.Host + fmt.Sprintf("/store/part%d?X-Amz-Signature=PART-SIGNATURE-%d&a=1&b=2", i, i)
+			d.mints++
+			// Same shape as the service's: the part number is a query parameter of
+			// the presigned URL, and the path is the storage object.
+			urlPart := i
+			if d.misrouteURLPart == i {
+				urlPart = i - 1
+				if urlPart < 1 {
+					urlPart = i + 1
+				}
+			}
+			u := "http://" + r.Host + fmt.Sprintf("/store/part%d?partNumber=%d&X-Amz-Signature=PART-SIGNATURE-%d&a=1&b=2", i, urlPart, d.mints)
 			if d.blankURLPart == key {
 				u = ""
 			}
@@ -488,12 +501,16 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if bodyErr != nil {
-				// The client gave the upload up while this part was in flight, and
-				// the transport delivered a truncated request. Those bytes are not a
-				// claim about the part's digest, so they are neither recorded nor
-				// checked: a cancelled upload says nothing about the part it dropped.
-				w.WriteHeader(http.StatusBadRequest)
-				return
+				// A truncated request is expected only when the client gave the
+				// upload up: the transport then delivers whatever it had. Those
+				// bytes are not a claim about the part's digest, so they are neither
+				// recorded nor checked. Without a cancelled context the same sight
+				// is a bug, and saying so is the point.
+				if r.Context().Err() != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				t.Errorf("a part PUT arrived truncated although the client did not cancel: %v", bodyErr)
 			}
 			d.storePart(w, r, bodyBytes)
 			return
@@ -586,7 +603,8 @@ func (d *fakeDrive) storePart(w http.ResponseWriter, r *http.Request, body []byt
 	if skew {
 		d.skewed = true
 	}
-	d.puts = append(d.puts, putCall{part: path.Base(r.URL.Path), headers: flattenHeaders(r.Header), body: body, contentLength: r.ContentLength})
+	d.puts = append(d.puts, putCall{part: path.Base(r.URL.Path), signature: r.URL.Query().Get("X-Amz-Signature"),
+		headers: flattenHeaders(r.Header), body: body, contentLength: r.ContentLength})
 	d.mu.Unlock()
 	if skew {
 		// The storage layer refuses a URL whose signed Date is too old. The bytes
@@ -769,10 +787,13 @@ func TestARefusedPartURLIsMintedAgain(t *testing.T) {
 
 	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
 	require.NoError(t, err, "a URL refused as too old must not fail the file")
-	require.Len(t, drive.putCalls(), 2, "the part was sent twice: once refused, once accepted")
+	puts := drive.putCalls()
+	require.Len(t, puts, 2, "the part was sent twice: once refused, once accepted")
 	urls := drive.urlRequests()
 	require.Len(t, urls, 2, "each attempt asked for its own URL")
 	require.Equal(t, urls[0]["partInfo"], urls[1]["partInfo"], "and asked for the same part")
+	require.NotEqual(t, puts[0].signature, puts[1].signature,
+		"the retry went to a URL minted after the one that was refused")
 }
 
 // TestUploadRefusesAURLSignedForAnotherPart pins the digest check: an answer
@@ -786,7 +807,22 @@ func TestUploadRefusesAURLSignedForAnotherPart(t *testing.T) {
 
 	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "carries another part's digest")
+	require.Contains(t, err.Error(), "was signed for digest")
+}
+
+// TestUploadRefusesAURLAddressedToAnotherPart: the URL itself says which part it
+// accepts. An answer with the right key and the right digest but addressed to a
+// different part number would send this part's bytes into that part's slot, so
+// it is refused before anything is sent.
+func TestUploadRefusesAURLAddressedToAnotherPart(t *testing.T) {
+	noWaiting(t)
+	drive := &fakeDrive{t: t, misrouteURLPart: 2}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase) * 3)
+
+	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "is addressed to part")
 }
 
 func flattenHeaders(h http.Header) map[string]string {
