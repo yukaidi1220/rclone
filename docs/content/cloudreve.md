@@ -243,19 +243,34 @@ from the kill, and rclone handles both:
   placeholders from listings and answers `object not found` when one is named
   directly: an entry nobody can open is not a file, and showing it would make a
   re-run compare its transfer against zero bytes.
-- Writing that name again releases the lock by itself. The server's `40073` answer
-  names the lock's token and the account that holds it, so rclone asks the site to
-  unlock **only its own account's upload locks**, retries once and says what it
-  dropped. A lock held by another account, or by anything other than an upload, is
-  left alone. Deleting a locked entry goes through the same release, so a folder an
-  interrupted upload locked can be purged without waiting. Set `drop_stale_locks` to
-  get the server's error untouched instead.
+- Writing that name again can release the lock. The server's `40073` answer names
+  the lock's token, its path and the account holding it, but nothing that says
+  whether the upload behind it is still running. So rclone releases a lock only when
+  every one of these holds: this account owns it, an upload took it, its path is the
+  one this request is writing, no other upload in the same rclone run holds that
+  name, and the placeholder the session left behind is at least
+  `drop_stale_locks_after` old, 5 minutes by default. That age is the only evidence
+  the site gives that an upload has stopped, so keep the threshold above the time
+  your longest upload takes. Anything failing these checks is left alone, and the
+  reason appears in the error. Deleting goes through the same release, restricted to
+  the paths the delete names, so a folder an interrupted upload locked can be purged
+  without waiting. Set `drop_stale_locks` off to get the server's error untouched.
 
-What that costs: the server does not say whether the holder is still running, so an
-upload interrupted on this account is dropped for good - its parts are discarded and
-it has to be sent again. Two rclone runs of the **same account** writing the **same
-name** at once therefore cannot both succeed; keep them to different names, or turn
-this off.
+What that costs: a lock old enough to release belongs to an upload that is gone, so
+its parts are discarded and that file has to be sent again. Two runs of the **same
+account** writing the **same name** at once is undefined whichever way this is
+answered: both sessions can be live, and whichever callback reaches the server first
+files the name while the other is refused as a lost lock and its bytes are discarded.
+What the checks above prevent is rclone *causing* that race, by cutting off an upload
+that is merely young or one running in the same process. Keep concurrent runs to
+different names.
+
+A second shape of `40073` belongs here. The server also answers `Lock expired` with
+no holders listed, and that is what a callback hears when the file **was** filed and
+filing it released the name - which happens when a reply is lost in transit and the
+request is sent again. rclone then reads the name back, and if a file is there with
+the size and modified time this upload carried, it reports the upload complete rather
+than sending it a second time.
 
 A failed upload that rclone itself abandons releases the lock immediately, and it
 does so even after the caller has been cancelled - Ctrl-C still sends the abandon.
@@ -362,12 +377,3 @@ Binding changes where **new** files go and leaves what is already there alone. T
 site has no "inherit again" value, so undoing a binding means naming the policy the
 `policy` command reported beforehand. See [folders](#folders) for how a folder's
 policy is resolved.
-
-`rclone backend downloadurl remote:folder file.ext` returns the normal download URL
-of one path - the same URL reads use (honoring `download_host`), not a share link -
-so scripts and rc callers can fetch links without shelling out to a second binary.
-The URL carries the server's own expiry; re-request it when downloads start
-failing. Via the rc command `backend/command`, name the path in `arg` relative to
-the remote root (the handler reads `fs`, `command`, `opt` and `arg` only):
-
-    rclone rc backend/command command=downloadurl fs=remote: -a some/folder/file.ext

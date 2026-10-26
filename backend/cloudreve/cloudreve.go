@@ -101,6 +101,7 @@ type Options struct {
 	UploadConcurrency int                  `config:"upload_concurrency"`
 	SkipSoftDelete    bool                 `config:"skip_soft_delete"`
 	DropStaleLocks    bool                 `config:"drop_stale_locks"`
+	StaleLockAfter    fs.Duration          `config:"drop_stale_locks_after"`
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -159,6 +160,11 @@ func init() {
 			Default:  true,
 			Advanced: true,
 		}, {
+			Name:     "drop_stale_locks_after",
+			Help:     "Only release an upload lock whose placeholder is at least this old.\n\nThe server never says whether the session holding a name is still running, and the payload of a lock conflict carries no timestamp either, so the age of the placeholder the session left behind is all rclone has to go on. Release a younger lock and the two uploads race for the same name: whichever callback reaches the server first files the file, the other is answered \"Lock expired\", and its bytes are recycled. Keep this above the time the longest upload to this site takes.\n\n0 releases every lock the server names, however fresh.",
+			Default:  fs.Duration(5 * time.Minute),
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -192,21 +198,6 @@ it knows; run the policy command to see the IDs available under a pool.
 Undoing a binding needs the ID the policy command reported beforehand - the site
 has no "inherit again" value. Binding affects where new files land; it does not
 move what is already there.`,
-		}, {
-			Name:  "downloadurl",
-			Short: "Return the normal download URL of a file, as reads use.",
-			Long: `Returns the URL the backend itself downloads from (POST /file/url,
-honoring the download_host rewrite): no share is created, and the URL carries
-the server's own expiry, so re-request it when downloads start failing.
-
-    rclone backend downloadurl remote:some/folder file.ext
-
-Via the rc API, name the file in arg relative to the remote root (the
-backend/command handler reads fs, command, opt and arg only - there is no
-separate path parameter):
-
-    rclone rc backend/command command=downloadurl fs=remote: -a some/folder/file.ext
-    rclone rc backend/command command=downloadurl fs=remote:some/folder -a file.ext`,
 		}},
 	})
 }
@@ -231,6 +222,10 @@ type Fs struct {
 	folderIDs map[string]string      // standard path of a folder -> its own ID
 	links     map[string]*cachedURL  // URI -> a download link still worth using
 	acctID    string                 // this account's ID, as a lock holder names its owner
+
+	uploadsMu sync.Mutex
+	uploads   map[string]map[uint64]bool // server path of a file -> uploads working on it here
+	uploadSeq uint64                     // the next ticket handed out above
 }
 
 // tokenState holds the session credentials
@@ -420,6 +415,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		policies:  map[string]*api.Policy{},
 		folderIDs: map[string]string{},
 		links:     map[string]*cachedURL{},
+		uploads:   map[string]map[uint64]bool{},
 		tok:       tokenState{access: opt.AccessToken, refresh: opt.RefreshToken},
 	}
 	f.pacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
@@ -849,12 +845,8 @@ func policyList(children []api.Policy) string {
 
 // statBy asks for the metadata of one entry by query parameters
 func (f *Fs) statBy(ctx context.Context, params map[string]string) (*api.File, error) {
-	query := url.Values{}
-	for key, value := range params {
-		query.Set(key, value)
-	}
-	file := new(api.File)
-	if err := f.call(ctx, "GET", "/file/info", query, nil, file); err != nil {
+	file, err := f.entryBy(ctx, params)
+	if err != nil {
 		return nil, err
 	}
 	if uploading(file) {
@@ -864,6 +856,51 @@ func (f *Fs) statBy(ctx context.Context, params map[string]string) (*api.File, e
 		return nil, fs.ErrorObjectNotFound
 	}
 	return file, nil
+}
+
+// entryBy is statBy without the placeholder filter: it answers for an entry even
+// while an unfinished upload owns it
+func (f *Fs) entryBy(ctx context.Context, params map[string]string) (*api.File, error) {
+	query := url.Values{}
+	for key, value := range params {
+		query.Set(key, value)
+	}
+	file := new(api.File)
+	if err := f.call(ctx, "GET", "/file/info", query, nil, file); err != nil {
+		return nil, err
+	}
+	return file, nil
+}
+
+// entryAtServerPath reads one entry the site named, placeholder included
+func (f *Fs) entryAtServerPath(ctx context.Context, serverPath string) (*api.File, error) {
+	return f.entryBy(ctx, map[string]string{"uri": driveRoot + strings.TrimPrefix(serverPath, "/")})
+}
+
+// serverPath is the path the site reports for a remote name, which is the form a
+// lock conflict carries: the encoded segments, but not the percent-escaping the
+// URI needs for transport
+func (f *Fs) serverPath(remote string) string {
+	uri := f.uriFor(remote)
+	unescaped, err := url.PathUnescape(uri)
+	if err == nil {
+		uri = unescaped
+	}
+	return strings.Trim(strings.TrimPrefix(uri, driveRoot), "/")
+}
+
+// serverPathsOf converts URIs the caller already holds into the paths a conflict
+// names, so they can be matched against each other
+func serverPathsOf(uris []string) []string {
+	paths := make([]string, 0, len(uris))
+	for _, uri := range uris {
+		unescaped, err := url.PathUnescape(uri)
+		if err != nil {
+			unescaped = uri
+		}
+		paths = append(paths, strings.Trim(strings.TrimPrefix(unescaped, driveRoot), "/"))
+	}
+	return paths
 }
 
 // statFile returns the metadata of the entry at the standard path remote
@@ -899,18 +936,26 @@ func (f *Fs) accountID(ctx context.Context) (string, error) {
 	return me.ID, nil
 }
 
-// lockConflicts returns the holders named by the data of a lock conflict, which
-// is how a client learns the token it has to release
-func lockConflicts(err error) []api.LockConflict {
-	var e *apiError
-	if !errors.As(err, &e) || len(e.data) == 0 {
+// conflictsIn decodes the holders a lock conflict names, which is how a client
+// learns the token it has to release
+func conflictsIn(data json.RawMessage) []api.LockConflict {
+	if len(data) == 0 {
 		return nil
 	}
 	conflicts := []api.LockConflict{}
-	if json.Unmarshal(e.data, &conflicts) != nil {
+	if json.Unmarshal(data, &conflicts) != nil {
 		return nil
 	}
 	return conflicts
+}
+
+// lockConflicts returns the holders a lock conflict error named
+func lockConflicts(err error) []api.LockConflict {
+	var e *apiError
+	if !errors.As(err, &e) {
+		return nil
+	}
+	return conflictsIn(e.data)
 }
 
 // plainCall makes one API request without a bearer token and without renewing
@@ -947,22 +992,47 @@ func (f *Fs) plainCall(ctx context.Context, method, endpoint string, query url.V
 // call makes an authenticated API request, renewing the session once when the
 // server reports it has expired
 func (f *Fs) call(ctx context.Context, method, endpoint string, query url.Values, in, out interface{}) error {
+	attempt, err := f.attempt(ctx, method, endpoint, query, in, out)
+	if err != nil {
+		return err
+	}
+	return f.pacer.Call(attempt)
+}
+
+// callOnce is call limited to a single delivery, for the endpoints that do
+// something once and for all
+//
+// Filing an upload is one of them: when its reply is lost, repeating the request
+// is refused as though the first had never worked, because the server released
+// the name as it filed the file. rclone would then read that refusal as a failed
+// upload and send the whole file again.
+func (f *Fs) callOnce(ctx context.Context, method, endpoint string, query url.Values, in, out interface{}) error {
+	attempt, err := f.attempt(ctx, method, endpoint, query, in, out)
+	if err != nil {
+		return err
+	}
+	_, err = attempt()
+	return err
+}
+
+// attempt prepares the closure that sends one request and reads one reply
+func (f *Fs) attempt(ctx context.Context, method, endpoint string, query url.Values, in, out interface{}) (func() (bool, error), error) {
 	var body []byte
 	if in != nil {
 		var err error
 		body, err = json.Marshal(in)
 		if err != nil {
-			return fmt.Errorf("cloudreve: can't encode request for %s: %w", endpoint, err)
+			return nil, fmt.Errorf("cloudreve: can't encode request for %s: %w", endpoint, err)
 		}
 	}
 	renewed := false
 	if seen := f.tok.currentGeneration(); f.tok.nearExpiry() {
 		if err := f.renewToken(ctx, seen); err != nil {
-			return err
+			return nil, err
 		}
 		renewed = true
 	}
-	return f.pacer.Call(func() (bool, error) {
+	return func() (bool, error) {
 		seen := f.tok.currentGeneration()
 		env, err := f.request(ctx, method, endpoint, query, body, true)
 		if err != nil {
@@ -985,7 +1055,7 @@ func (f *Fs) call(ctx context.Context, method, endpoint string, query url.Values
 			return true, f.apiError(method, endpoint, query, env)
 		}
 		return f.shouldRetry(ctx, f.apiError(method, endpoint, query, env))
-	})
+	}, nil
 }
 
 // apiError makes an error out of a non-success envelope, naming the call it came
@@ -998,10 +1068,16 @@ func (f *Fs) apiError(method, endpoint string, query url.Values, env envelope) e
 		where += "?" + query.Encode()
 	}
 	if env.Code == api.CodeLockConflict {
-		// The lock belongs to an upload session, and one left by a killed run holds
-		// it until the server's upload_session_timeout passes - a day by default.
-		// Repeating the request inside a run cannot win, so say what is waiting.
-		env.Msg += " - held by an upload session until the server's upload_session_timeout passes"
+		// Two different answers share this code, and telling them apart is the
+		// whole difference between waiting a day and retrying now. With a list of
+		// holders the name is still claimed by a session. Without one the server
+		// is saying the lock is gone, which is what a callback hears when the file
+		// was already filed and filing it released the name.
+		if len(conflictsIn(env.Data)) == 0 {
+			env.Msg += " - no upload session holds this name now, so the upload it belonged to may already be filed"
+		} else {
+			env.Msg += " - held by an upload session until the server's upload_session_timeout passes"
+		}
 	}
 	return &apiError{
 		code:     env.Code,
