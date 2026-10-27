@@ -2,6 +2,7 @@ package cloudreve
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -58,6 +59,9 @@ type site struct {
 	// missing holds the folder URIs the site does not have, for the case of an
 	// upload whose path names folders that are not there yet.
 	missing map[string]bool
+	// token is the access token every test's remote starts with, kept here so a
+	// test can name the bearer it expects.
+	token string
 }
 
 // lacks reports whether the site is without the folder at uri
@@ -109,8 +113,8 @@ func (s *site) made() []string {
 	return uris
 }
 
-// newSite starts a fake Cloudreve site and returns it with an Fs pointed at it
-func newSite(t *testing.T, root string, extra configmap.Simple, handle siteHandler) (*Fs, *site) {
+// newSiteServer starts a fake Cloudreve site that answers through handle
+func newSiteServer(t *testing.T, handle siteHandler) *site {
 	t.Helper()
 	s := &site{t: t, handle: handle, probePolicy: PolicyTypeS3, probeID: "POL-S3", probeName: "direct s3"}
 	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -149,10 +153,30 @@ func newSite(t *testing.T, root string, extra configmap.Simple, handle siteHandl
 		s.handle(s, w, r, rec)
 	}))
 	t.Cleanup(s.srv.Close)
+	return s
+}
 
+// newSite starts a fake Cloudreve site and returns it with an Fs pointed at it
+func newSite(t *testing.T, root string, extra configmap.Simple, handle siteHandler) (*Fs, *site) {
+	t.Helper()
+	s, m := siteAndConfig(t, extra, handle)
+	remote, err := NewFs(context.Background(), "cloudreve-test", root, m)
+	// A remote rooted at a file comes back with the sentinel rclone uses to
+	// learn the root is a file, alongside the Fs.
+	require.True(t, err == nil || errors.Is(err, fs.ErrorIsFile), "making the remote: %v", err)
+	return remote.(*Fs), s
+}
+
+// siteAndConfig starts the fake site and builds the config a remote would be made
+// from, without making one. It is for the cases where the remote is expected to
+// refuse to open, and for reading back what reached the config afterwards.
+func siteAndConfig(t *testing.T, extra configmap.Simple, handle siteHandler) (*site, configmap.Simple) {
+	t.Helper()
+	s := newSiteServer(t, handle)
+	s.token = accessToken(time.Now().Add(time.Hour))
 	m := configmap.Simple{
 		"url":                s.srv.URL,
-		"access_token":       "SEED",
+		"access_token":       s.token,
 		"refresh_token":      "SEEDR",
 		"upload_concurrency": "2",
 	}
@@ -163,11 +187,7 @@ func newSite(t *testing.T, root string, extra configmap.Simple, handle siteHandl
 		}
 		m[key] = value
 	}
-	remote, err := NewFs(context.Background(), "cloudreve-test", root, m)
-	// A remote rooted at a file comes back with the sentinel rclone uses to
-	// learn the root is a file, alongside the Fs.
-	require.True(t, err == nil || errors.Is(err, fs.ErrorIsFile), "making the remote: %v", err)
-	return remote.(*Fs), s
+	return s, m
 }
 
 // parentID is the ID the fake names the probed folder with, the way a real site
@@ -252,8 +272,10 @@ func loginStep(w http.ResponseWriter, rec seen, captcha bool, prepared api.Prepa
 func TestUnitSignInUsesBearerToken(t *testing.T) {
 	signedIn := map[string]string{}
 	f, _ := newSite(t, "", configmap.Simple{
-		"email":    "me@example.com",
-		"password": obscure.MustObscure("hunter2"),
+		"email":         "me@example.com",
+		"password":      obscure.MustObscure("hunter2"),
+		"access_token":  "",
+		"refresh_token": "",
 	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
 		if loginStep(w, rec, false, api.PrepareLogin{PasswordEnabled: true}) {
 			return
@@ -289,8 +311,10 @@ func TestUnitSignInUsesBearerToken(t *testing.T) {
 // connections, and one lost while signing in must not fail the whole remote.
 func TestUnitSignInRetriesADroppedConnection(t *testing.T) {
 	f, s := newSite(t, "", configmap.Simple{
-		"email":    "me@example.com",
-		"password": obscure.MustObscure("hunter2"),
+		"email":         "me@example.com",
+		"password":      obscure.MustObscure("hunter2"),
+		"access_token":  "",
+		"refresh_token": "",
 	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
 		if rec.path == "/api/v4/site/config/login" && rec.attempt <= 2 {
 			panic(http.ErrAbortHandler) // the connection goes, reply never arrives
@@ -397,6 +421,610 @@ func TestUnitWrongPasswordIsNotOverExplained(t *testing.T) {
 	assert.NotContains(t, err.Error(), "no local password")
 }
 
+// accessToken makes the text a site hands out for an access token: the claims
+// rclone reads are in the middle section, and the deadline is the only one that
+// matters here.
+func accessToken(expires time.Time) string {
+	head := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	claims := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(
+		`{"token_type":"access","sub":"USER","exp":%d}`, expires.Unix())))
+	return head + "." + claims + ".signature"
+}
+
+// TestUnitStoredTokenIsKept checks the cheapest way to open a remote: a pair in
+// the config whose access token still has life in it is kept, so the run starts
+// with the single request that says whose account it is and neither signs in nor
+// renews.
+func TestUnitStoredTokenIsKept(t *testing.T) {
+	fresh := accessToken(time.Now().Add(time.Hour))
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      obscure.MustObscure("hunter2"),
+		"access_token":  fresh,
+		"refresh_token": "SEEDR",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			assert.Equal(t, "Bearer "+fresh, rec.header.Get("Authorization"), "the stored token is what goes out")
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			assert.Equal(t, "Bearer "+fresh, rec.header.Get("Authorization"))
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("a pair that still works is neither traded nor replaced: %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.count("GET", "/api/v4/user/me"), "one request, and it is the one that says whose account this is")
+	assert.Equal(t, 0, s.count("POST", "/api/v4/session/token"), "no sign-in")
+	assert.Equal(t, 0, s.count("POST", "/api/v4/session/token/refresh"), "no renewal")
+	assert.Equal(t, fresh, token(f, "access_token"), "the config is left as it was")
+}
+
+// TestUnitOldTokenIsRenewedNotSignedIn checks what a token past its deadline
+// costs: one request to trade the refresh token, not three to sign in.
+func TestUnitOldTokenIsRenewedNotSignedIn(t *testing.T) {
+	fresh := accessToken(time.Now().Add(time.Hour))
+	spent := accessToken(time.Now().Add(-time.Minute))
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      obscure.MustObscure("hunter2"),
+		"access_token":  spent,
+		"refresh_token": "SEEDR",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+			reply(w, api.CodeSuccess, api.Token{
+				AccessToken: fresh, RefreshToken: "RT2", AccessExpires: time.Now().Add(time.Hour)})
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			assert.Equal(t, "Bearer "+fresh, rec.header.Get("Authorization"),
+				"a pair past its deadline is not sent, not even to ask a question")
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			assert.Equal(t, "Bearer "+fresh, rec.header.Get("Authorization"))
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("the account should not have to sign in: %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token/refresh"), "the pair is traded")
+	assert.Equal(t, 0, s.count("POST", "/api/v4/session/token"), "not replaced by a sign-in")
+	assert.Equal(t, "RT2", token(f, "refresh_token"))
+	require.NotEmpty(t, s.recorded())
+	assert.Equal(t, "/api/v4/session/token/refresh", s.recorded()[0].path,
+		"the trade is the first thing the run does, not a request doomed to be refused")
+}
+
+// TestUnitTokenOfAnotherAccountIsReplaced checks the case reusing a stored pair
+// could otherwise get wrong: the remote's email was edited underneath a pair that
+// still works, for somebody else's account. Signing in is what puts it right.
+func TestUnitTokenOfAnotherAccountIsReplaced(t *testing.T) {
+	fresh := accessToken(time.Now().Add(time.Hour))
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      obscure.MustObscure("hunter2"),
+		"access_token":  fresh,
+		"refresh_token": "",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "OTHER", Email: "someone.else@example.com"})
+		case loginStep(w, rec, false, api.PrepareLogin{PasswordEnabled: true}):
+			return
+		case rec.method == "POST" && rec.path == "/api/v4/session/token":
+			reply(w, api.CodeSuccess, api.LoginData{Token: api.Token{
+				AccessToken: "AT9", RefreshToken: "RT9", AccessExpires: time.Now().Add(time.Hour)}})
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			assert.Equal(t, "Bearer AT9", rec.header.Get("Authorization"),
+				"the account the remote names is the one that gets used")
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token"), "the foreign pair is replaced")
+	assert.Equal(t, "AT9", token(f, "access_token"))
+	assert.Equal(t, "RT9", token(f, "refresh_token"))
+}
+
+// TestUnitHandSetTokenIsNotSecondGuessed checks a token filled in by hand, with
+// no account to sign in as: rclone has nothing to check it against and no way to
+// replace it, so it just uses it.
+func TestUnitHandSetTokenIsNotSecondGuessed(t *testing.T) {
+	f, s := newSite(t, "", configmap.Simple{
+		"email": "", "password": "", "refresh_token": "",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			assert.Equal(t, "Bearer "+s.token, rec.header.Get("Authorization"))
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("a hand-set token is used, not questioned: %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.count("GET", "/api/v4/user/me"), "no identity request without an account named")
+	assert.Equal(t, s.token, token(f, "access_token"), "the config keeps what it had")
+}
+
+// TestUnitOpaqueHandSetTokenOpensTheRemoteSilently covers the pair that says
+// nothing about itself: no deadline in the token, nothing to trade it for and no
+// account to sign in as. Nothing can be established about it and nothing can
+// replace it, so the run starts with the work itself and lets the server be the
+// judge of the token.
+func TestUnitOpaqueHandSetTokenOpensTheRemoteSilently(t *testing.T) {
+	f, s := newSite(t, "", configmap.Simple{
+		"email": "", "password": "", "access_token": "OPAQUE", "refresh_token": "",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			assert.Equal(t, "Bearer OPAQUE", rec.header.Get("Authorization"))
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("a token that cannot be questioned or replaced is used: %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.count("GET", "/api/v4/user/me"), "no account named, so nothing to ask")
+	assert.Equal(t, 0, s.count("POST", "/api/v4/session/token"), "and no password to sign in with")
+	assert.True(t, f.tok.accessExpires.IsZero(), "a token that says nothing keeps no deadline")
+}
+
+// TestUnitSpentPairWithNothingToTradeStillOpens checks that a remote whose one
+// credential is past its deadline is not refused at the start. There is nothing
+// to trade it with and no account to sign in as, so the work itself is what finds
+// out, and the error comes from the request that was refused.
+func TestUnitSpentPairWithNothingToTradeStillOpens(t *testing.T) {
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      "",
+		"access_token":  accessToken(time.Now().Add(-time.Hour)),
+		"refresh_token": "",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			reply(w, api.CodeCheckLogin, nil) // the site will not have this one
+		default:
+			s.t.Fatalf("asking about a pair that cannot be renewed is one doomed request: %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.Error(t, err, "the refused request is what reports the dead session")
+	assert.Contains(t, err.Error(), "no refresh_token")
+	assert.Equal(t, 0, s.count("GET", "/api/v4/user/me"), "the run asks nothing on the way in")
+	assert.Equal(t, 1, s.count("GET", "/api/v4/file"), "and gets its answer from the work")
+}
+
+// TestUnitForeignAccountLeavesNoCachedID checks what the account check leaves
+// behind when it turns out the stored pair is somebody else's. The ID from that
+// answer must not be kept: the lock rules ask "is this holder me", and a cached
+// foreign ID would answer that for another account, both ways round.
+func TestUnitForeignAccountLeavesNoCachedID(t *testing.T) {
+	fresh := accessToken(time.Now().Add(time.Hour))
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      obscure.MustObscure("hunter2"),
+		"access_token":  fresh,
+		"refresh_token": "",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			if rec.attempt == 1 {
+				reply(w, api.CodeSuccess, api.CurrentUser{ID: "OTHER", Email: "someone.else@example.com"})
+				return
+			}
+			assert.Equal(t, "Bearer AT9", rec.header.Get("Authorization"), "asked again with the account's own token")
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+		case loginStep(w, rec, false, api.PrepareLogin{PasswordEnabled: true}):
+			return
+		case rec.method == "POST" && rec.path == "/api/v4/session/token":
+			reply(w, api.CodeSuccess, api.LoginData{Token: api.Token{AccessToken: "AT9", RefreshToken: "RT9"}})
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			assert.Equal(t, "Bearer AT9", rec.header.Get("Authorization"), "the run continues as the account it signed in to")
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err)
+	id, err := f.accountID(testCtx())
+	require.NoError(t, err)
+	assert.Equal(t, "ME", id, "the foreign account is not what the lock rules are told")
+	assert.Equal(t, 2, s.count("GET", "/api/v4/user/me"), "the question was asked again, not answered from the cache")
+}
+
+// TestUnitUnanswerableAccountCheckKeepsWorkingToken checks that a site which
+// cannot answer the identity question does not break a remote whose token is
+// fine. Only "this is not your account" may stop a run, and only when there is no
+// password to sign in with.
+func TestUnitUnanswerableAccountCheckKeepsWorkingToken(t *testing.T) {
+	fresh := accessToken(time.Now().Add(time.Hour))
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      "",
+		"access_token":  fresh,
+		"refresh_token": "",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME"})
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			assert.Equal(t, "Bearer "+fresh, rec.header.Get("Authorization"))
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("a remote with a working token must not be pushed to sign in: %s %s", rec.method, rec.path)
+		}
+	})
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err, "the run goes on with the token it has")
+	assert.Equal(t, 0, s.count("POST", "/api/v4/session/token"))
+}
+
+// TestUnitRefusedTokenIsTradedNotSignedIn checks the pair that looks fresh but is
+// already refused by the site: with a refresh token in hand that is one request,
+// not a sign-in, and it must not fail the remote for being unable to ask.
+func TestUnitRefusedTokenIsTradedNotSignedIn(t *testing.T) {
+	fresh := accessToken(time.Now().Add(time.Hour))
+	newer := accessToken(time.Now().Add(2 * time.Hour))
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      "",
+		"access_token":  fresh,
+		"refresh_token": "SEEDR",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			if rec.header.Get("Authorization") == "Bearer "+fresh {
+				reply(w, api.CodeCheckLogin, nil) // the site will not have this one
+				return
+			}
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+		case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+			reply(w, api.CodeSuccess, api.Token{AccessToken: newer, RefreshToken: "RT2"})
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			assert.Equal(t, "Bearer "+newer, rec.header.Get("Authorization"))
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token/refresh"), "the pair is traded")
+	assert.Equal(t, 0, s.count("POST", "/api/v4/session/token"), "no sign-in, there is no password")
+	assert.Equal(t, "RT2", token(f, "refresh_token"))
+}
+
+// TestUnitTokenExpiryReadsTheDeadline checks the one thing rclone reads off a
+// token, and that a token saying nothing is treated as unknown rather than as
+// good forever.
+func TestUnitTokenExpiryReadsTheDeadline(t *testing.T) {
+	later := time.Now().Add(2 * time.Hour).Truncate(time.Second)
+	at, ok := tokenExpiry(accessToken(later))
+	require.True(t, ok, "a signed-looking token says when it dies")
+	assert.True(t, later.Equal(at.Truncate(time.Second)), "the deadline read is the one written: %s vs %s", at, later)
+
+	for _, token := range []string{"", "SEED", "a.b", "a." + strings.Repeat("!", 8) + ".c"} {
+		_, ok := tokenExpiry(token)
+		assert.False(t, ok, "no deadline to be had from %q", token)
+	}
+}
+
+// TestUnitTokenExpiryReadsEveryShapeOfToken checks the two ways the middle
+// section of a written token catches a reader out: it is packed in the URL-safe
+// alphabet, and it is packed without the padding most base64 readers want. A
+// token from a live site has a payload 3 characters short of a whole group, so
+// reading the deadline cannot assume the padding is there.
+func TestUnitTokenExpiryReadsEveryShapeOfToken(t *testing.T) {
+	head := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	later := time.Unix(1780000000, 0)
+	for _, row := range []struct {
+		name   string
+		claims string
+		stdURL bool // pack with the other alphabet, which no JWT is written in
+		want   time.Time
+		nodate bool
+		// what the fixture itself has to be, so the row keeps testing its name
+		needUnpadded   bool
+		needWholeGroup bool
+		needURLChars   bool
+		needStdChars   bool
+	}{
+		{
+			name:         "the shape a live site answers with",
+			claims:       `{"exp":1780000000,"nbf":1700000000,"sub":"ME","token_type":"access"}`,
+			want:         later,
+			needUnpadded: true,
+		},
+		{
+			name:         "claims that pack with a URL-safe character",
+			claims:       `{"exp":1780000000,"nbf":1700000000,"sub":"ID~A","token_type":"access"}`,
+			want:         later,
+			needUnpadded: true,
+			needURLChars: true,
+		},
+		{
+			name:           "claims that pack into whole groups",
+			claims:         `{"exp":1780000000,"nbf":1700000000,"sub":"~~~","token_type":"access"}`,
+			want:           later,
+			needURLChars:   true,
+			needWholeGroup: true,
+		},
+		{
+			name:         "claims packed in the other alphabet",
+			claims:       `{"exp":1780000000,"nbf":1700000000,"sub":"ID~A","token_type":"access"}`,
+			stdURL:       true,
+			nodate:       true,
+			needStdChars: true,
+		},
+		{name: "no deadline claimed", claims: `{"sub":"ME","token_type":"access"}`, nodate: true},
+		{name: "deadline of zero", claims: `{"exp":0,"sub":"ME","token_type":"access"}`, nodate: true},
+		{name: "deadline before the epoch", claims: `{"exp":-5,"sub":"ME","token_type":"access"}`, nodate: true},
+		{name: "claims that are not JSON", claims: `exp=1780000000`, nodate: true},
+	} {
+		payload := base64.RawURLEncoding.EncodeToString([]byte(row.claims))
+		if row.stdURL {
+			payload = strings.TrimRight(base64.StdEncoding.EncodeToString([]byte(row.claims)), "=")
+		}
+		if row.needUnpadded {
+			require.NotEqual(t, 0, len(payload)%4, "fixture: %s needs a payload short of a whole group", row.name)
+		}
+		if row.needWholeGroup {
+			require.Equal(t, 0, len(payload)%4, "fixture: %s needs a payload of whole groups", row.name)
+		}
+		if row.needURLChars {
+			require.True(t, strings.ContainsAny(payload, "-_"), "fixture: %s needs the URL-safe characters", row.name)
+		}
+		if row.needStdChars {
+			require.True(t, strings.ContainsAny(payload, "+/"), "fixture: %s needs the other alphabet's characters", row.name)
+		}
+		at, ok := tokenExpiry(head + "." + payload + ".signature")
+		if row.nodate {
+			assert.False(t, ok, "%s: nothing here is a deadline rclone may trust", row.name)
+			continue
+		}
+		require.True(t, ok, "%s: the deadline is written in the claims", row.name)
+		assert.True(t, row.want.Equal(at), "%s: read %s, written %s", row.name, at, row.want)
+	}
+}
+
+// TestUnitSameAddressWrittenDifferentlyIsTheSameAccount checks the identity
+// comparison against the way a site makes addresses. Cloudreve looks an account
+// up case-insensitively, and refuses to create a second one whose email differs
+// only in case, so an answer that differs from the configured address in case
+// cannot be another account - and treating it as one would throw a working
+// session away on every run of a remote whose email was typed differently.
+func TestUnitSameAddressWrittenDifferentlyIsTheSameAccount(t *testing.T) {
+	fresh := accessToken(time.Now().Add(time.Hour))
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "Me@Example.COM",
+		"password":      obscure.MustObscure("hunter2"),
+		"access_token":  fresh,
+		"refresh_token": "SEEDR",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			assert.Equal(t, "Bearer "+fresh, rec.header.Get("Authorization"))
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		case loginStep(w, rec, false, api.PrepareLogin{PasswordEnabled: true}):
+			return
+		case rec.method == "POST" && rec.path == "/api/v4/session/token":
+			reply(w, api.CodeSuccess, api.LoginData{Token: api.Token{AccessToken: "AT9", RefreshToken: "RT9"}})
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.count("POST", "/api/v4/session/token"), "one address written two ways is one account")
+	assert.Equal(t, 0, s.count("POST", "/api/v4/session/token/refresh"), "and the pair is neither traded nor replaced")
+	assert.Equal(t, fresh, token(f, "access_token"))
+}
+
+// TestUnitKeptTokenRecordsItsOwnDeadline checks what keeping a pair writes down.
+// The deadline comes from the token, not from the config, and recording it at the
+// start is what lets a run that lasts past the margin renew while the token it
+// holds still works; without it the session is only noticed when it has already
+// stopped working.
+func TestUnitKeptTokenRecordsItsOwnDeadline(t *testing.T) {
+	later := time.Now().Add(time.Hour).Truncate(time.Second)
+	f, _ := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      "",
+		"access_token":  accessToken(later),
+		"refresh_token": "SEEDR",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("an hour of life left is not a reason to replace anything: %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err)
+	assert.True(t, later.Equal(f.tok.accessExpires.Truncate(time.Second)),
+		"the run keeps the deadline the token carries: %s against %s", f.tok.accessExpires, later)
+	assert.False(t, f.tok.nearExpiry(), "an hour away is not near the deadline")
+}
+
+// TestUnitAlivePairWithNothingToRenewItIsUsed checks that a deadline is written
+// down only where something can act on it. A token with a few minutes left, with
+// no refresh token and no password behind it, cannot be renewed; recording its
+// deadline would have the run stop using a token that still works and report a
+// session it has no way to renew, before the site ever refused anything.
+func TestUnitAlivePairWithNothingToRenewItIsUsed(t *testing.T) {
+	shorter := accessToken(time.Now().Add(5 * time.Minute))
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      "",
+		"access_token":  shorter,
+		"refresh_token": "",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			assert.Equal(t, "Bearer "+shorter, rec.header.Get("Authorization"))
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("a token that still works is neither renewed nor replaced: %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err, "the run uses what it was given")
+	assert.True(t, f.tok.accessExpires.IsZero(), "no deadline is kept for a pair that cannot be renewed")
+	assert.Equal(t, 0, s.count("POST", "/api/v4/session/token/refresh"))
+	assert.Equal(t, shorter, token(f, "access_token"), "and the config is left alone")
+}
+
+// TestUnitTradedPairIsCheckedBeforeItIsUsed checks the one thing a trade cannot
+// tell for itself: whose it got. Trading a foreign refresh token leaves rclone
+// holding a fresh pair for somebody else's account, which reads and writes that
+// account's drive and reports nothing - so the answer has to be asked again.
+func TestUnitTradedPairIsCheckedBeforeItIsUsed(t *testing.T) {
+	newer := accessToken(time.Now().Add(time.Hour))
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      obscure.MustObscure("hunter2"),
+		"access_token":  accessToken(time.Now().Add(-time.Minute)),
+		"refresh_token": "SEEDR",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+			reply(w, api.CodeSuccess, api.Token{
+				AccessToken: newer, RefreshToken: "RT2", AccessExpires: time.Now().Add(time.Hour)})
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			if rec.header.Get("Authorization") == "Bearer "+newer {
+				reply(w, api.CodeSuccess, api.CurrentUser{ID: "OTHER", Email: "someone.else@example.com"})
+				return
+			}
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+		case loginStep(w, rec, false, api.PrepareLogin{PasswordEnabled: true}):
+			return
+		case rec.method == "POST" && rec.path == "/api/v4/session/token":
+			reply(w, api.CodeSuccess, api.LoginData{Token: api.Token{AccessToken: "AT9", RefreshToken: "RT9"}})
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			assert.Equal(t, "Bearer AT9", rec.header.Get("Authorization"),
+				"the drive used is the account the remote names, not the one traded in")
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token/refresh"), "the pair was traded")
+	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token"), "and found to be another account's")
+	assert.Equal(t, "AT9", token(f, "access_token"), "the foreign pair is not left in the config")
+	id, err := f.accountID(testCtx())
+	require.NoError(t, err)
+	assert.Equal(t, "ME", id, "nor is its ID what the lock rules are told")
+}
+
+// TestUnitPairTradedToAnUnanswerableCheckIsStillUsed checks the trade path of the
+// same rule that governs a kept pair: a site that will not say whose token this
+// is has not said it is somebody else's. Failing here would make a remote that
+// renews correctly refuse to open at all.
+func TestUnitPairTradedToAnUnanswerableCheckIsStillUsed(t *testing.T) {
+	newer := accessToken(time.Now().Add(time.Hour))
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      "",
+		"access_token":  accessToken(time.Now().Add(-time.Minute)),
+		"refresh_token": "SEEDR",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+			reply(w, api.CodeSuccess, api.Token{
+				AccessToken: newer, RefreshToken: "RT2", AccessExpires: time.Now().Add(time.Hour)})
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME"}) // the site names no email
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			assert.Equal(t, "Bearer "+newer, rec.header.Get("Authorization"))
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("a remote with a renewed pair must not be pushed to sign in: %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err, "the run goes on with the pair it traded for")
+	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token/refresh"))
+	assert.Equal(t, 0, s.count("POST", "/api/v4/session/token"), "there is no password to sign in with anyway")
+}
+
+// TestUnitRenewalTakesTheDeadlineOfThePairItInstalls checks the clock a renewed
+// session runs on when the site does not state one. The deadline held before the
+// renewal is the spent token's, and leaving it behind makes every request of a
+// long run look about to expire, so the renewal runs again and again.
+func TestUnitRenewalTakesTheDeadlineOfThePairItInstalls(t *testing.T) {
+	spent := time.Now().Add(-time.Hour)
+	for _, row := range []struct {
+		name   string
+		issued string
+		want   time.Time
+	}{
+		{
+			name:   "the token says when",
+			issued: accessToken(spent.Add(3 * time.Hour)),
+			want:   spent.Add(3 * time.Hour).Truncate(time.Second),
+		},
+		{
+			name:   "neither the answer nor the token says",
+			issued: "OPAQUE",
+			want:   time.Time{},
+		},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			f, s := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+				switch {
+				case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+					reply(w, api.CodeSuccess, api.Token{AccessToken: row.issued, RefreshToken: "RT2"})
+				default:
+					s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+				}
+			})
+			f.tok.setExpiry(spent) // the clock the token being replaced was run on
+
+			require.NoError(t, f.renewToken(testCtx(), f.tok.currentGeneration()))
+			at := f.tok.accessExpires.Truncate(time.Second)
+			if row.want.IsZero() {
+				assert.True(t, f.tok.accessExpires.IsZero(),
+					"a pair that says nothing has no deadline, not the old one: %s", f.tok.accessExpires)
+			} else {
+				assert.True(t, row.want.Equal(at), "running on %s, expected %s", at, row.want)
+			}
+			assert.False(t, f.tok.nearExpiry(), "a renewed pair is not near its deadline")
+			assert.Equal(t, 1, s.count("POST", "/api/v4/session/token/refresh"), "renewed once")
+		})
+	}
+}
+
 // TestUnitRenewsSpentSession checks that an expired session is renewed once, and
 // that the renewal does not send the dead token.
 func TestUnitRenewsSpentSession(t *testing.T) {
@@ -424,7 +1052,7 @@ func TestUnitRenewsSpentSession(t *testing.T) {
 	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token/refresh"), "the session is renewed once")
 	assert.Equal(t, 2, s.count("GET", "/api/v4/file"), "the call is repeated after renewing")
 	assert.Equal(t, "AT2", token(f, "access_token"), "the rotated pair is saved")
-	assert.Equal(t, "RT2", token(f, "refresh_token"), "a spent refresh_token is replaced")
+	assert.Equal(t, "RT2", token(f, "refresh_token"), "the renewed pair replaces what the config held")
 }
 
 // TestUnitCannotRenewWithoutCredential checks the message when a hand-set token
@@ -821,7 +1449,7 @@ func TestUnitUploadUsesPresignedParts(t *testing.T) {
 			partsMu.Unlock()
 			replyRaw(w, http.StatusOK, "<CompleteMultipartUploadOutput/>")
 		case rec.method == "GET" && rec.path == "/api/v4/callback/s3/S1/SEC":
-			assert.Equal(t, "Bearer SEED", rec.header.Get("Authorization"), "the callback is an API call")
+			assert.Equal(t, "Bearer "+s.token, rec.header.Get("Authorization"), "the callback is an API call")
 			reply(w, api.CodeSuccess, nil)
 		case rec.path == "/api/v4/file/info":
 			reply(w, api.CodeSuccess, api.File{
@@ -1003,7 +1631,7 @@ func TestUnitDeleteSoftDeleteFlag(t *testing.T) {
 			f, s := newSite(t, "", extra, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
 				require.Equal(t, "DELETE", rec.method)
 				require.Equal(t, "/api/v4/file", rec.path)
-				assert.Equal(t, "Bearer SEED", rec.header.Get("Authorization"), "delete is an API call")
+				assert.Equal(t, "Bearer "+s.token, rec.header.Get("Authorization"), "delete is an API call")
 				request := new(api.DeleteRequest)
 				require.NoError(t, json.Unmarshal([]byte(rec.body), request))
 				assert.Equal(t, []string{"cloudreve://my/dir/f%20x.txt"}, request.Uris)
@@ -1357,6 +1985,556 @@ func TestUnitFileAsRoot(t *testing.T) {
 	assert.Equal(t, "two.txt", entries[1].Remote())
 }
 
+// TestUnitRefusedRefreshDoesNotThrowAwayATokenThatStillWorks checks the pair
+// whose refresh token is dead but whose access token says nothing about itself.
+// Nothing has shown that token to be spent - a site accepts an access token until
+// its own deadline, even after the session behind it is revoked - so the run uses
+// it and lets the server be the judge, rather than the remote refusing to open. It
+// is asked about first, because a refused trade says nothing about whose token the
+// one in hand is.
+func TestUnitRefusedRefreshDoesNotThrowAwayATokenThatStillWorks(t *testing.T) {
+	t.Run("no password to sign in with", func(t *testing.T) {
+		f, s := newSite(t, "", configmap.Simple{
+			"email":         "me@example.com",
+			"password":      "",
+			"access_token":  "OPAQUE",
+			"refresh_token": "DEAD",
+		}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			switch {
+			case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+				reply(w, api.CodeNotFound, nil) // the lineage behind this one is gone
+			case rec.method == "GET" && rec.path == "/api/v4/user/me":
+				reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+			case rec.method == "GET" && rec.path == "/api/v4/file":
+				assert.Equal(t, "Bearer OPAQUE", rec.header.Get("Authorization"), "the token in hand is what goes out")
+				reply(w, api.CodeSuccess, api.ListResponse{})
+			default:
+				s.t.Fatalf("a refused renewal is not a reason to sign in or to stop: %s %s", rec.method, rec.path)
+			}
+		})
+
+		_, err := f.List(testCtx(), "")
+		require.NoError(t, err, "the remote opens on the token it still has")
+		assert.Equal(t, 1, s.count("POST", "/api/v4/session/token/refresh"), "one request to trade, then the fallback")
+		assert.Equal(t, 1, s.count("GET", "/api/v4/user/me"), "the token was asked about before being used")
+		assert.Equal(t, 0, s.count("POST", "/api/v4/session/token"), "no password to sign in with")
+	})
+
+	t.Run("another account's token", func(t *testing.T) {
+		_, m := siteAndConfig(t, configmap.Simple{
+			"email":         "me@example.com",
+			"password":      "",
+			"access_token":  "OPAQUE",
+			"refresh_token": "DEAD",
+		}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			switch {
+			case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+				reply(w, api.CodeNotFound, nil)
+			case rec.method == "GET" && rec.path == "/api/v4/user/me":
+				reply(w, api.CodeSuccess, api.CurrentUser{ID: "OTHER", Email: "someone.else@example.com"})
+			default:
+				s.t.Fatalf("the foreign token must not reach the work: %s %s", rec.method, rec.path)
+			}
+		})
+		_, err := NewFs(testCtx(), "cloudreve-test", "", m)
+		require.Error(t, err, "and a token found to be somebody else's is not used")
+		assert.Contains(t, err.Error(), "belongs to someone.else@example.com")
+	})
+
+	t.Run("a password can start over", func(t *testing.T) {
+		f, s := newSite(t, "", configmap.Simple{
+			"email":         "me@example.com",
+			"password":      obscure.MustObscure("hunter2"),
+			"access_token":  "OPAQUE",
+			"refresh_token": "DEAD",
+		}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			switch {
+			case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+				reply(w, api.CodeNotFound, nil)
+			case loginStep(w, rec, false, api.PrepareLogin{PasswordEnabled: true}):
+				return
+			case rec.method == "POST" && rec.path == "/api/v4/session/token":
+				reply(w, api.CodeSuccess, api.LoginData{Token: api.Token{
+					AccessToken: "AT9", RefreshToken: "RT9", AccessExpires: time.Now().Add(time.Hour)}})
+			case rec.method == "GET" && rec.path == "/api/v4/file":
+				assert.Equal(t, "Bearer AT9", rec.header.Get("Authorization"), "the account the remote names signs in")
+				reply(w, api.CodeSuccess, api.ListResponse{})
+			default:
+				s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+			}
+		})
+		_, err := f.List(testCtx(), "")
+		require.NoError(t, err)
+		assert.Equal(t, 1, s.count("POST", "/api/v4/session/token/refresh"), "the trade was tried first")
+		assert.Equal(t, 1, s.count("POST", "/api/v4/session/token"), "and the password is what carries the run")
+		assert.Equal(t, "AT9", token(f, "access_token"))
+	})
+}
+
+// TestUnitUndatedTokenIsAskedAboutWhenAnAccountIsNamed covers the pair that
+// cannot state its own life, with an account named but no password to start over
+// with. Nothing can be done about a token that turns out to be foreign, so finding
+// that out costs one request - and the alternative is working on somebody else's
+// drive and reporting nothing.
+func TestUnitUndatedTokenIsAskedAboutWhenAnAccountIsNamed(t *testing.T) {
+	t.Run("the account the remote names", func(t *testing.T) {
+		f, s := newSite(t, "", configmap.Simple{
+			"email":         "me@example.com",
+			"password":      "",
+			"access_token":  "OPAQUE",
+			"refresh_token": "",
+		}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			switch {
+			case rec.method == "GET" && rec.path == "/api/v4/user/me":
+				assert.Equal(t, "Bearer OPAQUE", rec.header.Get("Authorization"))
+				reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+			case rec.method == "GET" && rec.path == "/api/v4/file":
+				reply(w, api.CodeSuccess, api.ListResponse{})
+			default:
+				s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+			}
+		})
+		_, err := f.List(testCtx(), "")
+		require.NoError(t, err)
+		assert.Equal(t, 1, s.count("GET", "/api/v4/user/me"), "asked once, on the token that says nothing")
+		assert.Equal(t, 0, s.count("POST", "/api/v4/session/token/refresh"))
+	})
+
+	t.Run("another account", func(t *testing.T) {
+		_, m := siteAndConfig(t, configmap.Simple{
+			"email":         "me@example.com",
+			"password":      "",
+			"access_token":  "OPAQUE",
+			"refresh_token": "",
+		}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			switch {
+			case rec.method == "GET" && rec.path == "/api/v4/user/me":
+				reply(w, api.CodeSuccess, api.CurrentUser{ID: "OTHER", Email: "someone.else@example.com"})
+			default:
+				s.t.Fatalf("a foreign pair must not get as far as the work: %s %s", rec.method, rec.path)
+			}
+		})
+		_, err := NewFs(testCtx(), "cloudreve-test", "", m)
+		require.Error(t, err, "no password to sign in with, so the run stops")
+		assert.Contains(t, err.Error(), "belongs to someone.else@example.com, not me@example.com")
+		got, _ := m.Get("access_token")
+		assert.Equal(t, "OPAQUE", got, "the pair that was refused is not written over the config")
+	})
+}
+
+// TestUnitRenewalMidRunDoesNotKeepAForeignPair is the rule that guards the trade
+// at the start, applied where the token actually changes hands in the middle of a
+// run: an access token that was ours can sit in the config next to a refresh token
+// that was not, and the renewal then lands on the other account quietly, with its
+// pair saved into the config for every run after.
+func TestUnitRenewalMidRunDoesNotKeepAForeignPair(t *testing.T) {
+	mine := accessToken(time.Now().Add(20 * time.Minute))
+	traded := accessToken(time.Now().Add(time.Hour))
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      obscure.MustObscure("hunter2"),
+		"access_token":  mine,
+		"refresh_token": "SEEDR",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+			reply(w, api.CodeSuccess, api.Token{
+				AccessToken: traded, RefreshToken: "RT2", AccessExpires: time.Now().Add(time.Hour)})
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			if rec.header.Get("Authorization") == "Bearer "+traded {
+				reply(w, api.CodeSuccess, api.CurrentUser{ID: "OTHER", Email: "someone.else@example.com"})
+				return
+			}
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+		case loginStep(w, rec, false, api.PrepareLogin{PasswordEnabled: true}):
+			return
+		case rec.method == "POST" && rec.path == "/api/v4/session/token":
+			reply(w, api.CodeSuccess, api.LoginData{Token: api.Token{
+				AccessToken: "AT9", RefreshToken: "RT9", AccessExpires: time.Now().Add(time.Hour)}})
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			assert.Equal(t, "Bearer AT9", rec.header.Get("Authorization"),
+				"the work goes on as the account the remote names, not the one traded in")
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+
+	// Stand for a run that has aged into the renewal margin: the pair in hand is
+	// the one this remote was opened with, and the next request is what renews it.
+	f.tok.setExpiry(time.Now().Add(2 * time.Minute))
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token/refresh"), "the renewal ran")
+	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token"), "and what it traded for was signed over")
+	assert.Equal(t, "AT9", token(f, "access_token"), "the foreign pair is not what the config keeps")
+}
+
+// TestUnitForeignTradeIsNotWrittenToTheConfig checks the one path where a traded pair
+// is refused outright: an account is named, no password can replace the pair, and
+// the site says the pair is somebody else's. The failure has to leave the config
+// as it found it, because a working credential for another account sitting in the
+// file is the thing a later run can pick up by accident.
+func TestUnitForeignTradeIsNotWrittenToTheConfig(t *testing.T) {
+	spent := accessToken(time.Now().Add(-time.Hour))
+	traded := accessToken(time.Now().Add(time.Hour))
+	s, m := siteAndConfig(t, configmap.Simple{
+		"email":         "me@example.com",
+		"password":      "",
+		"access_token":  spent,
+		"refresh_token": "SEEDR",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+			reply(w, api.CodeSuccess, api.Token{
+				AccessToken: traded, RefreshToken: "RT2", AccessExpires: time.Now().Add(time.Hour)})
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "OTHER", Email: "someone.else@example.com"})
+		default:
+			s.t.Fatalf("a pair found to be foreign stops the run: %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := NewFs(testCtx(), "cloudreve-test", "", m)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "belongs to someone.else@example.com")
+	assert.NotContains(t, err.Error(), traded, "and the error does not hand the foreign token back")
+	got, _ := m.Get("access_token")
+	assert.Equal(t, spent, got, "the traded pair is not saved")
+	kept, _ := m.Get("refresh_token")
+	assert.Equal(t, "SEEDR", kept, "nor is its refresh token")
+	assert.Equal(t, 0, s.count("GET", "/api/v4/file"), "and nothing was asked of that account's drive")
+}
+
+// TestUnitPasskeyAccountWithAPasswordIsStillSignedIn checks the two answers the
+// site gives are read as the site means them: a passkey on the account says how it
+// can also prove itself, not that the password is gone. Login is refused for a
+// passkey account only when it has no password to check.
+func TestUnitPasskeyAccountWithAPasswordIsStillSignedIn(t *testing.T) {
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      obscure.MustObscure("hunter2"),
+		"access_token":  "",
+		"refresh_token": "",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case loginStep(w, rec, false, api.PrepareLogin{PasswordEnabled: true, WebauthnEnabled: true}):
+			return
+		case rec.method == "POST" && rec.path == "/api/v4/session/token":
+			reply(w, api.CodeSuccess, api.LoginData{Token: api.Token{
+				AccessToken: "AT9", RefreshToken: "RT9", AccessExpires: time.Now().Add(time.Hour)}})
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err, "a passkey alongside a password does not block signing in")
+	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token"))
+}
+
+// TestUnitAliveTokenOfAnotherAccountIsRefusedEvenWithoutAPassword is the gate
+// that has no workaround: the site says this pair belongs to somebody else, and
+// there is no password to sign in with. Every other answer the check can give is
+// a reason to carry on; this one is a reason to stop, because the alternative is
+// reading and writing that account's drive.
+func TestUnitAliveTokenOfAnotherAccountIsRefusedEvenWithoutAPassword(t *testing.T) {
+	fresh := accessToken(time.Now().Add(time.Hour))
+	_, m := siteAndConfig(t, configmap.Simple{
+		"email":         "me@example.com",
+		"password":      "",
+		"access_token":  fresh,
+		"refresh_token": "",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "OTHER", Email: "someone.else@example.com"})
+		default:
+			s.t.Fatalf("a foreign pair must not get as far as the work: %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := NewFs(testCtx(), "cloudreve-test", "", m)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "the stored token belongs to someone.else@example.com, not me@example.com")
+	got, _ := m.Get("access_token")
+	assert.Equal(t, fresh, got, "the config is left holding what it was given")
+}
+
+// TestUnitUnanswerableAfterATradeWithAPasswordSignsIn covers the arm where the
+// site will not say whose the traded pair is while there is a password to start
+// over with: signing in costs more but buys a pair known to be ours, which a pair
+// of unknown ownership does not.
+func TestUnitUnanswerableAfterATradeWithAPasswordSignsIn(t *testing.T) {
+	traded := accessToken(time.Now().Add(time.Hour))
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      obscure.MustObscure("hunter2"),
+		"access_token":  accessToken(time.Now().Add(-time.Minute)),
+		"refresh_token": "SEEDR",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+			reply(w, api.CodeSuccess, api.Token{AccessToken: traded, RefreshToken: "RT2"})
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME"}) // the site names no email
+		case loginStep(w, rec, false, api.PrepareLogin{PasswordEnabled: true}):
+			return
+		case rec.method == "POST" && rec.path == "/api/v4/session/token":
+			reply(w, api.CodeSuccess, api.LoginData{Token: api.Token{
+				AccessToken: "AT9", RefreshToken: "RT9", AccessExpires: time.Now().Add(time.Hour)}})
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			assert.Equal(t, "Bearer AT9", rec.header.Get("Authorization"))
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token/refresh"), "the trade ran")
+	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token"), "and an unprovable pair was signed over")
+	assert.Equal(t, "AT9", token(f, "access_token"))
+}
+
+// TestUnitRenewalWithoutARefreshTokenSignsIn checks the renewal that finds nothing
+// to trade with: the password is what carries the run.
+func TestUnitRenewalWithoutARefreshTokenSignsIn(t *testing.T) {
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      obscure.MustObscure("hunter2"),
+		"refresh_token": "",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+		case loginStep(w, rec, false, api.PrepareLogin{PasswordEnabled: true}):
+			return
+		case rec.method == "POST" && rec.path == "/api/v4/session/token":
+			reply(w, api.CodeSuccess, api.LoginData{Token: api.Token{
+				AccessToken: "AT9", RefreshToken: "RT9", AccessExpires: time.Now().Add(time.Hour)}})
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+
+	require.NoError(t, f.renewToken(testCtx(), f.tok.currentGeneration()))
+	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token"), "signed in instead")
+	assert.Equal(t, "AT9", f.tok.accessToken())
+	assert.Equal(t, "AT9", token(f, "access_token"), "and the signed-in pair is what the config keeps")
+}
+
+// TestUnitRenewalRefusedWithoutAPasswordSaysWhatFailed checks the error a run
+// gives when the refresh is refused and there is no password: it names the renewal
+// rather than a sign-in it never attempted.
+func TestUnitRenewalRefusedWithoutAPasswordSaysWhatFailed(t *testing.T) {
+	f, _ := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      "",
+		"refresh_token": "DEAD",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+		case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+			reply(w, api.CodeNotFound, nil)
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+
+	err := f.renewToken(testCtx(), f.tok.currentGeneration())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "can't renew the session")
+	assert.NotContains(t, err.Error(), "password")
+}
+
+// TestUnitRenewalKeepsTheRefreshTokenItWasGiven checks a site that hands back a
+// new access token and nothing else: the refresh token in hand still works, so
+// blanking it would cost the next run a sign-in.
+func TestUnitRenewalKeepsTheRefreshTokenItWasGiven(t *testing.T) {
+	f, _ := newSite(t, "", configmap.Simple{
+		"email":         "",
+		"password":      "",
+		"refresh_token": "SEEDR",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+			reply(w, api.CodeSuccess, api.Token{AccessToken: "AT2"}) // no refresh_token this time
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+
+	require.NoError(t, f.renewToken(testCtx(), f.tok.currentGeneration()))
+	assert.Equal(t, "AT2", f.tok.accessToken())
+	f.tok.mu.Lock()
+	held := f.tok.refresh
+	f.tok.mu.Unlock()
+	assert.Equal(t, "SEEDR", held, "the old refresh token is kept")
+	assert.Equal(t, "SEEDR", token(f, "refresh_token"), "and so in the config")
+}
+
+// TestUnitRenewalAfterARefusalIsCheckedToo covers the other place a pair changes
+// hands: the server refused what looked good, rclone traded for a new one, and
+// that new one comes from the same refresh token the trade at the start would
+// have come from. The rule cannot depend on which of the two ran.
+func TestUnitRenewalAfterARefusalIsCheckedToo(t *testing.T) {
+	mine := accessToken(time.Now().Add(time.Hour))
+	traded := accessToken(time.Now().Add(2 * time.Hour))
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      obscure.MustObscure("hunter2"),
+		"access_token":  mine,
+		"refresh_token": "SEEDR",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			if rec.header.Get("Authorization") == "Bearer "+traded {
+				reply(w, api.CodeSuccess, api.CurrentUser{ID: "OTHER", Email: "someone.else@example.com"})
+				return
+			}
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+		case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+			reply(w, api.CodeSuccess, api.Token{
+				AccessToken: traded, RefreshToken: "RT2", AccessExpires: time.Now().Add(2 * time.Hour)})
+		case loginStep(w, rec, false, api.PrepareLogin{PasswordEnabled: true}):
+			return
+		case rec.method == "POST" && rec.path == "/api/v4/session/token":
+			reply(w, api.CodeSuccess, api.LoginData{Token: api.Token{
+				AccessToken: "AT9", RefreshToken: "RT9", AccessExpires: time.Now().Add(time.Hour)}})
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			if rec.header.Get("Authorization") == "Bearer "+mine {
+				// The token says it has an hour left, and the site says otherwise:
+				// the session behind it was closed early, which is what the refusal
+				// is for finding out.
+				reply(w, api.CodeCheckLogin, nil)
+				return
+			}
+			assert.Equal(t, "Bearer AT9", rec.header.Get("Authorization"),
+				"the run goes on as the account the remote names")
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token/refresh"), "the refusal traded a pair")
+	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token"), "and that pair was found to be another account's")
+	assert.Equal(t, "AT9", token(f, "access_token"), "what the config keeps is the signed-in pair")
+}
+
+// countingWrites is a config map that keeps count of what was written to it, for
+// the case where the thing being tested is that nothing was written: saving a whole
+// config file is how rclone persists one key, so a run that changed no credential
+// should not rewrite the file at all.
+type countingWrites struct {
+	configmap.Simple
+	writes atomic.Int32
+}
+
+func (c *countingWrites) Set(key, value string) {
+	c.writes.Add(1)
+	c.Simple.Set(key, value)
+}
+
+// TestUnitAChangelessRunRewritesNothing checks the config write only happens when
+// the pair actually moved. Both arms of "keep what was given" - a stored token
+// taken as it stands, and a trade refused while the token in hand still works -
+// hold the same pair the file already has, and a run that renewed nothing must not
+// rewrite the file under another process's feet.
+func TestUnitAChangelessRunRewritesNothing(t *testing.T) {
+	kept := func(t *testing.T, extra configmap.Simple, handle siteHandler) *countingWrites {
+		t.Helper()
+		s := newSiteServer(t, handle)
+		s.token = accessToken(time.Now().Add(time.Hour))
+		m := countingWrites{Simple: configmap.Simple{
+			"url":                s.srv.URL,
+			"upload_concurrency": "2",
+		}}
+		for key, value := range extra {
+			if value == "" {
+				delete(m.Simple, key)
+				continue
+			}
+			m.Simple[key] = value
+		}
+		_, err := NewFs(testCtx(), "cloudreve-test", "", &m)
+		require.True(t, err == nil || errors.Is(err, fs.ErrorIsFile), "making the remote: %v", err)
+		return &m
+	}
+
+	t.Run("a stored pair kept as it stands", func(t *testing.T) {
+		m := kept(t, configmap.Simple{
+			"email":         "me@example.com",
+			"password":      "",
+			"access_token":  accessToken(time.Now().Add(time.Hour)),
+			"refresh_token": "",
+		}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			switch {
+			case rec.method == "GET" && rec.path == "/api/v4/user/me":
+				reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+			default:
+				s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+			}
+		})
+		assert.Equal(t, int32(0), m.writes.Load(), "nothing moved, so nothing was written")
+	})
+
+	t.Run("a trade refused over a token that still works", func(t *testing.T) {
+		m := kept(t, configmap.Simple{
+			"email":         "me@example.com",
+			"password":      "",
+			"access_token":  "OPAQUE",
+			"refresh_token": "DEAD",
+		}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			switch {
+			case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+				reply(w, api.CodeNotFound, nil)
+			case rec.method == "GET" && rec.path == "/api/v4/user/me":
+				reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+			default:
+				s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+			}
+		})
+		assert.Equal(t, int32(0), m.writes.Load(), "the pair in hand is the pair the file holds")
+	})
+
+	// The counter has to be able to move, or the two arms above prove nothing.
+	t.Run("a traded pair is written", func(t *testing.T) {
+		fresh := accessToken(time.Now().Add(time.Hour))
+		s := newSiteServer(t, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			switch {
+			case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+				reply(w, api.CodeSuccess, api.Token{AccessToken: fresh, RefreshToken: "RT2"})
+			case rec.method == "GET" && rec.path == "/api/v4/user/me":
+				reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+			default:
+				s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+			}
+		})
+		m := countingWrites{Simple: configmap.Simple{
+			"url":                s.srv.URL,
+			"email":              "me@example.com",
+			"password":           "",
+			"access_token":       accessToken(time.Now().Add(-time.Minute)),
+			"refresh_token":      "SEEDR",
+			"upload_concurrency": "2",
+		}}
+		_, err := NewFs(testCtx(), "cloudreve-test", "", &m)
+		require.NoError(t, err)
+		assert.Equal(t, int32(2), m.writes.Load(), "both halves of the new pair reached the config")
+		assert.Equal(t, fresh, m.Simple["access_token"])
+		assert.Equal(t, "RT2", m.Simple["refresh_token"])
+	})
+}
+
 // TestUnitPublicLinkIsTheDownloadURL checks that a link is the URL reads use, is
 // asked for afresh every time, and is made absolute when the site answers with a
 // path on itself.
@@ -1425,12 +2603,13 @@ func TestUnitAbsoluteURLFollowsTheURLRules(t *testing.T) {
 	}
 }
 
-// TestUnitPublicLinkRefusesAFolderAndUnlinksStoredLinks checks the two shapes a
-// link request can take. A folder has no download URL, since the site only hands
-// out entity URLs for files. An unlink removes the stored direct links an earlier
-// version of this backend created, which the site keeps serving as permanent
-// public URLs.
-func TestUnitPublicLinkRefusesAFolderAndUnlinksStoredLinks(t *testing.T) {
+// TestUnitPublicLinkRefusesAFolderAndIgnoresUnlink checks the two shapes a link
+// request can take. A folder has no download URL, since the site only hands out
+// entity URLs for files. An unlink is ignored, which is what rclone documents for
+// a backend without unlink support: the stored direct links an earlier version of
+// this backend created are permanent public URLs on the site, and revoking every
+// one of them is not what a link request asks for.
+func TestUnitPublicLinkRefusesAFolderAndIgnoresUnlink(t *testing.T) {
 	t.Run("folder", func(t *testing.T) {
 		f, s := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
 			if rec.method == "GET" && rec.path == "/api/v4/file/info" {
@@ -1456,44 +2635,23 @@ func TestUnitPublicLinkRefusesAFolderAndUnlinksStoredLinks(t *testing.T) {
 		assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
 	})
 
-	t.Run("unlink", func(t *testing.T) {
-		// An earlier version of this backend created stored direct links, which
-		// the site keeps serving as permanent public URLs. unlink is the only
-		// way to take one back, so it removes them instead of doing nothing.
+	t.Run("unlink is ignored", func(t *testing.T) {
 		f, s := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
 			switch {
 			case rec.method == "GET" && rec.path == "/api/v4/file/info":
-				assert.Equal(t, "cloudreve://my/f.txt", rec.query.Get("uri"))
-				assert.Equal(t, "true", rec.query.Get("extended"),
-					"the stored links are only reported when asked for")
-				info := api.FileExtended{File: api.File{Type: api.FileTypeFile, ID: "F1", Size: 5}}
-				info.ExtendedInfo.DirectLinks = []api.DirectLink{{ID: "L1", URL: "https://site.example/s/L1"}}
-				reply(w, api.CodeSuccess, info)
-			case rec.method == "DELETE" && rec.path == "/api/v4/file/source/L1":
-				reply(w, api.CodeSuccess, nil)
-			default:
-				s.t.Fatalf("unlink removes the stored link and asks for nothing else: %s %s", rec.method, rec.path)
-			}
-		})
-		link, err := f.PublicLink(testCtx(), "f.txt", 0, true)
-		require.NoError(t, err)
-		assert.Empty(t, link, "an unlink hands back no link")
-		assert.Equal(t, 1, s.count("DELETE", "/api/v4/file/source/L1"), "the stored link is gone")
-		assert.Equal(t, 0, s.count("POST", "/api/v4/file/url"), "and no fresh one is minted")
-	})
-
-	t.Run("unlink with nothing stored", func(t *testing.T) {
-		f, s := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
-			if rec.method == "GET" && rec.path == "/api/v4/file/info" {
+				assert.NotEqual(t, "true", rec.query.Get("extended"),
+					"the stored links are not even asked about")
 				reply(w, api.CodeSuccess, api.File{Type: api.FileTypeFile, ID: "F1", Size: 5})
-				return
+			case rec.method == "POST" && rec.path == "/api/v4/file/url":
+				reply(w, api.CodeSuccess, api.FileURLData{URLs: []api.FileURL{{URL: "https://cdn.example/f.txt"}}})
+			default:
+				s.t.Fatalf("nothing stored is touched: %s %s", rec.method, rec.path)
 			}
-			s.t.Fatalf("there is nothing to remove, so nothing else may be touched: %s %s", rec.method, rec.path)
 		})
 		link, err := f.PublicLink(testCtx(), "f.txt", 0, true)
-		require.NoError(t, err, "a file with no stored links is already in the wanted state")
-		assert.Empty(t, link)
-		assert.Equal(t, 0, s.count("DELETE", "/api/v4/file/source"))
+		require.NoError(t, err, "a backend without unlink ignores the flag, as rclone documents")
+		assert.NotEmpty(t, link)
+		assert.Equal(t, 0, s.count("DELETE", "/api/v4/file/source"), "no stored link is removed")
 	})
 }
 
@@ -1922,8 +3080,10 @@ func TestUnitNonJSONReplyEventuallySaysWhatAnswered(t *testing.T) {
 }
 
 // TestUnitRetiredRefreshFallsBackToSigningIn checks the way out when a refresh
-// token no longer works: an account that can sign in gets a fresh pair rather
-// than a remote stuck on a credential the server has already retired.
+// token no longer renews: an account that can sign in gets a fresh pair rather
+// than a remote stuck on a credential the server will not trade. A refresh token
+// stops working when it expires, when the account's password changes, or when the
+// session it belongs to is signed out - none of those are fixed by asking again.
 func TestUnitRetiredRefreshFallsBackToSigningIn(t *testing.T) {
 	f, _ := newSite(t, "", configmap.Simple{
 		"email":         "me@example.com",
@@ -1935,7 +3095,7 @@ func TestUnitRetiredRefreshFallsBackToSigningIn(t *testing.T) {
 		case loginStep(w, rec, false, api.PrepareLogin{PasswordEnabled: true}):
 			return
 		case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
-			reply(w, api.CodeCredentialInvalid, nil) // this pair is retired
+			reply(w, api.CodeCredentialInvalid, nil) // this pair will not trade
 		case rec.method == "POST" && rec.path == "/api/v4/session/token":
 			reply(w, api.CodeSuccess, api.LoginData{Token: api.Token{
 				AccessToken: "AT4", RefreshToken: "RT4",
@@ -1950,10 +3110,12 @@ func TestUnitRetiredRefreshFallsBackToSigningIn(t *testing.T) {
 	assert.Equal(t, "RT4", token(f, "refresh_token"))
 }
 
-// TestUnitConcurrentRenewalsSpendOneRefresh checks that parallel transfers renew
-// the session once: a refresh token is retired by being used, so a second caller
-// that spent the same one would leave the remote holding a dead credential.
-func TestUnitConcurrentRenewalsSpendOneRefresh(t *testing.T) {
+// TestUnitConcurrentRenewalsRenewOnce checks that parallel transfers renew the
+// session once. A refused refresh token would still work - the site trades it
+// until it expires on its own - so this is not about losing a credential: it is
+// about not making four requests to install one pair, and not letting a caller
+// that queued behind another overwrite the pair that has already arrived.
+func TestUnitConcurrentRenewalsRenewOnce(t *testing.T) {
 	var refreshes atomic.Int32
 	f, _ := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
 		switch {
@@ -1981,8 +3143,8 @@ func TestUnitConcurrentRenewalsSpendOneRefresh(t *testing.T) {
 	for i, err := range errs {
 		assert.NoError(t, err, "renewal %d", i)
 	}
-	assert.Equal(t, int32(1), refreshes.Load(), "one refresh token is spent, the rest take its result")
-	assert.Equal(t, "AT2", token(f, "access_token"))
+	assert.Equal(t, int32(1), refreshes.Load(), "one renewal runs, the rest take its result")
+	assert.Equal(t, "AT2", f.tok.accessToken(), "the renewed pair is what the run goes on to use")
 }
 
 // TestUnitTopUploadProbesTheDriveItself checks that a name at the top of the
