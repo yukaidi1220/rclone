@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/rclone/rclone/fs"
 
@@ -200,4 +201,78 @@ func TestPartRefusalDoesNotQuoteTheSignature(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "refused by the storage layer")
 	require.NotContains(t, err.Error(), "PART-SIGNATURE-1", "the refusal echoed the presigned query into the message")
+}
+
+// TestPublicLinkMintsAFreshUnescapedLink is the contract `/operations/publiclink`
+// hands out: a URL that works for whoever receives it. Two things can quietly
+// break that. The link the API writes carries `&amp;` inside its own query, so
+// the string that has to be handed over is not the string that was sent. And a
+// link that was kept and handed out again is part way through a lifetime rclone
+// cannot shorten - rclone re-mints when its own read dies, the recipient has no
+// way to. The drive answers each request with a different link here, so the mint
+// number says which one came out of rclone's hand.
+func TestPublicLinkMintsAFreshUnescapedLink(t *testing.T) {
+	drive := &fakeDrive{t: t}
+	f := newFakeFs(t, drive)
+	drive.listingFn = func(*http.Request) string {
+		return listingJSON([]string{fileJSON("7000000000000000007", "clip.mp4", rootID)}, nil)
+	}
+
+	require.NotNil(t, f.Features().PublicLink, "without the feature the rc endpoint says the remote cannot do this")
+
+	link, err := f.PublicLink(context.Background(), "clip.mp4", fs.DurationOff, false)
+	require.NoError(t, err)
+	require.Contains(t, link, "sig=LIVE-SIGNATURE-VALUE", "the signature arrived intact")
+	require.NotContains(t, link, "amp", "the escaped ampersand was unescaped before the link went out")
+	require.Contains(t, link, "fileId=7000000000000000007", "and it is the id the drive holds, not the name")
+	require.Contains(t, link, "mint=1", "one link asked for, one link handed over")
+	require.Equal(t, 1, drive.downloadHits, "asking for one link did not cost two calls")
+
+	second, err := f.PublicLink(context.Background(), "clip.mp4", fs.DurationOff, false)
+	require.NoError(t, err)
+	require.Contains(t, second, "mint=2", "the second caller got the link the drive just signed, not the first one")
+	require.NotEqual(t, link, second)
+	require.Equal(t, 2, drive.downloadHits)
+}
+
+// TestPublicLinkIgnoresAnExpiryItCannotAskFor locks the shape of the answer for
+// --expiry. The endpoint has no expiry parameter, so the requested lifetime is
+// reported and the link still comes back; refusing outright would take away a
+// link the caller can use right now.
+func TestPublicLinkIgnoresAnExpiryItCannotAskFor(t *testing.T) {
+	drive := &fakeDrive{t: t}
+	f := newFakeFs(t, drive)
+	drive.listingFn = func(*http.Request) string {
+		return listingJSON([]string{fileJSON("7000000000000000007", "clip.mp4", rootID)}, nil)
+	}
+
+	link, err := f.PublicLink(context.Background(), "clip.mp4", fs.Duration(time.Hour), false)
+	require.NoError(t, err)
+	require.NotEmpty(t, link)
+
+	_, err = f.PublicLink(context.Background(), "clip.mp4", fs.DurationOff, true)
+	require.NoError(t, err, "there is no stored share to revoke, so unlink changes nothing")
+}
+
+// TestPublicLinkRefusesADirectory covers both ways a directory arrives: spelled
+// with the trailing slash and without it. Without the second half the caller
+// gets a bare "is a directory" from the rc endpoint instead of the reason rclone
+// gives everywhere else for this command.
+func TestPublicLinkRefusesADirectory(t *testing.T) {
+	drive := &fakeDrive{t: t}
+	f := newFakeFs(t, drive)
+	drive.listingFn = func(*http.Request) string {
+		return listingJSON(nil, []string{folderJSON("7000000000000000008", "albums", rootID)})
+	}
+
+	_, err := f.PublicLink(context.Background(), "albums/", fs.DurationOff, false)
+	require.ErrorIs(t, err, fs.ErrorCantShareDirectories)
+
+	_, err = f.PublicLink(context.Background(), "albums", fs.DurationOff, false)
+	require.ErrorIs(t, err, fs.ErrorCantShareDirectories)
+
+	_, err = f.PublicLink(context.Background(), "missing.mp4", fs.DurationOff, false)
+	require.ErrorIs(t, err, fs.ErrorObjectNotFound)
+
+	require.Zero(t, drive.downloadHits, "none of the three reached the link endpoint")
 }

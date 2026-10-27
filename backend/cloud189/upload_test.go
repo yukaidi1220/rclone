@@ -499,12 +499,15 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		d.mu.Lock()
 		d.downloadHits++
+		mint := d.downloadHits
 		d.mu.Unlock()
 		link := d.downloadLink
 		if link == "" {
 			// Escaped exactly as the family endpoint writes it (captured
 			// 2026-10-22): the ampersands inside the query arrive as &amp;.
-			link = "http://" + r.Host + "/store/file?fileId=" + fileID + "&a=1&amp;sig=LIVE-SIGNATURE-VALUE"
+			// The mint number makes each answer a different string, so a test
+			// can tell a freshly asked-for link from one that was kept.
+			link = "http://" + r.Host + "/store/file?fileId=" + fileID + "&a=1&amp;sig=LIVE-SIGNATURE-VALUE&amp;mint=" + strconv.Itoa(mint)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"fileDownloadUrl": link})
 
