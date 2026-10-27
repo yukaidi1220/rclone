@@ -343,12 +343,22 @@ already sent.
 `createBatchTask.action` followed by `checkBatchTask.action` until the task
 reaches state 4. Nothing crosses the wire except ids.
 
-A finished task is judged **only** by its counters. `res_code` stays `0` and HTTP
-stays `200` even when the server did nothing at all: measured 2026-10-22, a family
-delete came back with `failedCount: 1`, no `errorCode` and no message of any kind,
-and the objects were still on the drive. So `failedCount`, `skipCount` and
-`successedCount` decide, and a task that reports fewer successes than objects were
-sent is an error, as is one that skipped anything.
+A finished task's counters are the trigger, not the verdict. `res_code` stays `0`
+and HTTP stays `200` even when the server did nothing at all: measured 2026-10-22, a
+family delete came back with `failedCount: 1`, no `errorCode` and no message of any
+kind, and the objects were still on the drive. So `failedCount`, `skipCount` and
+`successedCount` decide whether a task is *suspect*, and a task that reports fewer
+successes than objects were sent, or skipped anything, is not accepted at its word.
+What settles a suspect **delete** is the drive's own evidence, in this order:
+`successedFileIdList`, which names the objects the task handled (captured 2026-10-22
+for MOVE, DELETE and CLEAR_RECYCLE; a successful COPY does not answer it), and then a
+listing of each parent directory, read to its end - the drive's own `count`, which
+measured 2026-10-28 is the number of rows in the directory rather than on the page,
+has to agree with the rows actually seen before an absence may be read as a deletion.
+`skipCount` is the one counter whose meaning has not been measured: a name conflict
+does not use it (captured: `failedCount 1, skipCount 0, errorCode FileAlreadyExists`),
+so a skip is reported as "the drive declined these and did not say what became of
+them" rather than being explained.
 
 The `fileName` a `COPY` or `MOVE` entry carries is **ignored**: the object lands in
 the target folder under its **source's** name (measured live 2026-10-24, with the
