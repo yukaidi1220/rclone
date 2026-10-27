@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -510,7 +511,7 @@ func refuse(status int, body []byte) error {
 		Msg       string          `json:"msg"`
 		Success   *bool           `json:"success"`
 	}
-	ae := &apiError{Status: status, Body: truncate(string(body), 500)}
+	ae := &apiError{Status: status, Body: describeBody(body, 500)}
 	if err := json.Unmarshal(body, &probe); err == nil {
 		switch {
 		case probe.ErrorCode != "":
@@ -549,7 +550,7 @@ func classify(status int, body []byte) ([]byte, error) {
 		return body, nil
 	}
 	if status >= http.StatusInternalServerError || status == http.StatusTooManyRequests {
-		return body, fmt.Errorf("cloud189: server answered HTTP %d: %s", status, truncate(string(body), 200))
+		return body, fmt.Errorf("cloud189: server answered HTTP %d: %s", status, describeBody(body, 200))
 	}
 	return body, noSpaceError(refuse(status, body))
 }
@@ -559,6 +560,38 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// secretInBody matches a credential-shaped value in whatever the drive answered:
+// the key name and its separator, then the value itself.
+//
+// The key list is what the captures show this drive sending around - sessionKey
+// (which it has echoed back inside an error body, measured 2026-10-26), the
+// access token, and the signature parameters of the download and upload URLs.
+var secretInBody = regexp.MustCompile(`(?i)(session[_-]?key|access[_-]?token|refresh[_-]?token|["a-z_]*token|sk|sign(?:ature)?|cookie)(["']?\s*[:=]\s*["']?)([^"'&,\s}\\]{6,})`)
+
+// describeBody is what an error may quote from a response body.
+//
+// The body is worth quoting - a Tomcat page or an unexpected shape is otherwise
+// undebuggable - but not verbatim: this drive has been measured putting its own
+// sessionKey into an error body, and an error string goes to the log. So each
+// credential-shaped value is replaced by its length, the key name stays, and the
+// fragment is capped. Nothing that can be used to call the drive survives this.
+func describeBody(body []byte, n int) string {
+	s := truncate(string(body), n)
+	var out strings.Builder
+	for {
+		m := secretInBody.FindStringSubmatchIndex(s)
+		if m == nil {
+			out.WriteString(s)
+			return out.String()
+		}
+		// groups: 1 the key name, 2 its separator, 3 the value itself
+		valueStart, valueEnd := m[6], m[7]
+		out.WriteString(s[:valueStart])
+		fmt.Fprintf(&out, "<masked len=%d>", valueEnd-valueStart)
+		s = s[valueEnd:]
+	}
 }
 
 // newRequestID returns a random UUID v4 for the x-request-id header, which the
