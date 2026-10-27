@@ -110,8 +110,8 @@ type fakeDrive struct {
 	taskSubs        int                          // object count of the task the next task poll answers
 
 	// The download link and the storage layer on the way down.
-	downloadLink string            // what getFileDownloadUrl answers; empty means the escaped link below
-	downloadHits int               // how many times a link was minted
+	downloadLink string // what getFileDownloadUrl answers; empty means the escaped link below
+	downloadHits int    // how many times a link was minted
 	// linkRedirect is the path (with query) that the link's own address 302s to.
 	// Set, it makes the storage host answer elsewhere, the way download.cloud.189.cn
 	// redirects to a presigned OBS URL (measured 2026-10-27).
