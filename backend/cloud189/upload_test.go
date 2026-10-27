@@ -115,9 +115,17 @@ type fakeDrive struct {
 	// deleteTaskSkips is the same queue for skipCount, which is what a task
 	// answers when the objects are already gone.
 	deleteTaskSkips []int64
-	taskSeq         int
-	taskFail        map[string]int64
-	taskSkip        map[string]int64
+	// deleteTaskCodes is the same queue for errorCode, which is what a refusal
+	// looks like when the drive does give a reason - a full drive, a spent day.
+	deleteTaskCodes []string
+	// listFailTimes makes the next that many listings fail outright, so a test can
+	// ask what the check does when the drive will not answer at all.
+	listFailTimes int
+	taskSeq       int
+	taskFail      map[string]int64
+	taskSkip      map[string]int64
+	taskCode      map[string]string
+	listFolders   []string // the folderId each listing was actually addressed at
 
 	// The download link and the storage layer on the way down.
 	downloadLink string // what getFileDownloadUrl answers; empty means the escaped link below
@@ -371,6 +379,20 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case "/listFiles.action", "/family/file/listFiles.action":
+		d.mu.Lock()
+		d.listFolders = append(d.listFolders, r.URL.Query().Get("folderId"))
+		refuse := d.listFailTimes > 0
+		if refuse {
+			d.listFailTimes--
+		}
+		d.mu.Unlock()
+		if refuse {
+			// Not JSON, so the listing is undecidable rather than empty: an empty
+			// page is exactly what a truncated walk looks like to a caller.
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "refused")
+			return
+		}
 		if d.listingFn != nil {
 			if raw := d.listingFn(r); raw != "" {
 				w.Header().Set("content-type", "application/json")
@@ -427,6 +449,13 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				d.taskSkip[taskID] = d.deleteTaskSkips[0]
 				d.deleteTaskSkips = d.deleteTaskSkips[1:]
 			}
+			if len(d.deleteTaskCodes) > 0 {
+				if d.taskCode == nil {
+					d.taskCode = map[string]string{}
+				}
+				d.taskCode[taskID] = d.deleteTaskCodes[0]
+				d.deleteTaskCodes = d.deleteTaskCodes[1:]
+			}
 		}
 		d.mu.Unlock()
 		if len(q.Get("taskInfos")) == 0 {
@@ -472,10 +501,14 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		subs := d.taskSubs
 		failed := d.taskFail[q.Get("taskId")]
 		skipped := d.taskSkip[q.Get("taskId")]
+		code := d.taskCode[q.Get("taskId")]
 		d.mu.Unlock()
 		st := map[string]any{
 			"res_code": 0, "res_message": "成功", "taskStatus": state,
 			"failedCount": failed, "skipCount": skipped, "subTaskCount": subs,
+		}
+		if code != "" {
+			st["errorCode"] = code
 		}
 		if state == taskStateDone {
 			st["successedCount"] = int64(subs) - failed - skipped
@@ -951,6 +984,11 @@ func newFakeFs(t *testing.T, drive *fakeDrive) *Fs {
 	}
 	f.opt.AccessToken = "fixture-token-" + t.Name()
 	f.opt.Space = spacePersonal
+	// The delete check's waits are production timing; a test asserts what the
+	// looks say, not how long they take. They are vars so they can be zeroed here
+	// rather than being read as a constant the tests cannot touch.
+	deleteVerifyWait = 0
+	t.Cleanup(func() { deleteVerifyWait = 2 * time.Second })
 	f.opt.ChunkSize = fs.SizeSuffix(fakePartBase)
 	f.opt.UploadConcurrency = 2
 	f.opt.Enc = cloud189DefaultEncoding
