@@ -1357,44 +1357,119 @@ func TestUnitFileAsRoot(t *testing.T) {
 	assert.Equal(t, "two.txt", entries[1].Remote())
 }
 
-// TestUnitPublicLinkIsMadeAbsolute checks the direct link answer, since the
-// server reports it as a path on itself.
-func TestUnitPublicLinkIsMadeAbsolute(t *testing.T) {
-	f, s := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
-		require.Equal(t, "PUT", rec.method)
-		require.Equal(t, "/api/v4/file/source", rec.path)
-		request := new(api.DirectLinkRequest)
-		require.NoError(t, json.Unmarshal([]byte(rec.body), request))
-		assert.Equal(t, []string{"cloudreve://my/f.txt"}, request.Uris)
-		reply(w, api.CodeSuccess, []api.DirectLinkResponse{{ID: "L1", Link: "/f/AbCdEf/f.txt"}})
-	})
-	link, err := f.PublicLink(testCtx(), "f.txt", fs.Duration(time.Hour), false)
-	require.NoError(t, err)
-	assert.Equal(t, s.srv.URL+"/f/AbCdEf/f.txt", link)
-	assert.Equal(t, 1, s.count("PUT", "/api/v4/file/source"))
+// TestUnitPublicLinkIsTheDownloadURL checks that a link is the URL reads use, is
+// asked for afresh every time, and is made absolute when the site answers with a
+// path on itself.
+func TestUnitPublicLinkIsTheDownloadURL(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		answer string
+		want   string
+	}{
+		{"absolute", "https://cdn.example/f.txt?sign=1", "https://cdn.example/f.txt?sign=1"},
+		{"relative", "/f/AbCdEf/f.txt", "SRV/f/AbCdEf/f.txt"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f, s := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+				switch {
+				case rec.method == "GET" && rec.path == "/api/v4/file/info":
+					assert.Equal(t, "cloudreve://my/f.txt", rec.query.Get("uri"),
+						"the file asked about is the one named")
+					reply(w, api.CodeSuccess, api.File{Type: api.FileTypeFile, ID: "F1", Size: 5})
+				case rec.method == "POST" && rec.path == "/api/v4/file/url":
+					request := new(api.FileURLRequest)
+					require.NoError(t, json.Unmarshal([]byte(rec.body), request))
+					assert.Equal(t, []string{"cloudreve://my/f.txt"}, request.Uris)
+					reply(w, api.CodeSuccess, api.FileURLData{URLs: []api.FileURL{{URL: test.answer}}})
+				default:
+					s.t.Fatalf("a download link is not a stored record, so nothing else may be asked: %s %s", rec.method, rec.path)
+				}
+			})
+			link, err := f.PublicLink(testCtx(), "f.txt", fs.Duration(time.Hour), false)
+			require.NoError(t, err)
+			assert.Equal(t, strings.ReplaceAll(test.want, "SRV", s.srv.URL), link)
+			assert.Equal(t, 1, s.count("POST", "/api/v4/file/url"))
+
+			// Ask a second time: a link handed on must not be one the read cache
+			// kept from before, so the site is asked again.
+			_, err = f.PublicLink(testCtx(), "f.txt", fs.Duration(time.Hour), false)
+			require.NoError(t, err)
+			assert.Equal(t, 2, s.count("POST", "/api/v4/file/url"), "a link for passing on is minted again")
+			assert.Equal(t, 0, s.count("PUT", "/api/v4/file/source"), "no stored direct link is made")
+		})
+	}
 }
 
-// TestUnitUnlinkRemovesStoredLinks checks rclone link --unlink.
-func TestUnitUnlinkRemovesStoredLinks(t *testing.T) {
-	var deleted []string
-	f, _ := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
-		switch {
-		case rec.method == "GET" && rec.path == "/api/v4/file/info":
-			assert.Equal(t, "true", rec.query.Get("extended"))
-			info := api.FileExtended{}
-			info.ID = "F1"
-			info.ExtendedInfo.DirectLinks = []api.DirectLink{{ID: "L1"}, {ID: "L2"}}
-			reply(w, api.CodeSuccess, info)
-		case rec.method == "DELETE" && strings.HasPrefix(rec.path, "/api/v4/file/source/"):
-			deleted = append(deleted, strings.TrimPrefix(rec.path, "/api/v4/file/source/"))
-			reply(w, api.CodeSuccess, nil)
-		default:
-			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
-		}
+// TestUnitAbsoluteURLFollowsTheURLRules checks what a relative answer is joined
+// to. The site normally returns a complete URL, but a policy that answers with a
+// path on itself has to land on the right one.
+func TestUnitAbsoluteURLFollowsTheURLRules(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		base string
+		raw  string
+		want string
+	}{
+		{"already absolute", "https://site.example", "https://cdn.example/f?x=1", "https://cdn.example/f?x=1"},
+		{"path from the host root", "https://site.example", "/f/x", "https://site.example/f/x"},
+		{"path under a sub-path site", "https://site.example/cloudreve/", "/cloudreve/f/x", "https://site.example/cloudreve/f/x"},
+		{"bare relative path", "https://site.example/cloudreve/", "f/x", "https://site.example/cloudreve/f/x"},
+		{"network-path reference", "https://site.example", "//cdn.example/f", "https://cdn.example/f"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := &Fs{opt: Options{URL: test.base}}
+			assert.Equal(t, test.want, f.absoluteURL(test.raw))
+		})
+	}
+}
+
+// TestUnitPublicLinkRefusesAFolderAndIgnoresUnlink checks the two shapes a link
+// request can take. A folder has no download URL, since the site only hands out
+// entity URLs for files. An unlink has nothing to act on: the link is stored
+// nowhere, and rclone's contract for a backend without unlink is to ignore it.
+func TestUnitPublicLinkRefusesAFolderAndIgnoresUnlink(t *testing.T) {
+	t.Run("folder", func(t *testing.T) {
+		f, s := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			if rec.method == "GET" && rec.path == "/api/v4/file/info" {
+				reply(w, api.CodeSuccess, api.File{Type: api.FileTypeFolder})
+				return
+			}
+			s.t.Fatalf("a folder must be refused before asking for a URL: %s %s", rec.method, rec.path)
+		})
+		_, err := f.PublicLink(testCtx(), "dir", 0, false)
+		assert.ErrorIs(t, err, fs.ErrorCantShareDirectories)
+		assert.Equal(t, 0, s.count("POST", "/api/v4/file/url"))
 	})
-	_, err := f.PublicLink(testCtx(), "f.txt", 0, true)
-	require.NoError(t, err)
-	assert.Equal(t, []string{"L1", "L2"}, deleted)
+
+	t.Run("missing file", func(t *testing.T) {
+		f, _ := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			if rec.method == "GET" && rec.path == "/api/v4/file/info" {
+				reply(w, api.CodeParentNotExist, nil)
+				return
+			}
+			s.t.Fatalf("a name that is not there must stop here: %s %s", rec.method, rec.path)
+		})
+		_, err := f.PublicLink(testCtx(), "gone.txt", 0, false)
+		assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
+	})
+
+	t.Run("unlink", func(t *testing.T) {
+		f, s := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			switch {
+			case rec.method == "GET" && rec.path == "/api/v4/file/info":
+				reply(w, api.CodeSuccess, api.File{Type: api.FileTypeFile, ID: "F1", Size: 5})
+			case rec.method == "POST" && rec.path == "/api/v4/file/url":
+				reply(w, api.CodeSuccess, api.FileURLData{URLs: []api.FileURL{{URL: "https://cdn.example/f.txt"}}})
+			default:
+				s.t.Fatalf("nothing is stored, so nothing may be touched: %s %s", rec.method, rec.path)
+			}
+		})
+		link, err := f.PublicLink(testCtx(), "f.txt", 0, true)
+		require.NoError(t, err, "a backend without unlink ignores the flag, as rclone documents")
+		assert.NotEmpty(t, link)
+		assert.Equal(t, 0, s.count("PUT", "/api/v4/file/source"), "no stored link is touched")
+		assert.Equal(t, 0, s.count("DELETE", "/api/v4/file/source"))
+	})
 }
 
 // TestUnitPurgeDeletesTheFolderItself checks that purge relies on the server

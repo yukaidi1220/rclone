@@ -223,10 +223,14 @@ does set the time. The measured difference on a live site:
 That last row is why the folder move stays server-side: nothing inside it loses its
 time, and rclone does not compare directory times when deciding what to transfer.
 
-`rclone link` asks for a **direct link** (`/f/<id>/<name>`) for a file or a folder,
-including the folder the remote starts in. It is a stored record that works until
-it is deleted - `--expire` therefore has no effect, and `rclone link --unlink`
-removes the entry's stored links.
+`rclone link` returns the **normal download URL** of a file, the same one reads go
+through (`POST /file/url`, with the site's `download_host` rewrite applied), minted
+for that call rather than reused from the read cache. No share and no stored direct
+link is created: it is a signed URL, so anyone holding it can download until the
+site's own expiry passes, and it cannot be revoked early. `--expire` has no effect
+for the same reason, and `--unlink` is ignored, as rclone asks for a backend that
+has no stored link to remove. A folder has no such URL - the site only hands out
+entity URLs for files - so asking for one is reported as unsupported.
 
 ### Interrupted uploads
 

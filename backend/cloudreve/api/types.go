@@ -164,23 +164,9 @@ type FileURLRequest struct {
 	NoCache   bool     `json:"no_cache,omitempty"`
 }
 
-// DirectLinkRequest is the body of PUT /file/source.
-type DirectLinkRequest struct {
-	Uris []string `json:"uris"`
-}
-
-// DirectLinkResponse is one entry of the PUT /file/source reply.
-//
-// Link is the address that opens the file from the drive and FileURL the
-// content address behind it.
-type DirectLinkResponse struct {
-	ID      string `json:"id,omitempty"`
-	Name    string `json:"name,omitempty"`
-	Link    string `json:"link"`
-	FileURL string `json:"file_url"`
-}
-
-// DirectLink is a stored direct link of a file.
+// DirectLink is a stored direct link of a file, as the extended file info
+// reports them. The backend no longer creates any: a download link is minted per
+// request and stored nowhere.
 type DirectLink struct {
 	ID         string `json:"id"`
 	URL        string `json:"url"`
