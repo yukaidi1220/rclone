@@ -4351,10 +4351,11 @@ func (o *Object) invalidateURL() {
 // finish inside a window the drive chose. unlink is ignored too: nothing was ever
 // stored on the drive, so there is no share to revoke.
 //
-// On the family space the storage grant is much shorter than the redirecting form
-// (measured X-Amz-Expires=300, so five minutes against eight hours), and the
-// redirecting form renews the grant every time it is hit. So a link passed on
-// from here lives minutes where the one before it would have lived hours. The
+// Those are the lifetimes of the redirecting form. The storage grant behind it is
+// shorter on both spaces and dramatically so on the family one (measured
+// X-Amz-Expires=300, i.e. five minutes against the eight hours above), while the
+// redirecting form renews that grant every time it is hit. So a link passed on
+// from here lives minutes where the one it replaces would have lived hours. The
 // resolved address is still what goes out - a direct-link rule keys on the host,
 // which is the whole reason this backend follows the redirect - but the shorter
 // lifetime is reported rather than left for the recipient to discover.
