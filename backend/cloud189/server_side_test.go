@@ -1825,14 +1825,51 @@ func TestADeleteStillRefusedAfterTheFirstResendIsSentAgainAndClears(t *testing.T
 // TestADeleteThatIsAlreadyGoneIsNotSentAgain is the point of asking the drive
 // before sending anything again: the task said it failed, the listing says the
 // object is not there, so it is done - and no second task is spent on it.
+//
+// The directory has to be shown holding something else. A page that claims nothing
+// at all is not evidence of absence, because it is also exactly what an address the
+// listing endpoint does not know answers with - see
+// TestADeleteWithRootFolderIDNamingTheSpaceRootStillSeesTheObject.
 func TestADeleteThatIsAlreadyGoneIsNotSentAgain(t *testing.T) {
 	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}}
 	f := newFakeFs(t, drive)
-	drive.listingFn = func(*http.Request) string { return emptyListing() }
+	drive.listingFn = func(*http.Request) string {
+		return listingJSON([]string{fileJSON("6000000000000000007", "other.mp4", rootID)}, nil)
+	}
 
 	require.NoError(t, srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background()))
 
 	require.Len(t, drive.tasks, 1, "the listing already said it is gone")
+}
+
+// TestADeleteOneLookIsNotEnoughToCallItGone pins the agreement rule itself. The
+// first look says the object is not on the drive; the second says it is. A single
+// "gone" must not finalise a delete, because a walk that came back without the row
+// is also what a listing window that moved under it looks like - and a delete
+// reported done while the object is there cannot be taken back.
+func TestADeleteOneLookIsNotEnoughToCallItGone(t *testing.T) {
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}}
+	f := newFakeFs(t, drive)
+	walks := 0
+	drive.listingFn = func(r *http.Request) string {
+		if r.URL.Query().Get("pageNum") != "1" {
+			// the page that ends a walk: nothing new on it
+			return ""
+		}
+		walks++
+		if walks == 1 {
+			return listingJSON([]string{fileJSON("6000000000000000007", "other.mp4", rootID)}, nil)
+		}
+		return listingJSON([]string{
+			fileJSON("6000000000000000006", "clip-01.mp4", rootID),
+			fileJSON("6000000000000000007", "other.mp4", rootID),
+		}, nil)
+	}
+
+	err := srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background())
+	require.Error(t, err, "the second look found it, so the first look's 'gone' decided nothing")
+	require.GreaterOrEqual(t, walks, 2, "both looks were spent")
+	require.Len(t, drivesTasks(drive), 3, "the resend was owed, and the resend of that")
 }
 
 // TestADeleteThatSkippedIsSettledByTheListing: a skip is another answer that says
@@ -1852,7 +1889,9 @@ func TestADeleteThatSkippedIsSettledByTheListing(t *testing.T) {
 		if len(drivesTasks(drive)) < 2 {
 			return listingJSON([]string{fileJSON("6000000000000000006", "clip-01.mp4", rootID)}, nil)
 		}
-		return emptyListing()
+		// gone, and shown so: the directory still holds another object, so the
+		// page is a real answer and not a nothing-claims page
+		return listingJSON([]string{fileJSON("6000000000000000007", "other.mp4", rootID)}, nil)
 	}
 
 	require.NoError(t, srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background()))
@@ -1995,21 +2034,120 @@ func TestADeleteUnderARootFolderIDChecksTheDirectoryItWasToldAbout(t *testing.T)
 	}
 }
 
-// TestADeleteOfManyObjectsIsStillSentAgainWithoutBeingChecked: the listing check is
-// bounded by target count because a purge can name thousands, but the resend is
-// the measured cure and must not be bounded with it.
-func TestADeleteOfManyObjectsIsStillSentAgainWithoutBeingChecked(t *testing.T) {
+// TestADeleteWithRootFolderIDNamingTheSpaceRootStillSeesTheObject is the shape the
+// option's own help recommends - space=family with root_folder_id set to the drive's
+// real root id - and the reason rootID() now asks for the space root even then.
+// Without that, familySpaceRoot stays empty, the absence check addresses the number
+// directly, and the family endpoint answers a number with an empty page and no error
+// (measured 2026-10-22). An empty page that claims nothing is a complete walk, so
+// the check would conclude "gone" from a directory it never read and report a
+// surviving object as deleted.
+func TestADeleteWithRootFolderIDNamingTheSpaceRootStillSeesTheObject(t *testing.T) {
+	const liveID = "9000000000000099"
 	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}}
 	f := newFakeFs(t, drive)
-	var rows []string
-	for i := 1; i <= deleteVerifyTargets+1; i++ {
-		rows = append(rows, fileJSON(fmt.Sprintf("70000000000000001%02d", i), fmt.Sprintf("f%02d.mp4", i), rootID))
+	f.opt.Space = spaceFamily
+	f.opt.RootFolderID = famRoot // the drive's own top level, named as a number
+	f.familyID = famID
+	f.familyRootID = famRoot
+	// familySpaceRoot is deliberately left empty: that is what NewFs hands over
+	// when root_folder_id is set, and rootID() has to fill it in.
+	f.dirCache = dircache.New("", famRoot, f)
+	drive.listingFn = func(r *http.Request) string {
+		if r.URL.Query().Get("folderId") == famRoot {
+			// measured: the numeric root answers nothing at all, and no error
+			return emptyListing()
+		}
+		// the alias, or the omitted folderId that means the same thing
+		return listingJSON([]string{fileJSON(liveID, "clip-01.mp4", famRoot)}, nil)
 	}
+
+	err := srcObject(f, "clip-01.mp4", liveID).Remove(context.Background())
+	require.Error(t, err, "the object is on the drive; an address that answers nothing must not read as absent")
+	require.Contains(t, err.Error(), "the server gave no reason")
+	// The empty page is addressed at the number, and the number is what the check
+	// would use without the alias translation; assert which addresses were asked
+	// for so a regression cannot quietly go back to reading the number.
+	for _, got := range driveFolders(drive) {
+		require.NotEqual(t, "", got, "the walk has to name the parent it looked at")
+	}
+}
+
+// TestRootIDLearnsTheFamilySpaceRootEvenUnderARootFolderID is the other half of the
+// same fix: rootID() returns what the user named, but must still have read the
+// drive's own top level, because that is the id listDirID translates back to the
+// alias. Without it a remote opened at the top level of a family drive has an
+// absence check that addresses a number the listing endpoint does not answer.
+func TestRootIDLearnsTheFamilySpaceRootEvenUnderARootFolderID(t *testing.T) {
+	drive := &fakeDrive{t: t}
+	f := newFakeFs(t, drive)
+	f.opt.Space = spaceFamily
+	f.opt.RootFolderID = famRoot
+	f.familyID = famID
+	f.familyRootID = famRoot
+	drive.listingFn = func(r *http.Request) string {
+		if r.URL.Query().Get("folderId") == famRoot {
+			return emptyListing()
+		}
+		return listingJSON([]string{fileJSON("9000000000000055", "clip-01.mp4", famRoot)}, nil)
+	}
+
+	got, err := f.rootID(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, famRoot, got, "what the user named is still what the remote is opened at")
+	require.Equal(t, famRoot, f.familySpaceRoot, "and the drive's own top level is now known for the translation")
+	require.Equal(t, familyRootAlias, f.listDirID(famRoot), "so a listing of it is addressed by the alias")
+}
+
+// TestADeleteResendsOnlyWhatTheDriveDidNotHandle is the big-purge shape: one task
+// of nine objects, one of them refused. The task names the eight it handled in
+// successedFileIdList (captured 2026-10-22: DELETE answers it), so the repeat has
+// to carry the ninth alone - sending all nine again repeats work the drive already
+// did, and the first version of this backend did exactly that.
+func TestADeleteResendsOnlyWhatTheDriveDidNotHandle(t *testing.T) {
+	var rows []string
+	var ids []string
+	for i := 1; i <= 9; i++ {
+		id := fmt.Sprintf("70000000000000001%02d", i)
+		ids = append(ids, id)
+		rows = append(rows, fileJSON(id, fmt.Sprintf("f%02d.mp4", i), rootID))
+	}
+	drive := &fakeDrive{t: t,
+		deleteTaskFailures: []int64{1, 0},
+		// The first task says which eight it finished with.
+		deleteTaskHandled: [][]string{ids[:8]},
+	}
+	f := newFakeFs(t, drive)
 	drive.listingFn = func(*http.Request) string { return listingJSON(rows, nil) }
 
-	err := f.Purge(context.Background(), "")
-	require.Error(t, err)
-	require.Len(t, drivesTasks(drive), 3, "too many targets to list is no reason to skip the resends")
+	require.NoError(t, f.Purge(context.Background(), ""), "the resend finished the one object the first task did not handle")
+
+	sent := drivesTasks(drive)
+	require.Len(t, sent, 2, "the first task and one resend")
+	require.Len(t, sent[0].infos, 9, "the purge sent all nine at once")
+	require.Len(t, sent[1].infos, 1, "the resend carries only the object the drive did not handle")
+	require.Equal(t, ids[8], sent[1].infos[0].FileID, "and it is the ninth")
+}
+
+// TestADeleteAnIncompleteWalkIsNotReadAsGone is the false-success axis the whole
+// absence check hangs on: the drive says a page carries 400 rows while giving 200
+// of them, so the walk that "found nothing" did not look at everything. Concluding
+// "gone" from that reports a leftover as deleted, which is the one answer that
+// cannot be taken back - so the target stays outstanding and the delete is
+// reported as a failure.
+func TestADeleteAnIncompleteWalkIsNotReadAsGone(t *testing.T) {
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}}
+	f := newFakeFs(t, drive)
+	drive.listingFn = func(*http.Request) string {
+		// count 400, rows on this page 1: the walk cannot be read as complete.
+		return `{"res_code":0,"fileListAO":{"count":400,"fileList": [` +
+			fileJSON("6000000000000000007", "other.mp4", rootID) + `],"folderList": []}}`
+	}
+
+	err := srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background())
+	require.Error(t, err, "a walk that did not reach the drive's own total cannot say the object is gone")
+	require.Contains(t, err.Error(), "the server gave no reason")
+	require.Len(t, drivesTasks(drive), 3, "the unproven absence still owes the resends")
 }
 
 // TestADeleteRefusedWithAReasonIsNotSentAgain: a drive that did give a reason -
