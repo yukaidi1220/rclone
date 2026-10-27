@@ -108,6 +108,16 @@ type fakeDrive struct {
 	listingFn       func(r *http.Request) string // a drive whose contents change as the test goes
 	taskStates      []int64                      // the taskStatus values the polls answer, in order
 	taskSubs        int                          // object count of the task the next task poll answers
+	// deleteTaskFailures is the failedCount of each successive DELETE task; a task
+	// past the end of it succeeds. A non-zero one is answered the way the drive
+	// answers a delete it will not explain: failedCount set, errorCode absent.
+	deleteTaskFailures []int64
+	// deleteTaskSkips is the same queue for skipCount, which is what a task
+	// answers when the objects are already gone.
+	deleteTaskSkips []int64
+	taskSeq         int
+	taskFail        map[string]int64
+	taskSkip        map[string]int64
 
 	// The download link and the storage layer on the way down.
 	downloadLink string // what getFileDownloadUrl answers; empty means the escaped link below
@@ -398,6 +408,26 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.createKeys = append(d.createKeys, r.Header.Get("sessionkey"))
 		// A task of several objects reports several done, the way the drive does.
 		d.taskSubs = len(infos)
+		// Every task gets its own id, so a test can tell a resend from the task
+		// it repeats - and so the poll can answer this task and not that one.
+		d.taskSeq++
+		taskID := fmt.Sprintf("9000000000000000%02d", d.taskSeq)
+		if q.Get("type") == taskDelete {
+			if len(d.deleteTaskFailures) > 0 {
+				if d.taskFail == nil {
+					d.taskFail = map[string]int64{}
+				}
+				d.taskFail[taskID] = d.deleteTaskFailures[0]
+				d.deleteTaskFailures = d.deleteTaskFailures[1:]
+			}
+			if len(d.deleteTaskSkips) > 0 {
+				if d.taskSkip == nil {
+					d.taskSkip = map[string]int64{}
+				}
+				d.taskSkip[taskID] = d.deleteTaskSkips[0]
+				d.deleteTaskSkips = d.deleteTaskSkips[1:]
+			}
+		}
 		d.mu.Unlock()
 		if len(q.Get("taskInfos")) == 0 {
 			t.Errorf("the task sent no taskInfos")
@@ -418,7 +448,7 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		default:
 			t.Errorf("unexpected task type %q", q.Get("type"))
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"res_code": 0, "taskId": "900000000000000005"})
+		writeJSON(w, http.StatusOK, map[string]any{"res_code": 0, "taskId": taskID})
 
 	case "/batch/checkBatchTask.action":
 		q, err := url.ParseQuery(string(bodyBytes))
@@ -440,13 +470,15 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			d.taskStates = d.taskStates[1:]
 		}
 		subs := d.taskSubs
+		failed := d.taskFail[q.Get("taskId")]
+		skipped := d.taskSkip[q.Get("taskId")]
 		d.mu.Unlock()
 		st := map[string]any{
 			"res_code": 0, "res_message": "成功", "taskStatus": state,
-			"failedCount": 0, "skipCount": 0, "subTaskCount": subs,
+			"failedCount": failed, "skipCount": skipped, "subTaskCount": subs,
 		}
 		if state == taskStateDone {
-			st["successedCount"] = subs
+			st["successedCount"] = int64(subs) - failed - skipped
 		}
 		writeJSON(w, http.StatusOK, st)
 

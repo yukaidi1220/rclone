@@ -1304,6 +1304,18 @@ func (f *Fs) realDirID(id string) string {
 	return id
 }
 
+// listDirID is the id a listing has to name: the alias wherever the numeric root
+// id appears, because a family listing addressed at the numeric root answers an
+// empty page with no error and reads as an empty drive (measured 2026-10-22, the
+// reason rootID always answers the alias). Request bodies want the numeric id -
+// this is the inverse of realDirID, and the two must not be swapped.
+func (f *Fs) listDirID(id string) string {
+	if f.opt.Space == spaceFamily && f.familyRootID != "" && id == f.familyRootID {
+		return familyRootAlias
+	}
+	return id
+}
+
 // resolveFamilyID fills in family_id when it was left blank.
 func (f *Fs) resolveFamilyID(ctx context.Context) error {
 	if f.familyID != "" {
@@ -2473,6 +2485,34 @@ const (
 	taskClearRecycle = "CLEAR_RECYCLE"
 )
 
+// deleteTaskResends is how many times a DELETE task that ended with failures and
+// no errorCode at all is sent again.
+//
+// One is enough by measurement. Captured 2026-10-22 a family directory delete
+// polled nine times (eight of them taskStatus 3) and closed failedCount 1 with no
+// code, a listing taken right after showed the directory still there, and the
+// same payload sent again finished successedCount 1 in 1.2s. The same shape cost
+// a production run on 2026-10-27: the first task came back with no reason, the
+// retry attempt's new task deleted the object.
+const deleteTaskResends = 1
+
+// deleteVerifyTargets bounds the listing check that follows a DELETE task that did
+// not report success. The per-object paths - sync's excess objects and rmdir -
+// carry one target; a purge can carry thousands and is worth reporting rather
+// than costing a listing per parent. Eight is my choice, not a number the protocol
+// dictates.
+const deleteVerifyTargets = 8
+
+// How long the check goes on looking for a target before it believes the object
+// is gone: three looks two seconds apart. The measured lag between a delete
+// taking effect and the listing dropping the row is about a second, seven at
+// worst, so the first look already settles the common case and the ones after it
+// cover a slow listing without turning a genuinely stuck delete into a wait.
+const (
+	deleteVerifyAttempts = 3
+	deleteVerifyWait     = 2 * time.Second
+)
+
 // Task states. 4 ends the task; the other two are states seen while it runs.
 //
 // 2 is a conflict the server wants the client to decide. This backend never
@@ -2643,6 +2683,52 @@ func (f *Fs) runBatchTask(ctx context.Context, auth taskAuth, taskType string, t
 	if err != nil {
 		return nil, err
 	}
+	resends := 0
+	for {
+		st, err := f.waitBatchTask(ctx, auth, taskID, taskType)
+		if err != nil {
+			return nil, err
+		}
+		verdict := f.taskVerdict(taskType, len(targets), st)
+		if verdict == nil {
+			return st, nil
+		}
+		// A DELETE task that did not report what was asked for is not taken at its
+		// word. Two measured shapes sit behind this. One failed with no reason at
+		// all and the same targets sent again finished it (2026-10-22 captured,
+		// 2026-10-27 in production), so it is sent again once. The other closed as
+		// failed after the work was done, so what the drive actually holds decides,
+		// whatever shape the counts came in - failed, skipped, or short of the
+		// targets. Saying an object was deleted while it is still there is the one
+		// answer here that cannot be taken back.
+		if taskType == taskDelete {
+			if st.FailedCount > 0 && string(st.ErrorCode) == "" && resends < deleteTaskResends {
+				resends++
+				fs.Logf(f, "cloud189: %s task %s ended with %d of %d failed and no reason; sending the same targets again", taskType, taskID, st.FailedCount, len(targets))
+				taskID, err = f.createBatchTask(ctx, auth, taskType, targets, targetFolderID)
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if len(targets) <= deleteVerifyTargets {
+				gone, gerr := f.targetsGone(ctx, targets)
+				if gerr != nil {
+					fs.Debugf(f, "cloud189: could not check what the unfinished %s task %s left behind: %v", taskType, taskID, gerr)
+				} else if gone {
+					fs.Logf(f, "cloud189: %s task %s did not report success but the drive no longer holds the %d target(s); taking it as done", taskType, taskID, len(targets))
+					return st, nil
+				}
+			}
+		}
+		return st, verdict
+	}
+}
+
+// waitBatchTask polls one task until it reaches a terminal state and returns the
+// last answer. Nothing here judges the outcome - runBatchTask does that, because
+// a DELETE task can be sent again.
+func (f *Fs) waitBatchTask(ctx context.Context, auth taskAuth, taskID api.FlexID, taskType string) (*taskStatusResponse, error) {
 	wait := taskPollFirst
 	deadline := time.Now().Add(taskPollWaitMax)
 	for {
@@ -2655,7 +2741,7 @@ func (f *Fs) runBatchTask(ctx context.Context, auth taskAuth, taskType string, t
 		}
 		switch st.TaskStatus {
 		case taskStateDone:
-			return st, f.taskVerdict(taskType, len(targets), st)
+			return st, nil
 		case taskStateConflict:
 			return nil, fserrors.NoRetryError(fmt.Errorf("cloud189: %s task %s stopped at a name conflict the server wants a client to answer; this backend resolves a same-name target by renaming before it starts a task, so this is not expected - check whether two transfers raced", taskType, taskID))
 		case taskStateRunning:
@@ -2674,6 +2760,59 @@ func (f *Fs) runBatchTask(ctx context.Context, auth taskAuth, taskType string, t
 			wait = taskPollMax
 		}
 	}
+}
+
+// targetsGone reports whether none of the task's targets is on the drive any
+// more, judged by id under the parent the task was given.
+//
+// The listing is asked more than once. The drive keeps answering a deleted row
+// for about a second after the delete reports done, and seven at worst (measured
+// 2026-10-23 through the readback window), so one row is not yet a leftover -
+// but an empty answer is what a successful delete looks like from the first
+// second on. The wait only ever happens on a delete that did not report success.
+func (f *Fs) targetsGone(ctx context.Context, targets []taskInfo) (bool, error) {
+	for attempt := 0; attempt < deleteVerifyAttempts; attempt++ {
+		gone, err := f.targetsGoneOnce(ctx, targets)
+		if err != nil {
+			return false, err
+		}
+		if gone {
+			return true, nil
+		}
+		if attempt < deleteVerifyAttempts-1 {
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-time.After(deleteVerifyWait):
+			}
+		}
+	}
+	return false, nil
+}
+
+// targetsGoneOnce is one look. A different object that now holds the name is not
+// this one, so the id decides.
+func (f *Fs) targetsGoneOnce(ctx context.Context, targets []taskInfo) (bool, error) {
+	for _, t := range targets {
+		if t.ParentID == nil {
+			return false, errors.New("cloud189: a task target carries no parent to look under")
+		}
+		found := false
+		err := f.listAll(ctx, f.listDirID(strconv.FormatInt(*t.ParentID, 10)), func(row *api.Row) bool {
+			if row.ID.String() == t.FileID {
+				found = true
+				return true
+			}
+			return false
+		})
+		if err != nil {
+			return false, err
+		}
+		if found {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // taskVerdict reads a finished task.
