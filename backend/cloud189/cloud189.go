@@ -4192,11 +4192,24 @@ func (o *Object) invalidateURL() {
 // holder gets the whole lifetime the drive granted, not what is left of a
 // window rclone was already part way through.
 //
+// What comes back is the address the bytes are read from, not the drive's own
+// download endpoint. getFileDownloadUrl.action answers with a
+// download.cloud.189.cn URL that only redirects: one 302 lands on a presigned
+// storage URL whose query carries the real grant (measured 2026-10-27, a ctyun
+// OBS host with X-Amz-Expires=300, and that host is what a direct-link rule keys
+// on). Following it once costs a single-byte request, so a client that does not
+// follow redirects gets a usable answer, and the lifetime the returned link
+// really has travels with it rather than being guessed at here. Were that one
+// request to fail, the redirecting form is returned with a warning instead: it
+// still reads for anything that follows the redirect, and a link part way
+// through its life is worth more than a failure.
+//
 // getFileDownloadUrl.action takes no expiry parameter, so the client cannot
-// choose how long a link lives. Measured 2026-10-22 a personal-space link is
-// valid for about 5 minutes from issue and a family one about 10 hours, so a
-// requested expiry is ignored with a warning and the reader has to finish
-// inside the window the drive chose. unlink is ignored too: nothing was ever
+// choose how long a link lives. Measured 2026-10-27 the redirecting form is valid
+// for about 5 minutes from issue on the personal space and about 10 hours on the
+// family one, and the storage address it names carries a grant of its own. A
+// requested expiry is therefore ignored with a warning, and the reader has to
+// finish inside a window the drive chose. unlink is ignored too: nothing was ever
 // stored on the drive, so there is no share to revoke.
 //
 // Directories cannot be linked and return fs.ErrorCantShareDirectories.
@@ -4218,7 +4231,37 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	// The uncached path: a link handed to someone else should not be shortened
 	// by whatever is left of rclone's own window.
 	link, _, err := f.downloadURL(ctx, o.id)
-	return link, err
+	if err != nil {
+		return "", err
+	}
+	resolved, rerr := f.storageURL(ctx, link)
+	if rerr != nil {
+		fs.Logf(f, "Public Link: the storage address behind the link could not be read (%v), returning the link that redirects", rerr)
+		return link, nil
+	}
+	return resolved, nil
+}
+
+// storageURL follows a download link once and reports the address the bytes
+// actually come from. A byte is asked for and the body is never read: the answer
+// wanted is the URL the client ended up requesting, which Go leaves on the
+// response after following the redirect.
+func (f *Fs) storageURL(ctx context.Context, link string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, http.NoBody)
+	if err != nil {
+		return "", scrubErr(err, link)
+	}
+	req.Header.Set("Range", "bytes=0-0")
+	req.Header.Set("user-agent", dartUserAgent)
+	res, err := f.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("cloud189: resolving the download link: %w", scrubErr(err, link))
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusPartialContent {
+		return "", fmt.Errorf("cloud189: the download link answered HTTP %d", res.StatusCode)
+	}
+	return res.Request.URL.String(), nil
 }
 
 // ------------------------------------------------------------ object info --
