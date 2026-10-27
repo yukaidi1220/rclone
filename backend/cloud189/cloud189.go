@@ -1304,6 +1304,18 @@ func (f *Fs) realDirID(id string) string {
 	return id
 }
 
+// listDirID is the id a listing has to name: the alias wherever the numeric root
+// id appears, because a family listing addressed at the numeric root answers an
+// empty page with no error and reads as an empty drive (measured 2026-10-22, the
+// reason rootID always answers the alias). Request bodies want the numeric id -
+// this is the inverse of realDirID, and the two must not be swapped.
+func (f *Fs) listDirID(id string) string {
+	if f.opt.Space == spaceFamily && f.familyRootID != "" && id == f.familyRootID {
+		return familyRootAlias
+	}
+	return id
+}
+
 // resolveFamilyID fills in family_id when it was left blank.
 func (f *Fs) resolveFamilyID(ctx context.Context) error {
 	if f.familyID != "" {
@@ -2473,6 +2485,34 @@ const (
 	taskClearRecycle = "CLEAR_RECYCLE"
 )
 
+// deleteTaskResends is how many times a DELETE task that ended with failures and
+// no errorCode at all is sent again.
+//
+// One is enough by measurement. Captured 2026-10-22 a family directory delete
+// polled nine times (eight of them taskStatus 3) and closed failedCount 1 with no
+// code, a listing taken right after showed the directory still there, and the
+// same payload sent again finished successedCount 1 in 1.2s. The same shape cost
+// a production run on 2026-10-27: the first task came back with no reason, the
+// retry attempt's new task deleted the object.
+const deleteTaskResends = 1
+
+// deleteVerifyTargets bounds the listing check that follows a DELETE task that did
+// not report success. The per-object paths - sync's excess objects and rmdir -
+// carry one target; a purge can carry thousands and is worth reporting rather
+// than costing a listing per parent. Eight is my choice, not a number the protocol
+// dictates.
+const deleteVerifyTargets = 8
+
+// How long the check goes on looking for a target before it believes the object
+// is gone: three looks two seconds apart. The measured lag between a delete
+// taking effect and the listing dropping the row is about a second, seven at
+// worst, so the first look already settles the common case and the ones after it
+// cover a slow listing without turning a genuinely stuck delete into a wait.
+const (
+	deleteVerifyAttempts = 3
+	deleteVerifyWait     = 2 * time.Second
+)
+
 // Task states. 4 ends the task; the other two are states seen while it runs.
 //
 // 2 is a conflict the server wants the client to decide. This backend never
@@ -2643,6 +2683,52 @@ func (f *Fs) runBatchTask(ctx context.Context, auth taskAuth, taskType string, t
 	if err != nil {
 		return nil, err
 	}
+	resends := 0
+	for {
+		st, err := f.waitBatchTask(ctx, auth, taskID, taskType)
+		if err != nil {
+			return nil, err
+		}
+		verdict := f.taskVerdict(taskType, len(targets), st)
+		if verdict == nil {
+			return st, nil
+		}
+		// A DELETE task that did not report what was asked for is not taken at its
+		// word. Two measured shapes sit behind this. One failed with no reason at
+		// all and the same targets sent again finished it (2026-10-22 captured,
+		// 2026-10-27 in production), so it is sent again once. The other closed as
+		// failed after the work was done, so what the drive actually holds decides,
+		// whatever shape the counts came in - failed, skipped, or short of the
+		// targets. Saying an object was deleted while it is still there is the one
+		// answer here that cannot be taken back.
+		if taskType == taskDelete {
+			if st.FailedCount > 0 && string(st.ErrorCode) == "" && resends < deleteTaskResends {
+				resends++
+				fs.Logf(f, "cloud189: %s task %s ended with %d of %d failed and no reason; sending the same targets again", taskType, taskID, st.FailedCount, len(targets))
+				taskID, err = f.createBatchTask(ctx, auth, taskType, targets, targetFolderID)
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if len(targets) <= deleteVerifyTargets {
+				gone, gerr := f.targetsGone(ctx, targets)
+				if gerr != nil {
+					fs.Debugf(f, "cloud189: could not check what the unfinished %s task %s left behind: %v", taskType, taskID, gerr)
+				} else if gone {
+					fs.Logf(f, "cloud189: %s task %s did not report success but the drive no longer holds the %d target(s); taking it as done", taskType, taskID, len(targets))
+					return st, nil
+				}
+			}
+		}
+		return st, verdict
+	}
+}
+
+// waitBatchTask polls one task until it reaches a terminal state and returns the
+// last answer. Nothing here judges the outcome - runBatchTask does that, because
+// a DELETE task can be sent again.
+func (f *Fs) waitBatchTask(ctx context.Context, auth taskAuth, taskID api.FlexID, taskType string) (*taskStatusResponse, error) {
 	wait := taskPollFirst
 	deadline := time.Now().Add(taskPollWaitMax)
 	for {
@@ -2655,7 +2741,7 @@ func (f *Fs) runBatchTask(ctx context.Context, auth taskAuth, taskType string, t
 		}
 		switch st.TaskStatus {
 		case taskStateDone:
-			return st, f.taskVerdict(taskType, len(targets), st)
+			return st, nil
 		case taskStateConflict:
 			return nil, fserrors.NoRetryError(fmt.Errorf("cloud189: %s task %s stopped at a name conflict the server wants a client to answer; this backend resolves a same-name target by renaming before it starts a task, so this is not expected - check whether two transfers raced", taskType, taskID))
 		case taskStateRunning:
@@ -2674,6 +2760,59 @@ func (f *Fs) runBatchTask(ctx context.Context, auth taskAuth, taskType string, t
 			wait = taskPollMax
 		}
 	}
+}
+
+// targetsGone reports whether none of the task's targets is on the drive any
+// more, judged by id under the parent the task was given.
+//
+// The listing is asked more than once. The drive keeps answering a deleted row
+// for about a second after the delete reports done, and seven at worst (measured
+// 2026-10-23 through the readback window), so one row is not yet a leftover -
+// but an empty answer is what a successful delete looks like from the first
+// second on. The wait only ever happens on a delete that did not report success.
+func (f *Fs) targetsGone(ctx context.Context, targets []taskInfo) (bool, error) {
+	for attempt := 0; attempt < deleteVerifyAttempts; attempt++ {
+		gone, err := f.targetsGoneOnce(ctx, targets)
+		if err != nil {
+			return false, err
+		}
+		if gone {
+			return true, nil
+		}
+		if attempt < deleteVerifyAttempts-1 {
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-time.After(deleteVerifyWait):
+			}
+		}
+	}
+	return false, nil
+}
+
+// targetsGoneOnce is one look. A different object that now holds the name is not
+// this one, so the id decides.
+func (f *Fs) targetsGoneOnce(ctx context.Context, targets []taskInfo) (bool, error) {
+	for _, t := range targets {
+		if t.ParentID == nil {
+			return false, errors.New("cloud189: a task target carries no parent to look under")
+		}
+		found := false
+		err := f.listAll(ctx, f.listDirID(strconv.FormatInt(*t.ParentID, 10)), func(row *api.Row) bool {
+			if row.ID.String() == t.FileID {
+				found = true
+				return true
+			}
+			return false
+		})
+		if err != nil {
+			return false, err
+		}
+		if found {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // taskVerdict reads a finished task.
@@ -4184,6 +4323,181 @@ func (o *Object) invalidateURL() {
 	o.urlMu.Lock()
 	o.url, o.urlExpiry = "", time.Time{}
 	o.urlMu.Unlock()
+}
+
+// PublicLink returns a direct download link for the file at remote.
+//
+// The link is minted fresh and never taken from the download-URL cache, so the
+// holder gets the whole lifetime the drive granted, not what is left of a
+// window rclone was already part way through.
+//
+// What comes back is the address the bytes are read from, not the drive's own
+// download endpoint. getFileDownloadUrl.action answers with a
+// download.cloud.189.cn URL that only redirects: one 302 lands on a presigned
+// storage URL whose query carries the real grant (measured 2026-10-27, a ctyun
+// OBS host with X-Amz-Expires=300, and that host is what a direct-link rule keys
+// on). Following it once costs a single-byte request, so a client that does not
+// follow redirects gets a usable answer, and the lifetime the returned link
+// really has travels with it rather than being guessed at here. Were that one
+// request to fail, the redirecting form is returned with a warning instead: it
+// still reads for anything that follows the redirect, and a link part way
+// through its life is worth more than a failure.
+//
+// getFileDownloadUrl.action takes no expiry parameter, so the client cannot
+// choose how long a link lives. Measured 2026-10-27 the redirecting form is valid
+// for about 5 minutes from issue on the personal space and about 8 hours on the
+// family one, and the storage address it names carries a grant of its own. A
+// requested expiry is therefore ignored with a warning, and the reader has to
+// finish inside a window the drive chose. unlink is ignored too: nothing was ever
+// stored on the drive, so there is no share to revoke.
+//
+// Those are the lifetimes of the redirecting form. The storage grant behind it is
+// shorter on both spaces and dramatically so on the family one (measured
+// X-Amz-Expires=300, i.e. five minutes against the eight hours above), while the
+// redirecting form renews that grant every time it is hit. So a link passed on
+// from here lives minutes where the one it replaces would have lived hours. The
+// resolved address is still what goes out - a direct-link rule keys on the host,
+// which is the whole reason this backend follows the redirect - but the shorter
+// lifetime is reported rather than left for the recipient to discover.
+//
+// Directories cannot be linked and return fs.ErrorCantShareDirectories.
+func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
+	if strings.HasSuffix(remote, "/") {
+		return "", fs.ErrorCantShareDirectories
+	}
+	obj, err := f.NewObject(ctx, remote)
+	if err != nil {
+		if err == fs.ErrorIsDir {
+			return "", fs.ErrorCantShareDirectories
+		}
+		return "", err
+	}
+	o := obj.(*Object)
+	if expire.IsSet() {
+		fs.Logf(f, "Public Link: cloud189 does not let the client choose how long a download link lives, ignoring the requested expiry of %v", expire)
+	}
+	if unlink {
+		// rclone's contract for a backend without unlink is to ignore the flag:
+		// the link is minted per request and stored nowhere on the drive, so
+		// there is nothing to revoke.
+		fs.Debugf(f, "a download link is minted per request, so there is no stored link to unlink")
+	}
+	// The uncached path: a link handed to someone else should not be shortened
+	// by whatever is left of rclone's own window.
+	link, _, err := f.downloadURL(ctx, o.id)
+	if err != nil {
+		return "", err
+	}
+	resolved, rerr := f.storageURL(ctx, link)
+	if rerr != nil {
+		var refused *linkRefusedError
+		if errors.As(rerr, &refused) {
+			// The drive's own endpoint refused, so the link is dead and passing
+			// it on would hand the caller something that does not work.
+			return "", rerr
+		}
+		fs.Logf(f, "Public Link: the storage address behind the link could not be read (%v), returning the link that redirects", rerr)
+		return link, nil
+	}
+	// The storage grant is shorter than the redirecting form on both spaces, and
+	// on the family one by orders of magnitude. A caller who passes this on is
+	// handing out minutes where the link would have lived hours, so it is said
+	// out loud rather than left to be discovered by whoever cannot open it.
+	if grant, ok := linkValidity(resolved); ok {
+		if grant < 30*time.Minute {
+			fs.Logf(f, "Public Link: the address handed out carries a %v grant, shorter than the link it redirects from; a recipient has to finish inside that window", grant.Round(time.Second))
+		}
+	}
+	return resolved, nil
+}
+
+// linkValidity reports how long a presigned storage URL stays valid, when its
+// query says so.
+func linkValidity(raw string) (time.Duration, bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return 0, false
+	}
+	q := u.Query()
+	secs, err := strconv.ParseInt(q.Get("X-Amz-Expires"), 10, 64)
+	if err != nil || secs <= 0 {
+		return 0, false
+	}
+	// The clock starts when the URL was signed, not when it was read, so the
+	// signing time is taken off when it is there.
+	if signedAt, err := time.Parse("20060102T150405Z", q.Get("X-Amz-Date")); err == nil {
+		return time.Until(signedAt.Add(time.Duration(secs) * time.Second)), true
+	}
+	return time.Duration(secs) * time.Second, true
+}
+
+// maxLinkRedirects bounds how far the one redirect is followed. The drive uses
+// a single hop; more than a few is a redirect loop, and the chain it would build
+// is not worth following.
+const maxLinkRedirects = 5
+
+// linkRefusedError says the drive's own link answered badly, rather than the
+// storage address behind it.
+//
+// The two failures mean different things to the caller: the link itself is dead
+// in the first case, and still fine for anything that follows redirects in the
+// second.
+type linkRefusedError struct {
+	status int
+}
+
+func (e *linkRefusedError) Error() string {
+	return fmt.Sprintf("cloud189: the download link answered HTTP %d", e.status)
+}
+
+// storageURL follows a download link once and reports the address the bytes
+// actually come from. A byte is asked for and the body is never read: the answer
+// wanted is the URL the client ended up requesting, which Go leaves on the
+// response after following the redirect.
+func (f *Fs) storageURL(ctx context.Context, link string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, http.NoBody)
+	if err != nil {
+		return "", scrubErr(err, link)
+	}
+	req.Header.Set("Range", "bytes=0-0")
+	req.Header.Set("user-agent", dartUserAgent)
+
+	// Every address on the way is a secret, and Go quotes the one it failed on.
+	// After a redirect that is the last address, not the one asked for: the
+	// storage URL with its own signature in the query, which the single-secret
+	// form of scrubErr would leave in place. The chain is collected so all of it
+	// can be taken out of the message.
+	chain := []string{link}
+	client := *f.httpClient
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		chain = append(chain, req.URL.String())
+		if len(via) >= maxLinkRedirects {
+			return fmt.Errorf("cloud189: the download link redirected more than %d times", maxLinkRedirects)
+		}
+		return nil
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("cloud189: resolving the download link: %w", scrubErr(err, chain...))
+	}
+	defer func() {
+		// A byte was asked for, so the rest is short. It is dropped rather than
+		// abandoned so the connection can go back to the pool - capped, because
+		// a server that ignores Range would otherwise turn this into the full
+		// download the range was there to avoid.
+		_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 64<<10))
+		_ = res.Body.Close()
+	}()
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusPartialContent {
+		if len(chain) == 1 {
+			// No redirect happened, so it was the drive's own endpoint that
+			// refused. The link is dead and handing it back would be worse than
+			// the error.
+			return "", &linkRefusedError{status: res.StatusCode}
+		}
+		return "", fmt.Errorf("cloud189: the storage address answered HTTP %d", res.StatusCode)
+	}
+	return res.Request.URL.String(), nil
 }
 
 // ------------------------------------------------------------ object info --
