@@ -2099,6 +2099,48 @@ func TestRootIDLearnsTheFamilySpaceRootEvenUnderARootFolderID(t *testing.T) {
 	require.Equal(t, familyRootAlias, f.listDirID(famRoot), "so a listing of it is addressed by the alias")
 }
 
+// rowRange builds a directory of count other objects with ids that never collide
+// with the test object's.
+func rowRange(count int) []string {
+	rows := make([]string, 0, count)
+	for i := 1; i <= count; i++ {
+		rows = append(rows, fileJSON(fmt.Sprintf("700000000000000%04d", i), fmt.Sprintf("o%04d.mp4", i), rootID))
+	}
+	return rows
+}
+
+// TestADeleteOnTheSecondPageIsFoundByAWalkThatPages is the positive control for
+// paging: the directory holds 250 objects and ours is the last of them, so it is
+// only reachable on page two. Before the fixture could page, no case in this
+// package could express "the row is past the first page" at all - which is the
+// hole the truncated-walk bug fell through.
+func TestADeleteOnTheSecondPageIsFoundByAWalkThatPages(t *testing.T) {
+	rows := append(rowRange(249), fileJSON("6000000000000000006", "clip-01.mp4", rootID))
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}, pagedRows: rows}
+	f := newFakeFs(t, drive)
+
+	err := srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background())
+	require.Error(t, err, "it is on page two of the listing, so it is still on the drive")
+	require.Len(t, drivesTasks(drive), 3, "and it was resent, twice, as a leftover should be")
+}
+
+// TestADeleteAWalkCutShortByItsPageBudgetIsNotTakenAsGone is the safety half: the
+// object genuinely is gone, the directory holds 250 others, and the walk is
+// allowed one page. Not being allowed to read the rest is not evidence of
+// absence, so the delete may not be called done from it - the cost of that rule
+// is a resend, and the cost of not having it is reporting a leftover as deleted.
+func TestADeleteAWalkCutShortByItsPageBudgetIsNotTakenAsGone(t *testing.T) {
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}, pagedRows: rowRange(250)}
+	f := newFakeFs(t, drive)
+	old := deleteVerifyPages
+	deleteVerifyPages = 1
+	t.Cleanup(func() { deleteVerifyPages = old })
+
+	err := srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background())
+	require.Error(t, err, "a walk that was cut off after one page cannot certify an absence")
+	require.Len(t, drivesTasks(drive), 3, "the undecidable answer still owes the resends")
+}
+
 // TestADeleteResendsOnlyWhatTheDriveDidNotHandle is the big-purge shape: one task
 // of nine objects, one of them refused. The task names the eight it handled in
 // successedFileIdList (captured 2026-10-22: DELETE answers it), so the repeat has
