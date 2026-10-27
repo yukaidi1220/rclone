@@ -481,19 +481,31 @@ func (f *Fs) setPolicy(ctx context.Context, policyID string) (any, error) {
 //
 // It is the link every read goes through (POST /file/url, which the site answers
 // with its download_host rewrite applied): no share and no stored direct link is
-// created, so nothing has to be removed afterwards, and the link carries the
-// site's own expiry rather than one asked for here.
+// created, and the link carries the site's own expiry rather than one asked for
+// here.
 //
 // The link is minted for this call rather than taken from the cache reads fill,
 // because one with a few minutes left is of little use to whoever asked for it.
 // The site hands out entity URLs for files only, so a folder has none.
+//
+// unlink removes the stored direct links an earlier version of this backend
+// created. Nothing creates them any more, but the site keeps serving every one
+// of them as a permanent public URL until it is deleted, so unlink stays the way
+// to take one back. It returns no link, as rclone expects of an unlink.
 func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
 	if unlink {
-		// rclone's contract for a backend without unlink is to ignore the flag,
-		// and a download link is stored nowhere, so nothing is left behind.
-		fs.Debugf(f, "a download link is minted per request, so there is no stored link to unlink")
+		// A download link is stored nowhere, so there is nothing of this
+		// backend's own to remove. Stored direct links are a different thing:
+		// an earlier version of this backend created them, and the site still
+		// serves every one of them as a permanent public URL. Removing those is
+		// the only way to take back a link that was handed out then, so unlink
+		// keeps doing that rather than becoming a no-op.
+		if err := f.deleteDirectLinks(ctx, remote); err != nil {
+			return "", err
+		}
+		return "", nil
 	}
-	if expire > 0 {
+	if expire.IsSet() {
 		fs.Logf(f, "the site sets its own expiry on download links, so --expire is ignored")
 	}
 	// Ask about the named entry itself rather than going through NewObject: when
@@ -513,11 +525,41 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	return f.absoluteURL(link), nil
 }
 
+// deleteDirectLinks removes every stored direct link of the file
+//
+// The links are permanent public URLs the site keeps serving until they are
+// deleted, and this backend used to create them. Nothing creates them any more,
+// but the ones made back then are still out there, and this is the only way to
+// revoke one.
+func (f *Fs) deleteDirectLinks(ctx context.Context, remote string) error {
+	query := url.Values{}
+	query.Set("uri", f.uriFor(remote))
+	query.Set("extended", "true")
+	info := new(api.FileExtended)
+	if err := f.call(ctx, "GET", "/file/info", query, nil, info); err != nil {
+		return err
+	}
+	for _, link := range info.ExtendedInfo.DirectLinks {
+		endpoint := "/file/source/" + url.PathEscape(link.ID)
+		if err := f.call(ctx, "DELETE", endpoint, nil, nil, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // absoluteURL makes a server-relative URL complete
 //
 // ResolveReference is what the URL rules say: an absolute path is taken from the
 // host root, a relative one from the remote's own base, and a network-path
 // reference keeps the host it names.
+//
+// An instance mounted under a sub-path is the exception. Its download_host
+// rewrites produce paths relative to the application, and an absolute path from
+// the host root would drop the prefix and land on the proxy's 404. When the
+// configured URL has a path prefix and the answer does not already carry it, the
+// prefix is put back. A complete URL is left alone either way: the site names the
+// host it wants, and that is the one the signature covers.
 func (f *Fs) absoluteURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil || u.IsAbs() {
@@ -526,6 +568,11 @@ func (f *Fs) absoluteURL(raw string) string {
 	base, err := url.Parse(f.opt.URL)
 	if err != nil {
 		return raw
+	}
+	if prefix := strings.TrimSuffix(base.Path, "/"); prefix != "" && u.Host == "" {
+		if !strings.HasPrefix(u.Path, prefix+"/") && u.Path != prefix {
+			u.Path = prefix + "/" + strings.TrimPrefix(u.Path, "/")
+		}
 	}
 	return base.ResolveReference(u).String()
 }

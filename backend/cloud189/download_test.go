@@ -325,3 +325,75 @@ func TestPublicLinkFallsBackToTheRedirectingLink(t *testing.T) {
 	require.NotContains(t, link, "X-Amz-Signature", "and the address that refused is not handed out as if it had worked")
 	require.Len(t, drive.readRanges, 2, "the link was followed once before giving up")
 }
+
+// TestStorageURLDoesNotQuoteTheStorageSignatureOnTransportFailure is the log
+// hygiene rule on the redirecting hop.
+//
+// When the transport itself fails, Go quotes the URL it was sending to - and
+// after a redirect that is the last address in the chain, the presigned storage
+// URL with its signature in the query, not the drive's own link. Scrubbing only
+// the link would leave the signature in the message, which is the one thing that
+// must not happen on this drive.
+func TestStorageURLDoesNotQuoteTheStorageSignatureOnTransportFailure(t *testing.T) {
+	drive := &fakeDrive{t: t,
+		linkRedirectAbs: "http://127.0.0.1:1/store/obs?X-Amz-Signature=OBS-SIGNATURE-1&X-Amz-Credential=OBS-CREDENTIAL-1",
+	}
+	f := newFakeFs(t, drive)
+	link := f.apiBase + "/store/file?fileId=1&amp;sig=LIVE-SIGNATURE-VALUE"
+
+	_, err := f.storageURL(context.Background(), link)
+	require.Error(t, err, "nothing listens at the far end of the redirect")
+	require.NotContains(t, err.Error(), "OBS-SIGNATURE-1", "the transport quoted the storage URL and its signature went with it")
+	require.NotContains(t, err.Error(), "OBS-CREDENTIAL-1", "and the credential that travels beside it")
+	require.NotContains(t, err.Error(), "LIVE-SIGNATURE-VALUE", "nor the drive's own signature")
+	require.Contains(t, err.Error(), "<redacted>", "the addresses are said to be redacted rather than shown")
+}
+
+// TestPublicLinkReportsADeadLinkInsteadOfHandingItOver is the other half of the
+// fallback. When the drive's own endpoint refuses - no redirect happened, so the
+// link itself is what answered badly - the link is dead, and returning it would
+// give the caller something that does not work.
+func TestPublicLinkReportsADeadLinkInsteadOfHandingItOver(t *testing.T) {
+	drive := &fakeDrive{t: t, readStatus: []int{http.StatusForbidden}}
+	f := newFakeFs(t, drive)
+	drive.listingFn = func(*http.Request) string {
+		return listingJSON([]string{fileJSON("7000000000000000007", "clip.mp4", rootID)}, nil)
+	}
+
+	link, err := f.PublicLink(context.Background(), "clip.mp4", fs.DurationOff, false)
+	require.Error(t, err, "the drive refused the link it had just minted")
+	require.Empty(t, link, "a link that was refused is not handed over as if it worked")
+	require.Contains(t, err.Error(), "HTTP 403")
+	require.Len(t, drive.readRanges, 1, "one attempt, and no redirect to follow")
+}
+
+// TestLinkValidityReadsTheGrant checks what the lifetime warning is computed
+// from. X-Amz-Expires is a window counted from when the URL was signed, so
+// X-Amz-Date has to come off it; without that a URL signed an hour ago would be
+// reported as fresh for its whole window.
+func TestLinkValidityReadsTheGrant(t *testing.T) {
+	signedAt := time.Now().UTC().Add(-10 * time.Minute)
+	date := signedAt.Format("20060102T150405Z")
+
+	for _, test := range []struct {
+		name string
+		url  string
+		want time.Duration
+		ok   bool
+	}{
+		{"signed ten minutes ago, half-hour grant", "/f?X-Amz-Date=" + date + "&X-Amz-Expires=1800", 20 * time.Minute, true},
+		{"no signing time, the window alone", "/f?X-Amz-Expires=300", 5 * time.Minute, true},
+		{"already expired", "/f?X-Amz-Date=" + date + "&X-Amz-Expires=60", -9 * time.Minute, true},
+		{"no expiry at all", "/f?sign=1", 0, false},
+		{"not a number", "/f?X-Amz-Expires=soon", 0, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := linkValidity(test.url)
+			require.Equal(t, test.ok, ok)
+			if test.ok {
+				// A second of slack for the clock moving between the two reads.
+				require.InDelta(t, test.want.Seconds(), got.Seconds(), 2)
+			}
+		})
+	}
+}

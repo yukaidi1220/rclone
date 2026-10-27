@@ -1413,8 +1413,10 @@ func TestUnitAbsoluteURLFollowsTheURLRules(t *testing.T) {
 		{"already absolute", "https://site.example", "https://cdn.example/f?x=1", "https://cdn.example/f?x=1"},
 		{"path from the host root", "https://site.example", "/f/x", "https://site.example/f/x"},
 		{"path under a sub-path site", "https://site.example/cloudreve/", "/cloudreve/f/x", "https://site.example/cloudreve/f/x"},
+		{"app-relative path on a sub-path site", "https://site.example/cloudreve/", "/f/x", "https://site.example/cloudreve/f/x"},
 		{"bare relative path", "https://site.example/cloudreve/", "f/x", "https://site.example/cloudreve/f/x"},
 		{"network-path reference", "https://site.example", "//cdn.example/f", "https://cdn.example/f"},
+		{"absolute path on a root site", "https://site.example", "/f/x", "https://site.example/f/x"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			f := &Fs{opt: Options{URL: test.base}}
@@ -1423,11 +1425,12 @@ func TestUnitAbsoluteURLFollowsTheURLRules(t *testing.T) {
 	}
 }
 
-// TestUnitPublicLinkRefusesAFolderAndIgnoresUnlink checks the two shapes a link
-// request can take. A folder has no download URL, since the site only hands out
-// entity URLs for files. An unlink has nothing to act on: the link is stored
-// nowhere, and rclone's contract for a backend without unlink is to ignore it.
-func TestUnitPublicLinkRefusesAFolderAndIgnoresUnlink(t *testing.T) {
+// TestUnitPublicLinkRefusesAFolderAndUnlinksStoredLinks checks the two shapes a
+// link request can take. A folder has no download URL, since the site only hands
+// out entity URLs for files. An unlink removes the stored direct links an earlier
+// version of this backend created, which the site keeps serving as permanent
+// public URLs.
+func TestUnitPublicLinkRefusesAFolderAndUnlinksStoredLinks(t *testing.T) {
 	t.Run("folder", func(t *testing.T) {
 		f, s := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
 			if rec.method == "GET" && rec.path == "/api/v4/file/info" {
@@ -1454,20 +1457,42 @@ func TestUnitPublicLinkRefusesAFolderAndIgnoresUnlink(t *testing.T) {
 	})
 
 	t.Run("unlink", func(t *testing.T) {
+		// An earlier version of this backend created stored direct links, which
+		// the site keeps serving as permanent public URLs. unlink is the only
+		// way to take one back, so it removes them instead of doing nothing.
 		f, s := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
 			switch {
 			case rec.method == "GET" && rec.path == "/api/v4/file/info":
-				reply(w, api.CodeSuccess, api.File{Type: api.FileTypeFile, ID: "F1", Size: 5})
-			case rec.method == "POST" && rec.path == "/api/v4/file/url":
-				reply(w, api.CodeSuccess, api.FileURLData{URLs: []api.FileURL{{URL: "https://cdn.example/f.txt"}}})
+				assert.Equal(t, "cloudreve://my/f.txt", rec.query.Get("uri"))
+				assert.Equal(t, "true", rec.query.Get("extended"),
+					"the stored links are only reported when asked for")
+				info := api.FileExtended{File: api.File{Type: api.FileTypeFile, ID: "F1", Size: 5}}
+				info.ExtendedInfo.DirectLinks = []api.DirectLink{{ID: "L1", URL: "https://site.example/s/L1"}}
+				reply(w, api.CodeSuccess, info)
+			case rec.method == "DELETE" && rec.path == "/api/v4/file/source/L1":
+				reply(w, api.CodeSuccess, nil)
 			default:
-				s.t.Fatalf("nothing is stored, so nothing may be touched: %s %s", rec.method, rec.path)
+				s.t.Fatalf("unlink removes the stored link and asks for nothing else: %s %s", rec.method, rec.path)
 			}
 		})
 		link, err := f.PublicLink(testCtx(), "f.txt", 0, true)
-		require.NoError(t, err, "a backend without unlink ignores the flag, as rclone documents")
-		assert.NotEmpty(t, link)
-		assert.Equal(t, 0, s.count("PUT", "/api/v4/file/source"), "no stored link is touched")
+		require.NoError(t, err)
+		assert.Empty(t, link, "an unlink hands back no link")
+		assert.Equal(t, 1, s.count("DELETE", "/api/v4/file/source/L1"), "the stored link is gone")
+		assert.Equal(t, 0, s.count("POST", "/api/v4/file/url"), "and no fresh one is minted")
+	})
+
+	t.Run("unlink with nothing stored", func(t *testing.T) {
+		f, s := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			if rec.method == "GET" && rec.path == "/api/v4/file/info" {
+				reply(w, api.CodeSuccess, api.File{Type: api.FileTypeFile, ID: "F1", Size: 5})
+				return
+			}
+			s.t.Fatalf("there is nothing to remove, so nothing else may be touched: %s %s", rec.method, rec.path)
+		})
+		link, err := f.PublicLink(testCtx(), "f.txt", 0, true)
+		require.NoError(t, err, "a file with no stored links is already in the wanted state")
+		assert.Empty(t, link)
 		assert.Equal(t, 0, s.count("DELETE", "/api/v4/file/source"))
 	})
 }

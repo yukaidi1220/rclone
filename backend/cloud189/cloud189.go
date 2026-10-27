@@ -4206,11 +4206,19 @@ func (o *Object) invalidateURL() {
 //
 // getFileDownloadUrl.action takes no expiry parameter, so the client cannot
 // choose how long a link lives. Measured 2026-10-27 the redirecting form is valid
-// for about 5 minutes from issue on the personal space and about 10 hours on the
+// for about 5 minutes from issue on the personal space and about 8 hours on the
 // family one, and the storage address it names carries a grant of its own. A
 // requested expiry is therefore ignored with a warning, and the reader has to
 // finish inside a window the drive chose. unlink is ignored too: nothing was ever
 // stored on the drive, so there is no share to revoke.
+//
+// On the family space the storage grant is much shorter than the redirecting form
+// (measured X-Amz-Expires=300, so five minutes against eight hours), and the
+// redirecting form renews the grant every time it is hit. So a link passed on
+// from here lives minutes where the one before it would have lived hours. The
+// resolved address is still what goes out - a direct-link rule keys on the host,
+// which is the whole reason this backend follows the redirect - but the shorter
+// lifetime is reported rather than left for the recipient to discover.
 //
 // Directories cannot be linked and return fs.ErrorCantShareDirectories.
 func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
@@ -4228,6 +4236,12 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	if expire.IsSet() {
 		fs.Logf(f, "Public Link: cloud189 does not let the client choose how long a download link lives, ignoring the requested expiry of %v", expire)
 	}
+	if unlink {
+		// rclone's contract for a backend without unlink is to ignore the flag:
+		// the link is minted per request and stored nowhere on the drive, so
+		// there is nothing to revoke.
+		fs.Debugf(f, "a download link is minted per request, so there is no stored link to unlink")
+	}
 	// The uncached path: a link handed to someone else should not be shortened
 	// by whatever is left of rclone's own window.
 	link, _, err := f.downloadURL(ctx, o.id)
@@ -4236,10 +4250,64 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	}
 	resolved, rerr := f.storageURL(ctx, link)
 	if rerr != nil {
+		var refused *linkRefusedError
+		if errors.As(rerr, &refused) {
+			// The drive's own endpoint refused, so the link is dead and passing
+			// it on would hand the caller something that does not work.
+			return "", rerr
+		}
 		fs.Logf(f, "Public Link: the storage address behind the link could not be read (%v), returning the link that redirects", rerr)
 		return link, nil
 	}
+	// The storage grant is shorter than the redirecting form on both spaces, and
+	// on the family one by orders of magnitude. A caller who passes this on is
+	// handing out minutes where the link would have lived hours, so it is said
+	// out loud rather than left to be discovered by whoever cannot open it.
+	if grant, ok := linkValidity(resolved); ok {
+		if grant < 30*time.Minute {
+			fs.Logf(f, "Public Link: the address handed out carries a %v grant, shorter than the link it redirects from; a recipient has to finish inside that window", grant.Round(time.Second))
+		}
+	}
 	return resolved, nil
+}
+
+// linkValidity reports how long a presigned storage URL stays valid, when its
+// query says so.
+func linkValidity(raw string) (time.Duration, bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return 0, false
+	}
+	q := u.Query()
+	secs, err := strconv.ParseInt(q.Get("X-Amz-Expires"), 10, 64)
+	if err != nil || secs <= 0 {
+		return 0, false
+	}
+	// The clock starts when the URL was signed, not when it was read, so the
+	// signing time is taken off when it is there.
+	if signedAt, err := time.Parse("20060102T150405Z", q.Get("X-Amz-Date")); err == nil {
+		return signedAt.Add(time.Duration(secs) * time.Second).Sub(time.Now()), true
+	}
+	return time.Duration(secs) * time.Second, true
+}
+
+// maxLinkRedirects bounds how far the one redirect is followed. The drive uses
+// a single hop; more than a few is a redirect loop, and the chain it would build
+// is not worth following.
+const maxLinkRedirects = 5
+
+// linkRefusedError says the drive's own link answered badly, rather than the
+// storage address behind it.
+//
+// The two failures mean different things to the caller: the link itself is dead
+// in the first case, and still fine for anything that follows redirects in the
+// second.
+type linkRefusedError struct {
+	status int
+}
+
+func (e *linkRefusedError) Error() string {
+	return fmt.Sprintf("cloud189: the download link answered HTTP %d", e.status)
 }
 
 // storageURL follows a download link once and reports the address the bytes
@@ -4253,13 +4321,41 @@ func (f *Fs) storageURL(ctx context.Context, link string) (string, error) {
 	}
 	req.Header.Set("Range", "bytes=0-0")
 	req.Header.Set("user-agent", dartUserAgent)
-	res, err := f.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("cloud189: resolving the download link: %w", scrubErr(err, link))
+
+	// Every address on the way is a secret, and Go quotes the one it failed on.
+	// After a redirect that is the last address, not the one asked for: the
+	// storage URL with its own signature in the query, which the single-secret
+	// form of scrubErr would leave in place. The chain is collected so all of it
+	// can be taken out of the message.
+	chain := []string{link}
+	client := *f.httpClient
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		chain = append(chain, req.URL.String())
+		if len(via) >= maxLinkRedirects {
+			return fmt.Errorf("cloud189: the download link redirected more than %d times", maxLinkRedirects)
+		}
+		return nil
 	}
-	defer func() { _ = res.Body.Close() }()
+	res, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("cloud189: resolving the download link: %w", scrubErr(err, chain...))
+	}
+	defer func() {
+		// A byte was asked for, so the rest is short. It is dropped rather than
+		// abandoned so the connection can go back to the pool - capped, because
+		// a server that ignores Range would otherwise turn this into the full
+		// download the range was there to avoid.
+		_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 64<<10))
+		_ = res.Body.Close()
+	}()
 	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusPartialContent {
-		return "", fmt.Errorf("cloud189: the download link answered HTTP %d", res.StatusCode)
+		if len(chain) == 1 {
+			// No redirect happened, so it was the drive's own endpoint that
+			// refused. The link is dead and handing it back would be worse than
+			// the error.
+			return "", &linkRefusedError{status: res.StatusCode}
+		}
+		return "", fmt.Errorf("cloud189: the storage address answered HTTP %d", res.StatusCode)
 	}
 	return res.Request.URL.String(), nil
 }
