@@ -108,18 +108,36 @@ type fakeDrive struct {
 	listingFn       func(r *http.Request) string // a drive whose contents change as the test goes
 	taskStates      []int64                      // the taskStatus values the polls answer, in order
 	taskSubs        int                          // object count of the task the next task poll answers
+	// deleteTaskFailures is the failedCount of each successive DELETE task; a task
+	// past the end of it succeeds. A non-zero one is answered the way the drive
+	// answers a delete it will not explain: failedCount set, errorCode absent.
+	deleteTaskFailures []int64
+	// deleteTaskSkips is the same queue for skipCount, which is what a task
+	// answers when the objects are already gone.
+	deleteTaskSkips []int64
+	taskSeq         int
+	taskFail        map[string]int64
+	taskSkip        map[string]int64
 
 	// The download link and the storage layer on the way down.
-	downloadLink string            // what getFileDownloadUrl answers; empty means the escaped link below
-	downloadHits int               // how many times a link was minted
-	readStatus   []int             // status for each successive read; shorter than the reads means 200
-	readBody     []byte            // bytes served on a read, default a short constant
-	readQueries  []string          // the query each read actually arrived with
-	readRanges   []string          // the Range header each read arrived with
-	readCut      []int64           // bytes to send while announcing the whole body, for each read
-	folders      map[string]string // directory name to id, for a createFolder
-	mkdirs       []string          // the directory names the drive was asked to create
-	mkdirQueries []url.Values      // the query each createFolder arrived with
+	downloadLink string // what getFileDownloadUrl answers; empty means the escaped link below
+	downloadHits int    // how many times a link was minted
+	// linkRedirect is the path (with query) that the link's own address 302s to.
+	// Set, it makes the storage host answer elsewhere, the way download.cloud.189.cn
+	// redirects to a presigned OBS URL (measured 2026-10-27).
+	linkRedirect string
+	// linkRedirectAbs is a whole address the link 302s to, for the case where
+	// nothing answers at the far end. The transport then quotes the address it
+	// was redirected to, not the one it started from.
+	linkRedirectAbs string
+	readStatus      []int             // status for each successive read; shorter than the reads means 200
+	readBody        []byte            // bytes served on a read, default a short constant
+	readQueries     []string          // the query each read actually arrived with
+	readRanges      []string          // the Range header each read arrived with
+	readCut         []int64           // bytes to send while announcing the whole body, for each read
+	folders         map[string]string // directory name to id, for a createFolder
+	mkdirs          []string          // the directory names the drive was asked to create
+	mkdirQueries    []url.Values      // the query each createFolder arrived with
 
 	// The account's own numbers. Left at zero the gates find nothing to gate on,
 	// which is what a drive that did not answer looks like to the code.
@@ -390,6 +408,26 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.createKeys = append(d.createKeys, r.Header.Get("sessionkey"))
 		// A task of several objects reports several done, the way the drive does.
 		d.taskSubs = len(infos)
+		// Every task gets its own id, so a test can tell a resend from the task
+		// it repeats - and so the poll can answer this task and not that one.
+		d.taskSeq++
+		taskID := fmt.Sprintf("9000000000000000%02d", d.taskSeq)
+		if q.Get("type") == taskDelete {
+			if len(d.deleteTaskFailures) > 0 {
+				if d.taskFail == nil {
+					d.taskFail = map[string]int64{}
+				}
+				d.taskFail[taskID] = d.deleteTaskFailures[0]
+				d.deleteTaskFailures = d.deleteTaskFailures[1:]
+			}
+			if len(d.deleteTaskSkips) > 0 {
+				if d.taskSkip == nil {
+					d.taskSkip = map[string]int64{}
+				}
+				d.taskSkip[taskID] = d.deleteTaskSkips[0]
+				d.deleteTaskSkips = d.deleteTaskSkips[1:]
+			}
+		}
 		d.mu.Unlock()
 		if len(q.Get("taskInfos")) == 0 {
 			t.Errorf("the task sent no taskInfos")
@@ -410,7 +448,7 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		default:
 			t.Errorf("unexpected task type %q", q.Get("type"))
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"res_code": 0, "taskId": "900000000000000005"})
+		writeJSON(w, http.StatusOK, map[string]any{"res_code": 0, "taskId": taskID})
 
 	case "/batch/checkBatchTask.action":
 		q, err := url.ParseQuery(string(bodyBytes))
@@ -432,13 +470,15 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			d.taskStates = d.taskStates[1:]
 		}
 		subs := d.taskSubs
+		failed := d.taskFail[q.Get("taskId")]
+		skipped := d.taskSkip[q.Get("taskId")]
 		d.mu.Unlock()
 		st := map[string]any{
 			"res_code": 0, "res_message": "成功", "taskStatus": state,
-			"failedCount": 0, "skipCount": 0, "subTaskCount": subs,
+			"failedCount": failed, "skipCount": skipped, "subTaskCount": subs,
 		}
 		if state == taskStateDone {
-			st["successedCount"] = subs
+			st["successedCount"] = int64(subs) - failed - skipped
 		}
 		writeJSON(w, http.StatusOK, st)
 
@@ -499,12 +539,15 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		d.mu.Lock()
 		d.downloadHits++
+		mint := d.downloadHits
 		d.mu.Unlock()
 		link := d.downloadLink
 		if link == "" {
 			// Escaped exactly as the family endpoint writes it (captured
 			// 2026-10-22): the ampersands inside the query arrive as &amp;.
-			link = "http://" + r.Host + "/store/file?fileId=" + fileID + "&a=1&amp;sig=LIVE-SIGNATURE-VALUE"
+			// The mint number makes each answer a different string, so a test
+			// can tell a freshly asked-for link from one that was kept.
+			link = "http://" + r.Host + "/store/file?fileId=" + fileID + "&a=1&amp;sig=LIVE-SIGNATURE-VALUE&amp;mint=" + strconv.Itoa(mint)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"fileDownloadUrl": link})
 
@@ -559,22 +602,40 @@ func (d *fakeDrive) storeRead(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, map[string]any{"Error": "AccessDenied", "RequestPath": r.URL.String()})
 		return
 	}
+	if r.URL.Path == "/store/file" && d.linkRedirectAbs != "" {
+		// The far end of the redirect is somewhere nothing listens, so the
+		// transport fails on the address the redirect named.
+		w.Header().Set("Location", d.linkRedirectAbs)
+		w.WriteHeader(http.StatusFound)
+		return
+	}
+	if r.URL.Path == "/store/file" && d.linkRedirect != "" {
+		// The drive's own download endpoint is a redirector, not the bytes.
+		w.Header().Set("Location", "http://"+r.Host+d.linkRedirect)
+		w.WriteHeader(http.StatusFound)
+		return
+	}
 	if body == nil {
 		body = []byte("downloaded-bytes")
 	}
 	// A Range header is honoured the way the storage host honours it: 206 with
-	// the rest of the object.
+	// exactly the window asked for, clipped at the end of the object.
 	payload := body
 	status = http.StatusOK
 	if rng := r.Header.Get("Range"); strings.HasPrefix(rng, "bytes=") && len(body) > 0 {
-		spec := strings.TrimSuffix(strings.TrimPrefix(rng, "bytes="), "-")
+		spec := strings.TrimPrefix(rng, "bytes=")
+		startText, endText := spec, ""
 		if i := strings.IndexByte(spec, '-'); i >= 0 {
-			spec = spec[:i]
+			startText, endText = spec[:i], spec[i+1:]
 		}
-		if start, err := strconv.ParseInt(spec, 10, 64); err == nil && start >= 0 && start <= int64(len(body)) {
-			payload = body[start:]
+		if start, err := strconv.ParseInt(startText, 10, 64); err == nil && start >= 0 && start <= int64(len(body)) {
+			stop := int64(len(body))
+			if end, err := strconv.ParseInt(endText, 10, 64); err == nil && end >= start && end < int64(len(body)) {
+				stop = end + 1
+			}
+			payload = body[start:stop]
 			status = http.StatusPartialContent
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(body)-1, len(body)))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, stop-1, len(body)))
 		}
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(payload)))

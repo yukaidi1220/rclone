@@ -259,9 +259,14 @@ through (`POST /file/url`, with the site's `download_host` rewrite applied), min
 for that call rather than reused from the read cache. No share and no stored direct
 link is created: it is a signed URL, so anyone holding it can download until the
 site's own expiry passes, and it cannot be revoked early. `--expire` has no effect
-for the same reason, and `--unlink` is ignored, as rclone asks for a backend that
-has no stored link to remove. A folder has no such URL - the site only hands out
-entity URLs for files - so asking for one is reported as unsupported.
+for the same reason. A folder has no such URL - the site only hands out entity URLs
+for files - so asking for one is reported as unsupported.
+
+`--unlink` removes **stored direct links**, which an earlier version of this backend
+created through `PUT /file/source`. Nothing creates them any more, but the site keeps
+serving every one of them as a permanent public URL until it is deleted, so `--unlink`
+is the way to take one back, and it prints no link. A file with none stored is already
+in the wanted state and is not an error.
 
 ### Interrupted uploads
 
