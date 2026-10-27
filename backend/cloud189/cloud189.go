@@ -4186,6 +4186,41 @@ func (o *Object) invalidateURL() {
 	o.urlMu.Unlock()
 }
 
+// PublicLink returns a direct download link for the file at remote.
+//
+// The link is minted fresh and never taken from the download-URL cache, so the
+// holder gets the whole lifetime the drive granted, not what is left of a
+// window rclone was already part way through.
+//
+// getFileDownloadUrl.action takes no expiry parameter, so the client cannot
+// choose how long a link lives. Measured 2026-10-22 a personal-space link is
+// valid for about 5 minutes from issue and a family one about 10 hours, so a
+// requested expiry is ignored with a warning and the reader has to finish
+// inside the window the drive chose. unlink is ignored too: nothing was ever
+// stored on the drive, so there is no share to revoke.
+//
+// Directories cannot be linked and return fs.ErrorCantShareDirectories.
+func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
+	if strings.HasSuffix(remote, "/") {
+		return "", fs.ErrorCantShareDirectories
+	}
+	obj, err := f.NewObject(ctx, remote)
+	if err != nil {
+		if err == fs.ErrorIsDir {
+			return "", fs.ErrorCantShareDirectories
+		}
+		return "", err
+	}
+	o := obj.(*Object)
+	if expire.IsSet() {
+		fs.Logf(f, "Public Link: cloud189 does not let the client choose how long a download link lives, ignoring the requested expiry of %v", expire)
+	}
+	// The uncached path: a link handed to someone else should not be shortened
+	// by whatever is left of rclone's own window.
+	link, _, err := f.downloadURL(ctx, o.id)
+	return link, err
+}
+
 // ------------------------------------------------------------ object info --
 
 // Fs returns the parent Fs
