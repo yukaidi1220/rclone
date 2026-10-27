@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1788,12 +1789,12 @@ func TestADeleteTaskThatFailsWithNoReasonIsSentAgain(t *testing.T) {
 	require.Equal(t, drive.tasks[0].infos, drive.tasks[1].infos, "the same targets, unchanged")
 }
 
-// TestADeleteStillFailingWithNoReasonIsReportedWhenTheObjectRemains: the resend is
-// the whole of the tolerance. If the second task fails the same way and the object
-// is still listed, this stays a failure - a delete that did not happen is not
-// something to report as done.
+// TestADeleteStillFailingWithNoReasonIsReportedWhenTheObjectRemains: the two
+// resends are the whole of the tolerance. If every send fails the same way and the
+// object is still listed, this stays a failure - a delete that did not happen is
+// not something to report as done.
 func TestADeleteStillFailingWithNoReasonIsReportedWhenTheObjectRemains(t *testing.T) {
-	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1}}
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}}
 	f := newFakeFs(t, drive)
 	drive.listingFn = func(*http.Request) string {
 		return listingJSON([]string{fileJSON("6000000000000000006", "clip-01.mp4", rootID)}, nil)
@@ -1803,20 +1804,110 @@ func TestADeleteStillFailingWithNoReasonIsReportedWhenTheObjectRemains(t *testin
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "the server gave no reason")
 	require.True(t, fserrors.IsNoRetryError(err), "and it is still not worth a second pass over the file")
-	require.Len(t, drive.tasks, 2, "one resend, and no more")
+	require.Len(t, drive.tasks, 3, "both resends, and no more")
 }
 
-// TestADeleteTaskThatFailedAfterDoingTheWorkIsTakenAsDone covers the mirror case:
-// the drive closed the task as failed and the listing no longer holds the object,
-// so reporting a failure would be the one answer that cannot be taken back.
-func TestADeleteTaskThatFailedAfterDoingTheWorkIsTakenAsDone(t *testing.T) {
+// TestADeleteStillRefusedAfterTheFirstResendIsSentAgainAndClears is what the
+// second resend is for. What was measured (2026-10-28, six passes with a tolerance
+// of one) is that 16 of 63 refused tasks came back refused from the first resend
+// too, and that those 16 were cleared by a later pass of rclone's rather than by
+// anything the backend sent inside the failed one - see the deleteTaskResends
+// comment. A refused delete never works itself out while the client waits, so
+// within one pass the answer is to send again; how many sends one pass needs is a
+// number that has not been measured.
+func TestADeleteStillRefusedAfterTheFirstResendIsSentAgainAndClears(t *testing.T) {
 	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1}}
 	f := newFakeFs(t, drive)
-	drive.listingFn = func(*http.Request) string { return emptyListing() }
+	drive.listingFn = func(*http.Request) string {
+		return listingJSON([]string{fileJSON("6000000000000000006", "clip-01.mp4", rootID)}, nil)
+	}
+
+	require.NoError(t, srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background()))
+	sent := drivesTasks(drive)
+	require.Len(t, sent, 3, "the object is listed between the sends, so all three are spent")
+	// Every send has to carry the object. Dropping it from the second resend -
+	// which is what a resend that trims its own target list looks like - would
+	// report the delete done having only ever asked once.
+	for i := range sent {
+		require.Len(t, sent[i].infos, 1, "send %d of the chain carries the one target it was created for", i)
+		require.Equal(t, "6000000000000000006", sent[i].infos[0].FileID, "and it is the refused object, every time")
+	}
+}
+
+// TestADeleteThatIsAlreadyGoneIsNotSentAgain is the point of asking the drive
+// before sending anything again: the task said it failed, the listing says the
+// object is not there, so it is done - and no second task is spent on it.
+//
+// The directory has to be shown holding something else. A page that claims nothing
+// at all is not evidence of absence, because it is also exactly what an address the
+// listing endpoint does not know answers with - see
+// TestADeleteWithRootFolderIDNamingTheSpaceRootStillSeesTheObject.
+func TestADeleteThatIsAlreadyGoneIsNotSentAgain(t *testing.T) {
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}}
+	f := newFakeFs(t, drive)
+	drive.listingFn = func(*http.Request) string {
+		return listingJSON([]string{fileJSON("6000000000000000007", "other.mp4", rootID)}, nil)
+	}
 
 	require.NoError(t, srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background()))
 
-	require.Len(t, drive.tasks, 2, "the resend still happened first")
+	require.Len(t, drive.tasks, 1, "the listing already said it is gone")
+}
+
+// TestADeleteOneLookIsNotEnoughToCallItGone pins the agreement rule itself. The
+// first look says the object is not on the drive; the second says it is. A single
+// "gone" must not finalise a delete, because a walk that came back without the row
+// is also what a listing window that moved under it looks like - and a delete
+// reported done while the object is there cannot be taken back.
+func TestADeleteOneLookIsNotEnoughToCallItGone(t *testing.T) {
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}}
+	f := newFakeFs(t, drive)
+	walks := 0
+	drive.listingFn = func(r *http.Request) string {
+		if r.URL.Query().Get("pageNum") != "1" {
+			// the page that ends a walk: nothing new on it
+			return ""
+		}
+		walks++
+		if walks == 1 {
+			return listingJSON([]string{fileJSON("6000000000000000007", "other.mp4", rootID)}, nil)
+		}
+		return listingJSON([]string{
+			fileJSON("6000000000000000006", "clip-01.mp4", rootID),
+			fileJSON("6000000000000000007", "other.mp4", rootID),
+		}, nil)
+	}
+
+	err := srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background())
+	require.Error(t, err, "the second look found it, so the first look's 'gone' decided nothing")
+	require.GreaterOrEqual(t, walks, 2, "both looks were spent")
+	require.Len(t, drivesTasks(drive), 3, "the resend was owed, and the resend of that")
+}
+
+// TestADeleteThatSkippedIsSettledByTheListing: a skip is another answer that says
+// nothing about whether the object is on the drive. The first look says it is
+// still there, so it goes back once; the repeat is skipped and the second look
+// finds it gone.
+func TestADeleteThatSkippedIsSettledByTheListing(t *testing.T) {
+	drive := &fakeDrive{t: t,
+		deleteTaskFailures: []int64{1, 0},
+		deleteTaskSkips:    []int64{0, 1},
+	}
+	f := newFakeFs(t, drive)
+	// The object is on the drive for as long as only the first task has been sent,
+	// and off it once the repeat is in: the first look therefore owes a resend, and
+	// the second one settles it as done.
+	drive.listingFn = func(*http.Request) string {
+		if len(drivesTasks(drive)) < 2 {
+			return listingJSON([]string{fileJSON("6000000000000000006", "clip-01.mp4", rootID)}, nil)
+		}
+		// gone, and shown so: the directory still holds another object, so the
+		// page is a real answer and not a nothing-claims page
+		return listingJSON([]string{fileJSON("6000000000000000007", "other.mp4", rootID)}, nil)
+	}
+
+	require.NoError(t, srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background()))
+	require.Len(t, drive.tasks, 2, "the first look said still there, so the resend was owed")
 }
 
 // TestADeleteTaskThatFailsOnOneOfTwoObjectsIsNotTakenAsDone: the listing check asks
@@ -1825,7 +1916,7 @@ func TestADeleteTaskThatFailedAfterDoingTheWorkIsTakenAsDone(t *testing.T) {
 // the list, so a check that stopped at the first absent target would call this a
 // success while an object is still on the drive.
 func TestADeleteTaskThatFailsOnOneOfTwoObjectsIsNotTakenAsDone(t *testing.T) {
-	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1}}
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}}
 	f := newFakeFs(t, drive)
 	// The first walk is the purge's own listing and holds both objects; every walk
 	// after it is a check, and answers with the survivor only. The check runs more
@@ -1846,36 +1937,21 @@ func TestADeleteTaskThatFailsOnOneOfTwoObjectsIsNotTakenAsDone(t *testing.T) {
 	err := f.Purge(context.Background(), "")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "the server gave no reason")
-	require.Len(t, drive.tasks, 2, "the resend still happened first")
+	require.Len(t, drive.tasks, 3, "one task and two resends, and no more")
 }
 
 // TestADeleteCheckMatchesTheIdNotTheName: the object deleted was the one the task
 // was given. A listing that has the name back on a different id means ours is gone,
 // and asking by name would report a leftover that is not the one aimed at.
 func TestADeleteCheckMatchesTheIdNotTheName(t *testing.T) {
-	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1}}
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}}
 	f := newFakeFs(t, drive)
 	drive.listingFn = func(*http.Request) string {
 		return listingJSON([]string{fileJSON("6000000000000000009", "clip-01.mp4", rootID)}, nil)
 	}
 
 	require.NoError(t, srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background()))
-	require.Len(t, drive.tasks, 2)
-}
-
-// TestADeleteTaskThatSkipsAfterTheWorkWasDoneIsTakenAsDone: the resend of a delete
-// whose objects are already gone can come back as skipped rather than failed. The
-// drive is asked either way, and an object that is not there is not a leftover.
-func TestADeleteTaskThatSkipsAfterTheWorkWasDoneIsTakenAsDone(t *testing.T) {
-	drive := &fakeDrive{t: t,
-		deleteTaskFailures: []int64{1, 0},
-		deleteTaskSkips:    []int64{0, 1},
-	}
-	f := newFakeFs(t, drive)
-	drive.listingFn = func(*http.Request) string { return emptyListing() }
-
-	require.NoError(t, srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background()))
-	require.Len(t, drive.tasks, 2, "the resend happened, and the skip did not end the story")
+	require.Len(t, drive.tasks, 1, "ours is gone; a different object holding the name does not owe a second task")
 }
 
 // TestADeleteAtTheFamilyRootIsNotTakenAsDoneWhileTheObjectIsThere is the measured
@@ -1884,11 +1960,14 @@ func TestADeleteTaskThatSkipsAfterTheWorkWasDoneIsTakenAsDone(t *testing.T) {
 // listing would read a full drive as empty and report a delete that never
 // happened - so the check has to name the alias, the way every other listing does.
 func TestADeleteAtTheFamilyRootIsNotTakenAsDoneWhileTheObjectIsThere(t *testing.T) {
-	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1}}
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}}
 	f := newFakeFs(t, drive)
 	f.opt.Space = spaceFamily
 	f.familyID = famID
 	f.familyRootID = famRoot
+	// discoverFamilyRoot writes both: the anchor bodies name, and the space root
+	// whose listing has to be addressed by the alias.
+	f.familySpaceRoot = famRoot
 	f.dirCache = dircache.New("", famRoot, f)
 	drive.listingFn = func(r *http.Request) string {
 		if r.URL.Query().Get("folderId") == famRoot {
@@ -1903,24 +1982,25 @@ func TestADeleteAtTheFamilyRootIsNotTakenAsDoneWhileTheObjectIsThere(t *testing.
 	require.Contains(t, err.Error(), "the server gave no reason")
 }
 
-// TestADeleteTheListingIsSlowToDropIsTakenAsDone: the drive keeps answering a
-// deleted row for about a second after the task reports done, so a check that
-// believed its first look would call a finished delete a failure. The row is shown
-// once and gone after that.
-func TestADeleteTheListingIsSlowToDropIsTakenAsDone(t *testing.T) {
-	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1}}
+// TestADeleteOneEmptyPageIsNotEnough: an empty listing is also what a truncated
+// walk looks like, so a single "gone" answer must not settle a delete. The drive
+// answers the object, then one empty page, then the object again, and the delete
+// is still a failure at the end of it.
+func TestADeleteOneEmptyPageIsNotEnough(t *testing.T) {
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}}
 	f := newFakeFs(t, drive)
-	walks := 0
+	looks := 0
 	drive.listingFn = func(*http.Request) string {
-		walks++
-		if walks == 1 {
-			return listingJSON([]string{fileJSON("6000000000000000006", "clip-01.mp4", rootID)}, nil)
+		looks++
+		if looks == 2 {
+			return emptyListing()
 		}
-		return emptyListing()
+		return listingJSON([]string{fileJSON("6000000000000000006", "clip-01.mp4", rootID)}, nil)
 	}
 
-	require.NoError(t, srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background()))
-	require.Len(t, drivesTasks(drive), 2, "the resend happened, then the slow listing was waited out")
+	err := srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background())
+	require.Error(t, err, "one blank page in the middle of a walk is not proof the object is gone")
+	require.Len(t, drivesTasks(drive), 3, "both resends are owed, and no more")
 }
 
 // drivesTasks reads the tasks a drive was asked to run, under its lock.
@@ -1928,4 +2008,331 @@ func drivesTasks(d *fakeDrive) []taskCall {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return append([]taskCall(nil), d.tasks...)
+}
+
+// TestADeleteUnderARootFolderIDChecksTheDirectoryItWasToldAbout is the trap of
+// having one field serve as both the anchor and the space root: with
+// root_folder_id naming a subdirectory, the anchor is not the drive's top level,
+// so rewriting it to the `0` alias looks in the wrong directory, finds nothing,
+// and reports a live object as deleted.
+func TestADeleteUnderARootFolderIDChecksTheDirectoryItWasToldAbout(t *testing.T) {
+	const (
+		anchor    = "9000000000000055" // where this remote is opened: a subdirectory
+		spaceRoot = "9000000000000066" // the drive's own top level, read off a listing
+		liveID    = "9000000000000077"
+	)
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}}
+	f := newFakeFs(t, drive)
+	f.opt.Space = spaceFamily
+	f.opt.RootFolderID = anchor
+	f.familyID = famID
+	f.familyRootID = anchor
+	f.familySpaceRoot = spaceRoot
+	f.dirCache = dircache.New("", anchor, f)
+	drive.listingFn = func(r *http.Request) string {
+		if r.URL.Query().Get("folderId") != anchor {
+			// the space root, which holds other things and not this object
+			return listingJSON([]string{fileJSON("9000000000000088", "elsewhere.mp4", spaceRoot)}, nil)
+		}
+		return listingJSON([]string{fileJSON(liveID, "clip-01.mp4", anchor)}, nil)
+	}
+
+	err := srcObject(f, "clip-01.mp4", liveID).Remove(context.Background())
+	require.Error(t, err, "the object is in the directory this remote is opened at, and it is still there")
+	folders := driveFolders(drive)
+	require.NotEmpty(t, folders)
+	for _, got := range folders {
+		require.Equal(t, anchor, got, "the check has to name the directory the row came from, never the alias")
+	}
+}
+
+// TestADeleteWithRootFolderIDNamingTheSpaceRootStillSeesTheObject is the shape the
+// option's own help recommends - space=family with root_folder_id set to the drive's
+// real root id - and the reason rootID() now asks for the space root even then.
+// Without that, familySpaceRoot stays empty, the absence check addresses the number
+// directly, and the family endpoint answers a number with an empty page and no error
+// (measured 2026-10-22). An empty page that claims nothing is a complete walk, so
+// the check would conclude "gone" from a directory it never read and report a
+// surviving object as deleted.
+func TestADeleteWithRootFolderIDNamingTheSpaceRootStillSeesTheObject(t *testing.T) {
+	const liveID = "9000000000000099"
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}}
+	f := newFakeFs(t, drive)
+	f.opt.Space = spaceFamily
+	f.opt.RootFolderID = famRoot // the drive's own top level, named as a number
+	f.familyID = famID
+	f.familyRootID = famRoot
+	// familySpaceRoot is deliberately left empty: that is what NewFs hands over
+	// when root_folder_id is set, and rootID() has to fill it in.
+	f.dirCache = dircache.New("", famRoot, f)
+	drive.listingFn = func(r *http.Request) string {
+		if r.URL.Query().Get("folderId") == famRoot {
+			// measured: the numeric root answers nothing at all, and no error
+			return emptyListing()
+		}
+		// the alias, or the omitted folderId that means the same thing
+		return listingJSON([]string{fileJSON(liveID, "clip-01.mp4", famRoot)}, nil)
+	}
+
+	err := srcObject(f, "clip-01.mp4", liveID).Remove(context.Background())
+	require.Error(t, err, "the object is on the drive; an address that answers nothing must not read as absent")
+	require.Contains(t, err.Error(), "the server gave no reason")
+	// The empty page is addressed at the number, and the number is what the check
+	// would use without the alias translation; assert which addresses were asked
+	// for so a regression cannot quietly go back to reading the number.
+	for _, got := range driveFolders(drive) {
+		require.NotEqual(t, "", got, "the walk has to name the parent it looked at")
+	}
+}
+
+// TestRootIDLearnsTheFamilySpaceRootEvenUnderARootFolderID is the other half of the
+// same fix: rootID() returns what the user named, but must still have read the
+// drive's own top level, because that is the id listDirID translates back to the
+// alias. Without it a remote opened at the top level of a family drive has an
+// absence check that addresses a number the listing endpoint does not answer.
+func TestRootIDLearnsTheFamilySpaceRootEvenUnderARootFolderID(t *testing.T) {
+	drive := &fakeDrive{t: t}
+	f := newFakeFs(t, drive)
+	f.opt.Space = spaceFamily
+	f.opt.RootFolderID = famRoot
+	f.familyID = famID
+	f.familyRootID = famRoot
+	drive.listingFn = func(r *http.Request) string {
+		if r.URL.Query().Get("folderId") == famRoot {
+			return emptyListing()
+		}
+		return listingJSON([]string{fileJSON("9000000000000055", "clip-01.mp4", famRoot)}, nil)
+	}
+
+	got, err := f.rootID(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, famRoot, got, "what the user named is still what the remote is opened at")
+	require.Equal(t, famRoot, f.familySpaceRoot, "and the drive's own top level is now known for the translation")
+	require.Equal(t, familyRootAlias, f.listDirID(famRoot), "so a listing of it is addressed by the alias")
+}
+
+// rowRange builds a directory of count other objects with ids that never collide
+// with the test object's.
+func rowRange(count int) []string {
+	rows := make([]string, 0, count)
+	for i := 1; i <= count; i++ {
+		rows = append(rows, fileJSON(fmt.Sprintf("700000000000000%04d", i), fmt.Sprintf("o%04d.mp4", i), rootID))
+	}
+	return rows
+}
+
+// TestADeleteOnTheSecondPageIsFoundByAWalkThatPages is the positive control for
+// paging: the directory holds 250 objects and ours is the last of them, so it is
+// only reachable on page two. Before the fixture could page, no case in this
+// package could express "the row is past the first page" at all - which is the
+// hole the truncated-walk bug fell through.
+func TestADeleteOnTheSecondPageIsFoundByAWalkThatPages(t *testing.T) {
+	rows := append(rowRange(249), fileJSON("6000000000000000006", "clip-01.mp4", rootID))
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}, pagedRows: rows}
+	f := newFakeFs(t, drive)
+
+	err := srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background())
+	require.Error(t, err, "it is on page two of the listing, so it is still on the drive")
+	require.Len(t, drivesTasks(drive), 3, "and it was resent, twice, as a leftover should be")
+}
+
+// TestADeleteAWalkCutShortByItsPageBudgetIsNotTakenAsGone is the safety half: the
+// object genuinely is gone, the directory holds 250 others, and the walk is
+// allowed one page. Not being allowed to read the rest is not evidence of
+// absence, so the delete may not be called done from it - the cost of that rule
+// is a resend, and the cost of not having it is reporting a leftover as deleted.
+func TestADeleteAWalkCutShortByItsPageBudgetIsNotTakenAsGone(t *testing.T) {
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}, pagedRows: rowRange(250)}
+	f := newFakeFs(t, drive)
+	old := deleteVerifyPages
+	deleteVerifyPages = 1
+	t.Cleanup(func() { deleteVerifyPages = old })
+
+	err := srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background())
+	require.Error(t, err, "a walk that was cut off after one page cannot certify an absence")
+	require.Len(t, drivesTasks(drive), 3, "the undecidable answer still owes the resends")
+}
+
+// TestADeleteResendsOnlyWhatTheDriveDidNotHandle is the big-purge shape: one task
+// of nine objects, one of them refused. The task names the eight it handled in
+// successedFileIdList (captured 2026-10-22: DELETE answers it), so the repeat has
+// to carry the ninth alone - sending all nine again repeats work the drive already
+// did, and the first version of this backend did exactly that.
+func TestADeleteResendsOnlyWhatTheDriveDidNotHandle(t *testing.T) {
+	var rows []string
+	var ids []string
+	for i := 1; i <= 9; i++ {
+		id := fmt.Sprintf("70000000000000001%02d", i)
+		ids = append(ids, id)
+		rows = append(rows, fileJSON(id, fmt.Sprintf("f%02d.mp4", i), rootID))
+	}
+	drive := &fakeDrive{t: t,
+		deleteTaskFailures: []int64{1, 0},
+		// The first task says which eight it finished with.
+		deleteTaskHandled: [][]string{ids[:8]},
+	}
+	f := newFakeFs(t, drive)
+	drive.listingFn = func(*http.Request) string { return listingJSON(rows, nil) }
+
+	require.NoError(t, f.Purge(context.Background(), ""), "the resend finished the one object the first task did not handle")
+
+	sent := drivesTasks(drive)
+	require.Len(t, sent, 2, "the first task and one resend")
+	require.Len(t, sent[0].infos, 9, "the purge sent all nine at once")
+	require.Len(t, sent[1].infos, 1, "the resend carries only the object the drive did not handle")
+	require.Equal(t, ids[8], sent[1].infos[0].FileID, "and it is the ninth")
+}
+
+// TestADeleteAnIncompleteWalkIsNotReadAsGone is the false-success axis the whole
+// absence check hangs on: the drive says a page carries 400 rows while giving 200
+// of them, so the walk that "found nothing" did not look at everything. Concluding
+// "gone" from that reports a leftover as deleted, which is the one answer that
+// cannot be taken back - so the target stays outstanding and the delete is
+// reported as a failure.
+func TestADeleteAnIncompleteWalkIsNotReadAsGone(t *testing.T) {
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}}
+	f := newFakeFs(t, drive)
+	drive.listingFn = func(*http.Request) string {
+		// count 400, rows on this page 1: the walk cannot be read as complete.
+		return `{"res_code":0,"fileListAO":{"count":400,"fileList": [` +
+			fileJSON("6000000000000000007", "other.mp4", rootID) + `],"folderList": []}}`
+	}
+
+	err := srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background())
+	require.Error(t, err, "a walk that did not reach the drive's own total cannot say the object is gone")
+	require.Contains(t, err.Error(), "the server gave no reason")
+	require.Len(t, drivesTasks(drive), 3, "the unproven absence still owes the resends")
+}
+
+// TestADeleteRefusedWithAReasonIsNotSentAgain: a drive that did give a reason -
+// here the day's flow being spent - is telling the client something a repeat
+// cannot fix, so the resend is not spent on it.
+func TestADeleteRefusedWithAReasonIsNotSentAgain(t *testing.T) {
+	drive := &fakeDrive{t: t,
+		deleteTaskFailures: []int64{1},
+		deleteTaskCodes:    []string{"DayFlowOver"},
+	}
+	f := newFakeFs(t, drive)
+	drive.listingFn = func(*http.Request) string {
+		return listingJSON([]string{fileJSON("6000000000000000006", "clip-01.mp4", rootID)}, nil)
+	}
+
+	err := srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background())
+	require.Error(t, err)
+	require.Len(t, drivesTasks(drive), 1, "a refusal with a reason is not worth a second task")
+}
+
+// TestADeleteTheListingCannotAnswerIsNotTakenAsDone: an undecidable listing must
+// not become a success. The resend still happens, and the object still comes back
+// as a failure.
+func TestADeleteTheListingCannotAnswerIsNotTakenAsDone(t *testing.T) {
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}, listFailTimes: 20}
+	f := newFakeFs(t, drive)
+	drive.listingFn = func(*http.Request) string {
+		return listingJSON([]string{fileJSON("6000000000000000006", "clip-01.mp4", rootID)}, nil)
+	}
+
+	err := srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background())
+	require.Error(t, err, "the listing refused to say, so nothing was concluded from it")
+	require.Len(t, drivesTasks(drive), 3, "the measured cure is owed twice")
+}
+
+// TestADeleteEvidenceWindowReachesPastTheLagItDistrusts is the one place the
+// spacing of the looks is written down as a requirement rather than as four
+// unrelated numbers. The absence check spans (looks-1)*wait between its first and
+// last look; the same package distrusts a listing that was still stale seven
+// seconds after the mutation landed (deletedRowWindow, and the capture of
+// 2026-10-22 it comes from). A window that stops inside that period asks the
+// question five times while the drive has not yet answered it.
+func TestADeleteEvidenceWindowReachesPastTheLagItDistrusts(t *testing.T) {
+	require.Equal(t, 5, deleteVerifyLooks, "five looks")
+	require.Equal(t, 2*time.Second, deleteVerifyWait, "two seconds apart")
+	window := time.Duration(deleteVerifyLooks-1) * deleteVerifyWait
+	require.GreaterOrEqual(t, window, 8*time.Second,
+		"the last look has to fall after the seven seconds the stale-row window allows, not inside it")
+}
+
+// TestADeleteLooksThatRunOutAreNotTakenAsGone covers the end of the look loop.
+// Here every look says the object is missing, so the answer never gets the two
+// agreements it asks for and the looks simply run out. That is not evidence of an
+// absence: the targets have to stay outstanding, which costs a resend and, when
+// the resends run out too, a reported failure.
+func TestADeleteLooksThatRunOutAreNotTakenAsGone(t *testing.T) {
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}}
+	f := newFakeFs(t, drive)
+	drive.listingFn = func(*http.Request) string {
+		return listingJSON([]string{fileJSON("6000000000000000007", "other.mp4", rootID)}, nil)
+	}
+	oldAgree, oldLooks := deleteVerifyAgree, deleteVerifyLooks
+	deleteVerifyAgree, deleteVerifyLooks = 3, 2
+	t.Cleanup(func() {
+		deleteVerifyAgree, deleteVerifyLooks = oldAgree, oldLooks
+	})
+
+	err := srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background())
+	require.Error(t, err, "the looks ran out before they agreed, which settles nothing")
+	require.Len(t, drivesTasks(drive), 3, "and the undecidable answer still owes the resends")
+}
+
+// TestADeleteOneRefusedChainSpendsTheListingOncePerParentPerLook is the cost
+// contract. The directory holds 450 rows, which pages as 200+200+50, and a purge
+// of it is one task of all 450 targets. Asking the drive which of those are still
+// on the drive is answered by reading the directory once, not 450 times, because
+// the walk groups every target under its parent - so what this chain may spend is
+// the purge's own read of the directory plus one look. A check that asked per
+// target, or a look that kept going after it had the answer, moves that number.
+func TestADeleteOneRefusedChainSpendsTheListingOncePerParentPerLook(t *testing.T) {
+	var rows []string
+	for i := 1; i <= 450; i++ {
+		rows = append(rows, fileJSON(fmt.Sprintf("710000000000000%04d", i), fmt.Sprintf("g%03d.mp4", i), rootID))
+	}
+	drive := &fakeDrive{t: t,
+		deleteTaskFailures: []int64{1, 0},
+		pagedRows:          rows,
+	}
+	f := newFakeFs(t, drive)
+
+	require.NoError(t, f.Purge(context.Background(), ""), "the resend finished what the first task refused")
+
+	sent := drivesTasks(drive)
+	require.Equal(t, 2, len(sent), "one refusal, one resend, and the resend is answered clean")
+	require.Equal(t, 450, len(sent[0].infos), "the purge sends the whole directory as one task")
+	require.Equal(t, 7, len(driveFolders(drive)),
+		"four requests read the directory for the purge (three pages and the empty one that ends it) "+
+			"and three read it once for the look that answers all 450 targets together - not 450 walks")
+}
+
+// TestADeleteEvidenceReportsOnlyWhatItCounted pins the wording the resend line
+// quotes. The review caught the log saying "the 2 target(s) are still on the
+// drive" when the walk had stopped at the first hit and the second object was
+// already gone - and that line is the only record an operator has of what the
+// evidence pass concluded, so the number in it has to be what the drive was
+// actually shown.
+func TestADeleteEvidenceReportsOnlyWhatItCounted(t *testing.T) {
+	drive := &fakeDrive{t: t}
+	f := newFakeFs(t, drive)
+	drive.listingFn = func(*http.Request) string {
+		return listingJSON([]string{fileJSON("6000000000000000006", "clip-01.mp4", rootID)}, nil)
+	}
+	parent, err := strconv.ParseInt(rootID, 10, 64)
+	require.NoError(t, err)
+	targets := []taskInfo{
+		{FileID: "6000000000000000006", FileName: "clip-01.mp4", ParentID: &parent},
+		{FileID: "6000000000000000007", FileName: "gone.mp4", ParentID: &parent},
+	}
+	st := &taskStatusResponse{TaskStatus: taskStateDone, FailedCount: 1, SubTaskCount: 2}
+
+	still, why, err := f.deleteEvidenceOnce(context.Background(), targets, st)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(still), "only the object the drive still lists is outstanding")
+	require.Equal(t, "6000000000000000006", still[0].FileID, "and it is the one that is on the drive")
+	require.Equal(t, "1 of the 2 target(s) are still on the drive", why,
+		"the count it reports is what it found, not how many were sent")
+}
+
+// driveFolders copies the folderIds the drive was asked to list, under its lock.
+func driveFolders(d *fakeDrive) []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.listFolders...)
 }

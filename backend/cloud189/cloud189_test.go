@@ -405,3 +405,83 @@ func TestRedactLoginNameKeepsTheLastTwoDigits(t *testing.T) {
 		require.Equal(t, tc.want, redactLoginName(tc.in), "input %q", tc.in)
 	}
 }
+
+// The drive has been measured echoing its own sessionKey back inside an error
+// body (InfoSecurityErrorCode, 2026-10-26), and an error string goes to the log -
+// so a quoted body must keep its shape without keeping its credentials.
+const fixtureSessionKey = "abcdefghij1234567890ABCD" // 24, the length the captures show
+
+func TestAnUnclassifiedErrorBodyNeverCarriesASessionKey(t *testing.T) {
+	// No errorCode, no code, no res_code: this is the shape whose error text IS a
+	// quote of the body ("unexpected answer (HTTP %d): %s"), which is where a key
+	// the drive echoes would travel. A recognised shape is covered by the next
+	// test and prints no body at all.
+	body := []byte(`{"res_message":"boom","sessionKey":"` + fixtureSessionKey + `"}`)
+	err := refuse(http.StatusBadRequest, body)
+	msg := err.Error()
+	require.Contains(t, msg, "unexpected answer", "an answer with no known field is the quoting branch: %q", msg)
+	require.NotContains(t, msg, fixtureSessionKey, "the value must not survive into the error text")
+	require.Contains(t, msg, "sessionKey", "the key name stays, or the log says nothing")
+	require.Contains(t, msg, "<masked len=24>", "and the value is reported by length")
+}
+
+// A classified answer is the shape that actually echoed the key. Its Body field is
+// what a later debug line could print, so it is scrubbed at construction.
+func TestAClassifiedErrorKeepsItsCodeAndMasksTheKeyInItsBody(t *testing.T) {
+	body := []byte(`{"errorCode":"InfoSecurityErrorCode","errorMsg":"security check","sessionKey":"` + fixtureSessionKey + `"}`)
+	err := refuse(http.StatusOK, body)
+	var ae *apiError
+	require.True(t, asAPIError(err, &ae), "an answer carrying errorCode is a known shape: %v", err)
+	require.Equal(t, "InfoSecurityErrorCode", ae.Code)
+	require.NotContains(t, ae.Body, fixtureSessionKey, "the stored body is the one thing that could still leak")
+	require.Contains(t, ae.Body, "<masked len=24>")
+}
+
+func TestAServerErrorResponseIsQuotedWithItsSecretsMasked(t *testing.T) {
+	body := []byte(`<html>Bad Gateway? sessionKey=` + fixtureSessionKey + `&x=1</html>`)
+	_, err := classify(http.StatusBadGateway, body)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "HTTP 502")
+	require.NotContains(t, err.Error(), fixtureSessionKey)
+	require.Contains(t, err.Error(), "<masked len=24>")
+}
+
+// The mask must not become a censor: a body with no credential in it is still
+// worth quoting verbatim, and that is what makes the four cases above meaningful.
+func TestABodyWithoutSecretsIsStillQuotedAsItIs(t *testing.T) {
+	body := []byte(`{"errorCode":"WeirdCode","errorMsg":"the drive said this exactly"}`)
+	err := refuse(http.StatusBadGateway, body)
+	require.Contains(t, err.Error(), "the drive said this exactly")
+	require.NotContains(t, err.Error(), "masked")
+}
+
+// The doc names the key set the mask covers; this is what makes that sentence a
+// claim with a test behind it. The negatives matter as much as the positives - a
+// mask that swallows ordinary short fields would look safe and destroy the only
+// diagnostic left in the line.
+func TestTheMaskCoversTheKeyNamesTheCapturesShow(t *testing.T) {
+	const value = "abcdefghijklmnopqrstuvwx" // 24 chars, the length a real key has
+	for _, tc := range []struct {
+		name    string
+		in      string
+		masked  bool
+		survive string
+	}{
+		{"json sessionKey", `{"sessionKey":"` + value + `"}`, true, "sessionKey"},
+		{"query sk", `sk=` + value + `&x=1`, true, "x=1"},
+		{"query signature", `signature=` + value, true, "signature"},
+		{"json accessToken", `{"accessToken":"` + value + `"}`, true, "accessToken"},
+		{"cookie header shaped", `Cookie: ` + value, true, "Cookie"},
+		{"short value stays", `sign=abc12`, false, "sign=abc12"},
+		{"plain text stays", `nothing of the sort here`, false, "nothing of the sort here"},
+	} {
+		got := describeBody([]byte(tc.in), 200)
+		if tc.masked {
+			require.NotContains(t, got, value, tc.name)
+			require.Contains(t, got, "<masked len=24>", tc.name)
+		} else {
+			require.Equal(t, tc.in, got, tc.name)
+		}
+		require.Contains(t, got, tc.survive, tc.name+": the rest of the line must survive")
+	}
+}

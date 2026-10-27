@@ -106,8 +106,12 @@ type fakeDrive struct {
 	createKeys      []string                     // the sessionkey header each create was signed with
 	apiKeys         []string                     // "path sessionkey" for every signed API call
 	listingFn       func(r *http.Request) string // a drive whose contents change as the test goes
-	taskStates      []int64                      // the taskStatus values the polls answer, in order
-	taskSubs        int                          // object count of the task the next task poll answers
+	// pagedRows, when set, is served with real paging: the answer carries
+	// listPageSize rows per page and reports the whole directory's total as
+	// count, which is what the endpoint actually does (measured 2026-10-28).
+	pagedRows  []string
+	taskStates []int64 // the taskStatus values the polls answer, in order
+	taskSubs   int     // object count of the task the next task poll answers
 	// deleteTaskFailures is the failedCount of each successive DELETE task; a task
 	// past the end of it succeeds. A non-zero one is answered the way the drive
 	// answers a delete it will not explain: failedCount set, errorCode absent.
@@ -115,9 +119,26 @@ type fakeDrive struct {
 	// deleteTaskSkips is the same queue for skipCount, which is what a task
 	// answers when the objects are already gone.
 	deleteTaskSkips []int64
-	taskSeq         int
-	taskFail        map[string]int64
-	taskSkip        map[string]int64
+	// deleteTaskCodes is the same queue for errorCode, which is what a refusal
+	// looks like when the drive does give a reason - a full drive, a spent day.
+	deleteTaskCodes []string
+	// deleteTaskHandled is the successedFileIdList of each successive task, as
+	// the ids the drive says it dealt with. Left unset, the fixture answers the
+	// list only when the task reported nothing failed and nothing skipped - the
+	// one case where the list is not a guess - because MOVE, DELETE and
+	// CLEAR_RECYCLE all answer it and a successful COPY does not (captured
+	// 2026-10-22).
+	deleteTaskHandled [][]string
+	taskInfosByID     map[string][]taskInfo
+	taskHandled       map[string][]string
+	// listFailTimes makes the next that many listings fail outright, so a test can
+	// ask what the check does when the drive will not answer at all.
+	listFailTimes int
+	taskSeq       int
+	taskFail      map[string]int64
+	taskSkip      map[string]int64
+	taskCode      map[string]string
+	listFolders   []string // the folderId each listing was actually addressed at
 
 	// The download link and the storage layer on the way down.
 	downloadLink string // what getFileDownloadUrl answers; empty means the escaped link below
@@ -371,6 +392,49 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case "/listFiles.action", "/family/file/listFiles.action":
+		d.mu.Lock()
+		d.listFolders = append(d.listFolders, r.URL.Query().Get("folderId"))
+		paged := len(d.pagedRows) > 0
+		all := append([]string(nil), d.pagedRows...)
+		refuse := d.listFailTimes > 0
+		if refuse {
+			d.listFailTimes--
+		}
+		d.mu.Unlock()
+		if refuse {
+			// Not JSON, so the listing is undecidable rather than empty: an empty
+			// page is exactly what a truncated walk looks like to a caller.
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "refused")
+			return
+		}
+		if paged {
+			// A directory big enough to be paged, which is the only way a test can
+			// say "the row is on page two" - and page two is where a walk that
+			// stops early, or a listing window that moved, hides a leftover.
+			page, _ := strconv.Atoi(r.URL.Query().Get("pageNum"))
+			if page < 1 {
+				page = 1
+			}
+			const size = 200 // the backend's listPageSize, mirrored here
+			start := (page - 1) * size
+			rows := []string{}
+			if start < len(all) {
+				end := start + size
+				if end > len(all) {
+					end = len(all)
+				}
+				rows = all[start:end]
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"res_code": 0, "fileListAO": map[string]any{
+				// count is the whole directory's total, not this page's length -
+				// measured 2026-10-28 on a directory of 240 objects, where a page of
+				// 200 and a page of 40 both answered count 240.
+				"count": len(all), "fileList": json.RawMessage("[" + strings.Join(rows, ",") + "]"),
+				"folderList": []any{},
+			}})
+			return
+		}
 		if d.listingFn != nil {
 			if raw := d.listingFn(r); raw != "" {
 				w.Header().Set("content-type", "application/json")
@@ -408,10 +472,24 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.createKeys = append(d.createKeys, r.Header.Get("sessionkey"))
 		// A task of several objects reports several done, the way the drive does.
 		d.taskSubs = len(infos)
+		// The handled-id list the poll will answer with is built from what this
+		// task was actually given, so a test cannot script a list that names
+		// objects the task never saw.
+		if d.taskInfosByID == nil {
+			d.taskInfosByID = map[string][]taskInfo{}
+		}
 		// Every task gets its own id, so a test can tell a resend from the task
 		// it repeats - and so the poll can answer this task and not that one.
 		d.taskSeq++
 		taskID := fmt.Sprintf("9000000000000000%02d", d.taskSeq)
+		d.taskInfosByID[taskID] = infos
+		if len(d.deleteTaskHandled) > 0 {
+			if d.taskHandled == nil {
+				d.taskHandled = map[string][]string{}
+			}
+			d.taskHandled[taskID] = d.deleteTaskHandled[0]
+			d.deleteTaskHandled = d.deleteTaskHandled[1:]
+		}
 		if q.Get("type") == taskDelete {
 			if len(d.deleteTaskFailures) > 0 {
 				if d.taskFail == nil {
@@ -426,6 +504,13 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				d.taskSkip[taskID] = d.deleteTaskSkips[0]
 				d.deleteTaskSkips = d.deleteTaskSkips[1:]
+			}
+			if len(d.deleteTaskCodes) > 0 {
+				if d.taskCode == nil {
+					d.taskCode = map[string]string{}
+				}
+				d.taskCode[taskID] = d.deleteTaskCodes[0]
+				d.deleteTaskCodes = d.deleteTaskCodes[1:]
 			}
 		}
 		d.mu.Unlock()
@@ -472,13 +557,32 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		subs := d.taskSubs
 		failed := d.taskFail[q.Get("taskId")]
 		skipped := d.taskSkip[q.Get("taskId")]
+		code := d.taskCode[q.Get("taskId")]
+		infos := d.taskInfosByID[q.Get("taskId")]
+		handled, handledSet := d.taskHandled[q.Get("taskId")], true
 		d.mu.Unlock()
 		st := map[string]any{
 			"res_code": 0, "res_message": "成功", "taskStatus": state,
 			"failedCount": failed, "skipCount": skipped, "subTaskCount": subs,
 		}
+		if code != "" {
+			st["errorCode"] = code
+		}
 		if state == taskStateDone {
 			st["successedCount"] = int64(subs) - failed - skipped
+			// The list the drive names is the list of what it finished with. With
+			// no script it is only safe to name everything, and only when nothing
+			// failed or skipped; naming a subset the test did not script would be
+			// the fixture inventing evidence.
+			if !handledSet && failed == 0 && skipped == 0 && q.Get("type") != taskCopy {
+				handled = make([]string, 0, len(infos))
+				for _, in := range infos {
+					handled = append(handled, in.FileID)
+				}
+			}
+			if len(handled) > 0 {
+				st["successedFileIdList"] = handled
+			}
 		}
 		writeJSON(w, http.StatusOK, st)
 
@@ -951,6 +1055,16 @@ func newFakeFs(t *testing.T, drive *fakeDrive) *Fs {
 	}
 	f.opt.AccessToken = "fixture-token-" + t.Name()
 	f.opt.Space = spacePersonal
+	// The delete check's waits are production timing; a test asserts what the
+	// looks say, not how long they take. They are vars so they can be zeroed here
+	// rather than being read as a constant the tests cannot touch.
+	//
+	// The cleanup gives back what it found, not a literal: writing the production
+	// number back here would hide any change to it, and one test exists precisely
+	// to notice such a change.
+	oldWait := deleteVerifyWait
+	deleteVerifyWait = 0
+	t.Cleanup(func() { deleteVerifyWait = oldWait })
 	f.opt.ChunkSize = fs.SizeSuffix(fakePartBase)
 	f.opt.UploadConcurrency = 2
 	f.opt.Enc = cloud189DefaultEncoding
