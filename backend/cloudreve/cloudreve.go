@@ -9,6 +9,7 @@ package cloudreve
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -270,6 +271,43 @@ func (ts *tokenState) nearExpiry() bool {
 	return time.Until(ts.accessExpires) < renewMargin
 }
 
+// setExpiry records when the token now in hand stops working
+func (ts *tokenState) setExpiry(at time.Time) {
+	ts.mu.Lock()
+	ts.accessExpires = at
+	ts.mu.Unlock()
+}
+
+// tokenExpiry reads the deadline an access token carries
+//
+// The signature is not checked, which only the site can do: this asks one thing
+// of the token, when it dies. A token that answers nothing - hand written, or
+// from a server that stopped issuing these - has no deadline, so nothing is
+// decided from it: a refresh token beside it is what gets traded, and the token
+// itself is used until the server says otherwise. The token never appears in what
+// is written out.
+func tokenExpiry(token string) (time.Time, bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return time.Time{}, false
+	}
+	payload := parts[1]
+	if pad := len(payload) % 4; pad != 0 {
+		payload += strings.Repeat("=", 4-pad)
+	}
+	raw, err := base64.URLEncoding.DecodeString(payload)
+	if err != nil {
+		return time.Time{}, false
+	}
+	claims := struct {
+		Expires int64 `json:"exp"`
+	}{}
+	if err := json.Unmarshal(raw, &claims); err != nil || claims.Expires <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(claims.Expires, 0), true
+}
+
 // Object describes a Cloudreve file
 type Object struct {
 	fs      *Fs
@@ -426,11 +464,186 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 	}
 	if opt.Email != "" && opt.Password != "" {
 		f.tok.canIssue = true
-		if err := f.issueToken(ctx); err != nil {
-			return nil, err
-		}
+	}
+	if err := f.openSession(ctx); err != nil {
+		return nil, err
 	}
 	return f, nil
+}
+
+// The two ways an account check can come back wrong, kept apart because only the
+// first is a reason to throw a working credential away.
+var (
+	errAccountMismatch   = errors.New("cloudreve: the stored token is not this account's")
+	errAccountUnanswered = errors.New("cloudreve: the site would not say whose token this is")
+)
+
+// openSession works out what this run has to do to hold a working credential, and
+// does the cheapest thing that gets there
+//
+// Signing in costs three requests and opens a new session on the site that only
+// age, a password change or a sign-out closes again, so a pair already in the
+// config is kept if it can be kept: a token with its deadline still ahead of it is
+// used as it stands, and one that is old or unanswerable about itself is traded for
+// a new one in the single request that costs. A pair is given up to signing in only
+// when the site says it belongs to another account, when the trade is refused, or
+// when nothing about it can be established and there is a password to start over
+// with.
+//
+// A pair that was traded rather than signed in for is asked about before it is
+// used: the refresh token left in a config can belong to another account, and the
+// pair it trades for works just as well on that account's drive. A pair the answer
+// says is somebody else's is never written back to the config, so the run that
+// stops over one leaves the file holding only what it was given. The same check
+// runs after a renewal in the middle of a transfer, inside the lock that serialises
+// renewals: asked outside it, every thread waiting on a renewal would ask the same
+// question, and each one that signed in behind an unsatisfying answer would open
+// another session on the site.
+func (f *Fs) openSession(ctx context.Context) error {
+	deadline, dated := tokenExpiry(f.tok.access)
+	switch {
+	case dated && time.Until(deadline) > 0:
+		// Recording the deadline is only worth doing where something can act on
+		// it. A pair with no refresh token and no password cannot be renewed, so a
+		// deadline written down here would stop a run that still has a working
+		// token in hand. How long before the deadline to renew is the request
+		// path's, and is not decided twice.
+		if f.tok.refresh != "" || f.tok.canIssue {
+			f.tok.setExpiry(deadline)
+		}
+		err := f.confirmAccount(ctx)
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, errAccountMismatch):
+			if !f.tok.canIssue {
+				return err // the one answer that must not be worked around
+			}
+			fs.Logf(f, "cloudreve: signing in as %s: %v", f.opt.Email, err)
+			return f.issueToken(ctx)
+		case f.tok.refresh == "" && !f.tok.canIssue:
+			fs.Logf(f, "cloudreve: cannot check the stored token and has nothing to replace it with, using it: %v", err)
+			return nil
+		default:
+			fs.Debugf(f, "cloudreve: cannot check the stored token, replacing it: %v", err)
+		}
+	case f.tok.access != "" && !dated && f.tok.refresh == "" && !f.tok.canIssue:
+		// Nothing to trade this pair for and no password to start over with, so it
+		// is all the run has. Where an account is named, whose token this is can
+		// still be asked for one request, and that is worth it: the alternative is
+		// working on somebody else's drive and saying nothing, and the shape of the
+		// token is no guide to who it belongs to.
+		if f.opt.Email == "" {
+			return nil // no account named, so nothing to check it against
+		}
+		return f.confirmHeld(ctx)
+	}
+	if f.tok.refresh != "" {
+		err := f.tradeRefresh(ctx)
+		switch {
+		case err == nil:
+			return f.confirmHeld(ctx)
+		case !f.tok.canIssue:
+			// The trade was refused, but nothing has shown the token in hand to be
+			// dead: an access token stays good until its own deadline even once the
+			// session behind the refresh token is gone. Letting the server be the
+			// judge beats closing a remote that works today - and a refused trade
+			// says nothing about whose token it is, so the account is still asked.
+			fs.Logf(f, "cloudreve: cannot renew the stored token, using what is in hand until the server refuses it: %v", err)
+			return f.confirmHeld(ctx)
+		}
+	}
+	if f.tok.canIssue {
+		return f.issueToken(ctx)
+	}
+	// Stale, and nothing to trade it with: let the server be the judge.
+	return nil
+}
+
+// confirmHeld settles whose the pair in hand is, and lets the config keep it only
+// once the site has said it belongs to the account the remote names
+//
+// Signing in is the way out when the answer says otherwise and there is a password
+// to sign in with. Where there is none, a site that will not answer is not evidence
+// against the pair, so it is used with a notice; a site that says it is somebody
+// else's stops the run.
+func (f *Fs) confirmHeld(ctx context.Context) error {
+	err := f.confirmAccount(ctx)
+	switch {
+	case err == nil:
+		f.saveTokens()
+		return nil
+	case errors.Is(err, errAccountMismatch):
+		if !f.tok.canIssue {
+			return err // somebody else's pair, and no way to ask for our own
+		}
+		fs.Logf(f, "cloudreve: signing in as %s: %v", f.opt.Email, err)
+		return f.issueToken(ctx)
+	case !f.tok.canIssue:
+		fs.Logf(f, "cloudreve: cannot check the token in hand and has nothing to replace it with, using it: %v", err)
+		f.saveTokens()
+		return nil
+	default:
+		fs.Debugf(f, "cloudreve: cannot check the token in hand, signing in instead: %v", err)
+		return f.issueToken(ctx)
+	}
+}
+
+// tradeRefresh asks the site to swap the refresh token for a new pair, and does
+// not fall back to signing in
+//
+// openSession needs the two apart: a pair that came from a sign-in has just been
+// given to us by the account itself and needs no check afterwards, while a pair
+// traded from a token left in the config still could belong to somebody else.
+func (f *Fs) tradeRefresh(ctx context.Context) error {
+	f.tok.mu.Lock()
+	refresh := f.tok.refresh
+	f.tok.mu.Unlock()
+	if refresh == "" {
+		return errors.New("cloudreve: no refresh_token to trade")
+	}
+	token := new(api.Token)
+	if err := f.plainCall(ctx, "POST", "/session/token/refresh", nil, &api.RefreshRequest{RefreshToken: refresh}, token); err != nil {
+		return err
+	}
+	if token.AccessToken == "" {
+		return errors.New("cloudreve: the refresh response carried no access_token")
+	}
+	f.setTokens(token.AccessToken, token.RefreshToken, token.AccessExpires)
+	return nil
+}
+
+// confirmAccount asks the site whose token this is, so a pair left in the config
+// is kept with the answer in hand rather than taken on trust
+//
+// Reusing a stored pair skips signing in, so nothing else would notice a remote
+// whose email was edited underneath it: the run would read and write somebody
+// else's drive and report nothing. The answer also carries the account ID the lock
+// rules ask about, which is cached here once the account is settled, so a pair
+// turned out to be foreign leaves nothing wrong behind.
+func (f *Fs) confirmAccount(ctx context.Context) error {
+	if f.opt.Email == "" {
+		return nil // nothing to check against: a token with no account named is taken as given
+	}
+	me := new(api.CurrentUser)
+	if err := f.bearerCall(ctx, "GET", "/user/me", nil, me); err != nil {
+		// The site could not be asked, or would not answer this one, which is not
+		// evidence that the pair is somebody else's. Refusing here would make a
+		// remote that works today fail to open, so the caller decides.
+		return err
+	}
+	if me.Email == "" {
+		return fmt.Errorf("%w: the site named no email", errAccountUnanswered)
+	}
+	if !strings.EqualFold(me.Email, f.opt.Email) {
+		return fmt.Errorf("%w: the stored token belongs to %s, not %s", errAccountMismatch, me.Email, f.opt.Email)
+	}
+	if me.ID != "" {
+		f.mu.Lock()
+		f.acctID = me.ID
+		f.mu.Unlock()
+	}
+	return nil
 }
 
 // issueToken signs in with the configured account
@@ -457,10 +670,14 @@ func (f *Fs) issueToken(ctx context.Context) error {
 		}
 		return fmt.Errorf("cloudreve: can't learn how %q signs in: %w", f.opt.Email, err)
 	}
-	if prepared.WebauthnEnabled {
-		return errors.New("cloudreve: this account signs in with a passkey, which rclone cannot present: set access_token instead")
-	}
+	// The site answers the two ways an account can prove itself separately, and a
+	// passkey does not switch the password off: login is refused for a passkey
+	// account only when it has no password to check. So the password decides, and a
+	// passkey is named as the reason there is no password to post.
 	if !prepared.PasswordEnabled {
+		if prepared.WebauthnEnabled {
+			return fmt.Errorf("cloudreve: the account %q signs in with a passkey and has no local password, so rclone cannot sign in: give it a password in the admin panel, or set access_token", f.opt.Email)
+		}
 		return fmt.Errorf("cloudreve: the account %q has no local password, so rclone cannot sign in: give it one in the admin panel, or set access_token", f.opt.Email)
 	}
 
@@ -481,15 +698,25 @@ func (f *Fs) issueToken(ctx context.Context) error {
 	if data.Token.AccessToken == "" {
 		return errors.New("cloudreve: the login response carried no access_token")
 	}
+	// A pair the account itself handed over needs no check afterwards, so it is
+	// the one thing here that can be saved as it arrives.
 	f.setTokens(data.Token.AccessToken, data.Token.RefreshToken, data.Token.AccessExpires)
+	f.saveTokens()
 	return nil
 }
 
 // renewToken trades the refresh token for a new pair
 //
-// A refresh token is spent by being used, so only one renewal may run at a time
-// and a caller whose pair was replaced while it queued is done: it takes the new
-// token rather than spending another refresh on the same renewal.
+// One renewal runs at a time, and a caller whose pair was replaced while it
+// queued is done: the token it would spend still works, but it has a newer one
+// already, so renewing again would only add a pair nothing will use.
+//
+// The one that does trade is the one that asks whose pair came back, and writes it
+// to the config if the answer is right. Both belong inside that same lock: asking
+// outside it would have every queued caller ask the same question once, and a
+// sign-in behind each of those answers would open as many sessions as the run has
+// threads. The asking cannot renew again, because an identity request is sent
+// once and for all.
 func (f *Fs) renewToken(ctx context.Context, seen int64) error {
 	f.tok.renewMu.Lock()
 	defer f.tok.renewMu.Unlock()
@@ -511,9 +738,10 @@ func (f *Fs) renewToken(ctx context.Context, seen int64) error {
 	err := f.plainCall(ctx, "POST", "/session/token/refresh", nil, &api.RefreshRequest{RefreshToken: refresh}, token)
 	if err != nil {
 		if canIssue {
-			// A refresh that reached the server but whose reply was lost cannot be
-			// repeated, because the pair it replaced is retired. Signing in again
-			// is the way out when the account allows it.
+			// A refused refresh means the whole lineage is gone: expired, the
+			// password changed, the session signed out, or the account itself
+			// blocked or deleted. None of those come back by asking again, so
+			// signing in is the way out when the account allows it.
 			return f.issueToken(ctx)
 		}
 		return fmt.Errorf("cloudreve: can't renew the session: %w", err)
@@ -522,29 +750,58 @@ func (f *Fs) renewToken(ctx context.Context, seen int64) error {
 		return errors.New("cloudreve: the refresh response carried no access_token")
 	}
 	f.setTokens(token.AccessToken, token.RefreshToken, token.AccessExpires)
-	return nil
+	return f.confirmHeld(ctx)
 }
 
-// setTokens installs a new pair and saves it over the config
+// setTokens installs a new pair in the run's memory.
 //
-// A refresh_token is spent by being used: the server retires the pair it
-// replaces, so a renewed pair that is not written back leaves the remote holding
-// an invalid credential for its next run.
+// What when is settled here for every pair. A site that says nothing about the
+// life of the token it just handed over may still have sent one that says. When
+// neither the answer nor the token speaks, the deadline is unknown rather than
+// the one held before. Leaving that behind would make every request of a long
+// run look about to expire, and each of them would spend a renewal.
+//
+// Nothing is written to the config here. A pair traded from a token left in the
+// config is not known to be the account's own until confirmHeld has asked, and
+// saving one before then leaves somebody else's credential in the user's file
+// even when the run goes on to refuse it.
 func (f *Fs) setTokens(access, refresh string, accessExpires time.Time) {
+	if accessExpires.IsZero() {
+		if at, dated := tokenExpiry(access); dated {
+			accessExpires = at
+		}
+	}
 	f.tok.mu.Lock()
 	f.tok.access = access
 	if refresh != "" {
 		f.tok.refresh = refresh
 	}
-	if !accessExpires.IsZero() {
-		f.tok.accessExpires = accessExpires
-	}
+	f.tok.accessExpires = accessExpires
 	f.tok.generation++
 	f.tok.mu.Unlock()
-	if f.cfg != nil {
-		f.cfg.Set("access_token", access)
-		f.cfg.Set("refresh_token", f.tok.refresh)
+}
+
+// saveTokens puts the pair in hand into the remote's config, which is what keeps
+// the stored credential from ageing out between runs.
+//
+// The site keeps a refresh token working until it expires on its own, so a renewal
+// that never reached the file costs the next run the one request that trades it
+// again, not a sign-in. Writing is skipped when the file already holds this pair,
+// so a run that only read the config does not rewrite it.
+func (f *Fs) saveTokens() {
+	if f.cfg == nil {
+		return
 	}
+	f.tok.mu.Lock()
+	access, refresh := f.tok.access, f.tok.refresh
+	f.tok.mu.Unlock()
+	if old, _ := f.cfg.Get("access_token"); old == access {
+		if old, _ := f.cfg.Get("refresh_token"); old == refresh {
+			return
+		}
+	}
+	f.cfg.Set("access_token", access)
+	f.cfg.Set("refresh_token", refresh)
 }
 
 // findRoot checks the configured root exists, reporting fs.ErrorIsFile when it
@@ -966,9 +1223,23 @@ func lockConflicts(err error) []api.LockConflict {
 	return conflictsIn(e.data)
 }
 
-// plainCall makes one API request without a bearer token and without renewing
-// the session, for the endpoints that issue it
+// plainCall makes one API request without a bearer token, for the endpoints that
+// issue it
 func (f *Fs) plainCall(ctx context.Context, method, endpoint string, query url.Values, in, out interface{}) error {
+	return f.oneCall(ctx, method, endpoint, query, in, out, false)
+}
+
+// bearerCall makes one API request with the token in hand, and does not renew.
+//
+// Asking who a pair belongs to must not itself be allowed to renew: a site whose
+// tokens are issued already inside the renewal margin would otherwise renew, ask,
+// renew, ask, until the stack gave out.
+func (f *Fs) bearerCall(ctx context.Context, method, endpoint string, query url.Values, out interface{}) error {
+	return f.oneCall(ctx, method, endpoint, query, nil, out, true)
+}
+
+// oneCall sends one request and reads one reply
+func (f *Fs) oneCall(ctx context.Context, method, endpoint string, query url.Values, in, out interface{}, auth bool) error {
 	var body []byte
 	if in != nil {
 		var err error
@@ -981,7 +1252,7 @@ func (f *Fs) plainCall(ctx context.Context, method, endpoint string, query url.V
 	// them is whatever answers in front of the site dropping connections, and that
 	// clears on its own.
 	return f.pacer.Call(func() (bool, error) {
-		env, err := f.request(ctx, method, endpoint, query, body, false)
+		env, err := f.request(ctx, method, endpoint, query, body, auth)
 		if err != nil {
 			return f.shouldRetry(ctx, err)
 		}
