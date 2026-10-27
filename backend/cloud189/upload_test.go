@@ -106,8 +106,12 @@ type fakeDrive struct {
 	createKeys      []string                     // the sessionkey header each create was signed with
 	apiKeys         []string                     // "path sessionkey" for every signed API call
 	listingFn       func(r *http.Request) string // a drive whose contents change as the test goes
-	taskStates      []int64                      // the taskStatus values the polls answer, in order
-	taskSubs        int                          // object count of the task the next task poll answers
+	// pagedRows, when set, is served with real paging: the answer carries
+	// listPageSize rows per page and reports the whole directory's total as
+	// count, which is what the endpoint actually does (measured 2026-10-28).
+	pagedRows  []string
+	taskStates []int64 // the taskStatus values the polls answer, in order
+	taskSubs   int     // object count of the task the next task poll answers
 	// deleteTaskFailures is the failedCount of each successive DELETE task; a task
 	// past the end of it succeeds. A non-zero one is answered the way the drive
 	// answers a delete it will not explain: failedCount set, errorCode absent.
@@ -390,6 +394,8 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/listFiles.action", "/family/file/listFiles.action":
 		d.mu.Lock()
 		d.listFolders = append(d.listFolders, r.URL.Query().Get("folderId"))
+		paged := len(d.pagedRows) > 0
+		all := append([]string(nil), d.pagedRows...)
 		refuse := d.listFailTimes > 0
 		if refuse {
 			d.listFailTimes--
@@ -400,6 +406,33 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// page is exactly what a truncated walk looks like to a caller.
 			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, "refused")
+			return
+		}
+		if paged {
+			// A directory big enough to be paged, which is the only way a test can
+			// say "the row is on page two" - and page two is where a walk that
+			// stops early, or a listing window that moved, hides a leftover.
+			page, _ := strconv.Atoi(r.URL.Query().Get("pageNum"))
+			if page < 1 {
+				page = 1
+			}
+			const size = 200 // the backend's listPageSize, mirrored here
+			start := (page - 1) * size
+			rows := []string{}
+			if start < len(all) {
+				end := start + size
+				if end > len(all) {
+					end = len(all)
+				}
+				rows = all[start:end]
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"res_code": 0, "fileListAO": map[string]any{
+				// count is the whole directory's total, not this page's length -
+				// measured 2026-10-28 on a directory of 240 objects, where a page of
+				// 200 and a page of 40 both answered count 240.
+				"count": len(all), "fileList": json.RawMessage("[" + strings.Join(rows, ",") + "]"),
+				"folderList": []any{},
+			}})
 			return
 		}
 		if d.listingFn != nil {
