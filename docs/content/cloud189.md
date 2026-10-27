@@ -568,7 +568,25 @@ The link comes back HTML-escaped - the family endpoint in particular writes
 written, the storage layer refuses it.
 
 The URL's query is a signature; rclone strips it out of any message or log line
-that would otherwise echo it back.
+that would otherwise echo it back. That covers the whole redirect chain, not just
+the link that was asked for: a transport failure after the redirect quotes the
+address it was sending to, which is the storage URL with a signature of its own.
+
+`rclone link` hands out the address the bytes actually come from, not the
+`download.cloud.189.cn` endpoint. That endpoint only redirects - one 302 lands on
+a presigned storage URL (measured 2026-10-27, a ctyun OBS host) - and the storage
+host is what a direct-link rule keys on, so following the one hop costs a
+single-byte request and gives the caller something it can decide on before asking.
+`--expire` has no effect: `getFileDownloadUrl.action` takes no expiry parameter, so
+the server picks the window. `--unlink` has nothing to revoke, since the link is
+minted per request and stored nowhere.
+
+The storage grant behind that address is shorter than the redirecting form: on the
+family space it is 5 minutes against about 8 hours. A family link passed on from
+`rclone link` therefore lives minutes where the redirecting form would have lived
+hours, and rclone reports the shorter window when it hands one out. A client that
+needs the longer life should take the redirecting form and follow the redirect
+itself, which also renews the grant on every hit.
 
 The storage host is also measurably unreliable over long transfers: on 2026-10-24
 the standard suite's 21 MiB read failed with `unexpected EOF` on three runs in a

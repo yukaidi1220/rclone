@@ -116,14 +116,18 @@ type fakeDrive struct {
 	// Set, it makes the storage host answer elsewhere, the way download.cloud.189.cn
 	// redirects to a presigned OBS URL (measured 2026-10-27).
 	linkRedirect string
-	readStatus   []int             // status for each successive read; shorter than the reads means 200
-	readBody     []byte            // bytes served on a read, default a short constant
-	readQueries  []string          // the query each read actually arrived with
-	readRanges   []string          // the Range header each read arrived with
-	readCut      []int64           // bytes to send while announcing the whole body, for each read
-	folders      map[string]string // directory name to id, for a createFolder
-	mkdirs       []string          // the directory names the drive was asked to create
-	mkdirQueries []url.Values      // the query each createFolder arrived with
+	// linkRedirectAbs is a whole address the link 302s to, for the case where
+	// nothing answers at the far end. The transport then quotes the address it
+	// was redirected to, not the one it started from.
+	linkRedirectAbs string
+	readStatus      []int             // status for each successive read; shorter than the reads means 200
+	readBody        []byte            // bytes served on a read, default a short constant
+	readQueries     []string          // the query each read actually arrived with
+	readRanges      []string          // the Range header each read arrived with
+	readCut         []int64           // bytes to send while announcing the whole body, for each read
+	folders         map[string]string // directory name to id, for a createFolder
+	mkdirs          []string          // the directory names the drive was asked to create
+	mkdirQueries    []url.Values      // the query each createFolder arrived with
 
 	// The account's own numbers. Left at zero the gates find nothing to gate on,
 	// which is what a drive that did not answer looks like to the code.
@@ -564,6 +568,13 @@ func (d *fakeDrive) storeRead(w http.ResponseWriter, r *http.Request) {
 		// Real storage layers quote the request they refused, URL and all, which
 		// is why the error path has to strip the signature back out.
 		writeJSON(w, status, map[string]any{"Error": "AccessDenied", "RequestPath": r.URL.String()})
+		return
+	}
+	if r.URL.Path == "/store/file" && d.linkRedirectAbs != "" {
+		// The far end of the redirect is somewhere nothing listens, so the
+		// transport fails on the address the redirect named.
+		w.Header().Set("Location", d.linkRedirectAbs)
+		w.WriteHeader(http.StatusFound)
 		return
 	}
 	if r.URL.Path == "/store/file" && d.linkRedirect != "" {
