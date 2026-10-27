@@ -240,7 +240,29 @@ type tokenState struct {
 	accessExpires time.Time  // zero when the token came from the config
 	canIssue      bool       // set when email and password can mint a new pair
 	generation    int64      // counts pairs installed, so waiters need not spend another
+	sessionErr    error      // set when the pair in hand turned out to be another account's
 	renewMu       sync.Mutex // held for the whole of one renewal
+}
+
+// setSessionError stops this run from sending another request
+//
+// A pair traded from a token left in the config can turn out to belong to another
+// account, and there is then nothing to replace it with. Failing the one call that
+// noticed is not enough: the pair would stay where the next call finds it, look
+// fresh, and never be asked about again.
+func (ts *tokenState) setSessionError(err error) {
+	ts.mu.Lock()
+	if ts.sessionErr == nil {
+		ts.sessionErr = err
+	}
+	ts.mu.Unlock()
+}
+
+// sessionError returns why this run must not go on, or nil
+func (ts *tokenState) sessionError() error {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return ts.sessionErr
 }
 
 // currentGeneration names the session pair held now
@@ -344,6 +366,18 @@ func (e *apiError) Error() string {
 		return fmt.Sprintf("cloudreve:%s %d %s (correlation id %s)", where, e.code, e.msg, e.id)
 	}
 	return fmt.Sprintf("cloudreve:%s %d %s", where, e.code, e.msg)
+}
+
+// siteRefused says whether the site answered, and the answer was a refusal
+//
+// A rate limit or a server-side failure arrives as an envelope too, so having a
+// code is not enough: those are worth another request, and they say nothing about
+// whether the refresh token is still good.
+func siteRefused(err error) bool {
+	if _, retry := pacer.IsRetryAfter(err); retry {
+		return false
+	}
+	return codeOf(err) != 0
 }
 
 // codeOf returns the server's error code, or 0 when err is not an API error
@@ -472,10 +506,12 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 }
 
 // The two ways an account check can come back wrong, kept apart because only the
-// first is a reason to throw a working credential away.
+// first is a reason to throw a working credential away. The second is the site
+// answering without naming whose token it is, which is not evidence against it; a
+// site that could not be asked at all returns its own error instead.
 var (
-	errAccountMismatch   = errors.New("cloudreve: the stored token is not this account's")
-	errAccountUnanswered = errors.New("cloudreve: the site would not say whose token this is")
+	errAccountMismatch = errors.New("cloudreve: the stored token is not this account's")
+	errAccountUnnamed  = errors.New("cloudreve: the site named no account for this token")
 )
 
 // openSession works out what this run has to do to hold a working credential, and
@@ -539,10 +575,10 @@ func (f *Fs) openSession(ctx context.Context) error {
 		return f.confirmHeld(ctx)
 	}
 	if f.tok.refresh != "" {
-		err := f.tradeRefresh(ctx)
+		token, err := f.tradeRefresh(ctx)
 		switch {
 		case err == nil:
-			return f.confirmHeld(ctx)
+			return f.checkTraded(ctx, token)
 		case !f.tok.canIssue:
 			// The trade was refused, but nothing has shown the token in hand to be
 			// dead: an access token stays good until its own deadline even once the
@@ -575,17 +611,30 @@ func (f *Fs) confirmHeld(ctx context.Context) error {
 		return nil
 	case errors.Is(err, errAccountMismatch):
 		if !f.tok.canIssue {
-			return err // somebody else's pair, and no way to ask for our own
+			// Somebody else's pair, and no way to ask for our own. The one call that
+			// noticed cannot be the only thing that stops: the pair stays where the
+			// next call finds it, looks fresh, and would never be asked about again.
+			f.tok.setSessionError(fmt.Errorf("%w: there is no password to sign in with, so the run stops rather than work on that account's drive", err))
+			return err
 		}
 		fs.Logf(f, "cloudreve: signing in as %s: %v", f.opt.Email, err)
-		return f.issueToken(ctx)
+		if signIn := f.issueToken(ctx); signIn != nil {
+			// The foreign pair is still installed and nothing replaced it.
+			f.tok.setSessionError(fmt.Errorf("%w, and signing in as %s failed too: %v", err, f.opt.Email, signIn))
+			return signIn
+		}
+		return nil
 	case !f.tok.canIssue:
 		fs.Logf(f, "cloudreve: cannot check the token in hand and has nothing to replace it with, using it: %v", err)
 		f.saveTokens()
 		return nil
 	default:
-		fs.Debugf(f, "cloudreve: cannot check the token in hand, signing in instead: %v", err)
-		return f.issueToken(ctx)
+		fs.Logf(f, "cloudreve: cannot check the token in hand, signing in instead: %v", err)
+		if signIn := f.issueToken(ctx); signIn != nil {
+			fs.Logf(f, "cloudreve: signing in failed too, so the token in hand is used until the site refuses it: %v", signIn)
+			f.saveTokens()
+		}
+		return nil
 	}
 }
 
@@ -595,22 +644,21 @@ func (f *Fs) confirmHeld(ctx context.Context) error {
 // openSession needs the two apart: a pair that came from a sign-in has just been
 // given to us by the account itself and needs no check afterwards, while a pair
 // traded from a token left in the config still could belong to somebody else.
-func (f *Fs) tradeRefresh(ctx context.Context) error {
+func (f *Fs) tradeRefresh(ctx context.Context) (*api.Token, error) {
 	f.tok.mu.Lock()
 	refresh := f.tok.refresh
 	f.tok.mu.Unlock()
 	if refresh == "" {
-		return errors.New("cloudreve: no refresh_token to trade")
+		return nil, errors.New("cloudreve: no refresh_token to trade")
 	}
 	token := new(api.Token)
 	if err := f.plainCall(ctx, "POST", "/session/token/refresh", nil, &api.RefreshRequest{RefreshToken: refresh}, token); err != nil {
-		return err
+		return nil, err
 	}
 	if token.AccessToken == "" {
-		return errors.New("cloudreve: the refresh response carried no access_token")
+		return nil, errors.New("cloudreve: the refresh response carried no access_token")
 	}
-	f.setTokens(token.AccessToken, token.RefreshToken, token.AccessExpires)
-	return nil
+	return token, nil
 }
 
 // confirmAccount asks the site whose token this is, so a pair left in the config
@@ -622,18 +670,25 @@ func (f *Fs) tradeRefresh(ctx context.Context) error {
 // rules ask about, which is cached here once the account is settled, so a pair
 // turned out to be foreign leaves nothing wrong behind.
 func (f *Fs) confirmAccount(ctx context.Context) error {
+	return f.confirmToken(ctx, f.tok.accessToken())
+}
+
+// confirmToken asks the site whose the given access token is, sending that token
+// itself. Nothing is installed here: a pair the site has not been asked about must
+// never be the one the next request picks up.
+func (f *Fs) confirmToken(ctx context.Context, access string) error {
 	if f.opt.Email == "" {
 		return nil // nothing to check against: a token with no account named is taken as given
 	}
 	me := new(api.CurrentUser)
-	if err := f.bearerCall(ctx, "GET", "/user/me", nil, me); err != nil {
+	if err := f.oneCall(ctx, "GET", "/user/me", nil, nil, me, access); err != nil {
 		// The site could not be asked, or would not answer this one, which is not
 		// evidence that the pair is somebody else's. Refusing here would make a
 		// remote that works today fail to open, so the caller decides.
 		return err
 	}
 	if me.Email == "" {
-		return fmt.Errorf("%w: the site named no email", errAccountUnanswered)
+		return fmt.Errorf("%w: the site named no email", errAccountUnnamed)
 	}
 	if !strings.EqualFold(me.Email, f.opt.Email) {
 		return fmt.Errorf("%w: the stored token belongs to %s, not %s", errAccountMismatch, me.Email, f.opt.Email)
@@ -737,11 +792,15 @@ func (f *Fs) renewToken(ctx context.Context, seen int64) error {
 	token := new(api.Token)
 	err := f.plainCall(ctx, "POST", "/session/token/refresh", nil, &api.RefreshRequest{RefreshToken: refresh}, token)
 	if err != nil {
-		if canIssue {
-			// A refused refresh means the whole lineage is gone: expired, the
-			// password changed, the session signed out, or the account itself
-			// blocked or deleted. None of those come back by asking again, so
-			// signing in is the way out when the account allows it.
+		if canIssue && siteRefused(err) {
+			// The site answered, and the answer refused the refresh: the whole
+			// lineage is gone - expired, the password changed, the session signed
+			// out, the account blocked or deleted - and none of that comes back by
+			// asking again, so signing in is the way out.
+			//
+			// An answer that is not the site's is left alone: a dropped connection,
+			// a proxy page, a 5xx. None of those say the refresh token is dead, and
+			// signing in behind one would open a session for a network hiccup.
 			return f.issueToken(ctx)
 		}
 		return fmt.Errorf("cloudreve: can't renew the session: %w", err)
@@ -749,8 +808,53 @@ func (f *Fs) renewToken(ctx context.Context, seen int64) error {
 	if token.AccessToken == "" {
 		return errors.New("cloudreve: the refresh response carried no access_token")
 	}
-	f.setTokens(token.AccessToken, token.RefreshToken, token.AccessExpires)
-	return f.confirmHeld(ctx)
+	return f.checkTraded(ctx, token)
+}
+
+// checkTraded settles whose the pair the site just traded for is, and installs it
+// only once that is settled
+//
+// Installing first and asking afterwards leaves a window in which a transfer
+// running beside the renewal sends somebody else's token, and a failure then
+// leaves that pair where the next call finds it. So the question is asked with the
+// candidate token, and the pair becomes the run's own only if the answer is right.
+func (f *Fs) checkTraded(ctx context.Context, token *api.Token) error {
+	err := f.confirmToken(ctx, token.AccessToken)
+	switch {
+	case err == nil:
+		f.setTokens(token.AccessToken, token.RefreshToken, token.AccessExpires)
+		f.saveTokens()
+		return nil
+	case errors.Is(err, errAccountMismatch):
+		if !f.tok.canIssue {
+			// The pair is somebody else's and there is no password for our own. The
+			// pair in hand before the trade is the account's own, so the run stops
+			// rather than be worked around.
+			f.tok.setSessionError(fmt.Errorf("%w: there is no password to sign in with, so the run stops rather than work on that account's drive", err))
+			return err
+		}
+		fs.Logf(f, "cloudreve: signing in as %s: %v", f.opt.Email, err)
+		if signIn := f.issueToken(ctx); signIn != nil {
+			f.tok.setSessionError(fmt.Errorf("%w, and signing in as %s failed too: %v", err, f.opt.Email, signIn))
+			return signIn
+		}
+		return nil
+	case !f.tok.canIssue:
+		// The site would not say, and there is nothing else to try: the pair is used
+		// and the doubt is said out loud rather than kept quiet.
+		fs.Logf(f, "cloudreve: cannot check the traded token and has nothing to replace it with, using it: %v", err)
+		f.setTokens(token.AccessToken, token.RefreshToken, token.AccessExpires)
+		f.saveTokens()
+		return nil
+	default:
+		fs.Logf(f, "cloudreve: cannot check the traded token, signing in instead: %v", err)
+		if signIn := f.issueToken(ctx); signIn != nil {
+			fs.Logf(f, "cloudreve: signing in failed too, so the traded token is used until the site refuses it: %v", signIn)
+			f.setTokens(token.AccessToken, token.RefreshToken, token.AccessExpires)
+			f.saveTokens()
+		}
+		return nil
+	}
 }
 
 // setTokens installs a new pair in the run's memory.
@@ -771,6 +875,14 @@ func (f *Fs) setTokens(access, refresh string, accessExpires time.Time) {
 			accessExpires = at
 		}
 	}
+	if !accessExpires.IsZero() && time.Until(accessExpires) < renewMargin {
+		// Nothing can be done with a deadline this close: the next request, and
+		// every one after it, would treat a freshly installed pair as about to
+		// expire and spend a renewal. A site issuing tokens shorter than the margin
+		// would then renew once per request. Such a pair is used until the site
+		// refuses it instead.
+		accessExpires = time.Time{}
+	}
 	f.tok.mu.Lock()
 	f.tok.access = access
 	if refresh != "" {
@@ -785,9 +897,9 @@ func (f *Fs) setTokens(access, refresh string, accessExpires time.Time) {
 // the stored credential from ageing out between runs.
 //
 // The site keeps a refresh token working until it expires on its own, so a renewal
-// that never reached the file costs the next run the one request that trades it
-// again, not a sign-in. Writing is skipped when the file already holds this pair,
-// so a run that only read the config does not rewrite it.
+// that never reached the config costs the next run the one request that trades it
+// again, not a sign-in. Writing is skipped when the config already resolves to this
+// pair, so a run that changed nothing does not rewrite the file behind it.
 func (f *Fs) saveTokens() {
 	if f.cfg == nil {
 		return
@@ -1226,20 +1338,25 @@ func lockConflicts(err error) []api.LockConflict {
 // plainCall makes one API request without a bearer token, for the endpoints that
 // issue it
 func (f *Fs) plainCall(ctx context.Context, method, endpoint string, query url.Values, in, out interface{}) error {
-	return f.oneCall(ctx, method, endpoint, query, in, out, false)
+	return f.oneCall(ctx, method, endpoint, query, in, out, "")
 }
 
-// bearerCall makes one API request with the token in hand, and does not renew.
-//
-// Asking who a pair belongs to must not itself be allowed to renew: a site whose
-// tokens are issued already inside the renewal margin would otherwise renew, ask,
-// renew, ask, until the stack gave out.
-func (f *Fs) bearerCall(ctx context.Context, method, endpoint string, query url.Values, out interface{}) error {
-	return f.oneCall(ctx, method, endpoint, query, nil, out, true)
+// tokenToSend returns the token a request should carry, renewing first when there
+// is none
+func (f *Fs) tokenToSend(ctx context.Context) (string, error) {
+	seen := f.tok.currentGeneration()
+	token := f.tok.accessToken()
+	if token != "" {
+		return token, nil
+	}
+	if err := f.renewToken(ctx, seen); err != nil {
+		return "", err
+	}
+	return f.tok.accessToken(), nil
 }
 
 // oneCall sends one request and reads one reply
-func (f *Fs) oneCall(ctx context.Context, method, endpoint string, query url.Values, in, out interface{}, auth bool) error {
+func (f *Fs) oneCall(ctx context.Context, method, endpoint string, query url.Values, in, out interface{}, token string) error {
 	var body []byte
 	if in != nil {
 		var err error
@@ -1252,7 +1369,7 @@ func (f *Fs) oneCall(ctx context.Context, method, endpoint string, query url.Val
 	// them is whatever answers in front of the site dropping connections, and that
 	// clears on its own.
 	return f.pacer.Call(func() (bool, error) {
-		env, err := f.request(ctx, method, endpoint, query, body, auth)
+		env, err := f.request(ctx, method, endpoint, query, body, token)
 		if err != nil {
 			return f.shouldRetry(ctx, err)
 		}
@@ -1296,6 +1413,9 @@ func (f *Fs) callOnce(ctx context.Context, method, endpoint string, query url.Va
 
 // attempt prepares the closure that sends one request and reads one reply
 func (f *Fs) attempt(ctx context.Context, method, endpoint string, query url.Values, in, out interface{}) (func() (bool, error), error) {
+	if err := f.tok.sessionError(); err != nil {
+		return nil, err // the pair in hand belongs to somebody else: nothing may be sent
+	}
 	var body []byte
 	if in != nil {
 		var err error
@@ -1313,7 +1433,14 @@ func (f *Fs) attempt(ctx context.Context, method, endpoint string, query url.Val
 	}
 	return func() (bool, error) {
 		seen := f.tok.currentGeneration()
-		env, err := f.request(ctx, method, endpoint, query, body, true)
+		if err := f.tok.sessionError(); err != nil {
+			return false, err // the pair turned out to be somebody else's: nothing more goes out
+		}
+		token, err := f.tokenToSend(ctx)
+		if err != nil {
+			return false, err
+		}
+		env, err := f.request(ctx, method, endpoint, query, body, token)
 		if err != nil {
 			return f.shouldRetry(ctx, err)
 		}
@@ -1368,7 +1495,7 @@ func (f *Fs) apiError(method, endpoint string, query url.Values, env envelope) e
 }
 
 // request sends one HTTP request and reads the whole reply
-func (f *Fs) request(ctx context.Context, method, endpoint string, query url.Values, body []byte, auth bool) (env envelope, err error) {
+func (f *Fs) request(ctx context.Context, method, endpoint string, query url.Values, body []byte, token string) (env envelope, err error) {
 	u := f.endpoint(endpoint)
 	if len(query) > 0 {
 		u += "?" + query.Encode()
@@ -1385,15 +1512,7 @@ func (f *Fs) request(ctx context.Context, method, endpoint string, query url.Val
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if auth {
-		seen := f.tok.currentGeneration()
-		token := f.tok.accessToken()
-		if token == "" {
-			if err := f.renewToken(ctx, seen); err != nil {
-				return env, err
-			}
-			token = f.tok.accessToken()
-		}
+	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := f.client.Do(req)

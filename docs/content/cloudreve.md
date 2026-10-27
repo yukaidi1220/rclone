@@ -90,9 +90,10 @@ to hold a token itself. Two ways in:
 - **`access_token`** (with `refresh_token` to allow renewal) - for a token taken
   from somewhere else. With no `email` named there is nothing to check such a token
   against, so a token with life ahead of it is used as it stands and opening the
-  remote costs no request; with a `refresh_token` beside it, the pair is traded as
-  soon as the remote opens. With an `email` named the token is asked about once,
-  because its shape says nothing about who it belongs to.
+  remote costs no request. A token that has run out, or says nothing about when it
+  will, is traded with the `refresh_token` beside it as soon as the remote opens.
+  With an `email` named the token is asked about once, because its shape says
+  nothing about who it belongs to.
 
 Before signing in, rclone asks the site how that account can prove itself, so the
 failure modes say something useful instead of "wrong password":
@@ -263,11 +264,11 @@ for the same reason. A folder has no such URL - the site only hands out entity U
 for files - so asking for one is reported as unsupported.
 
 `--unlink` is ignored, which is what rclone documents for a backend without unlink
-support. An earlier version of this backend created **stored direct links** through
-`PUT /file/source`; the site keeps serving every one of those as a permanent public
-URL until it is deleted, and revoking all of them is not what a link request asks
-for. Removing one is a deliberate act, so it is done in the site's own interface
-rather than behind `rclone link`.
+support, and a link is printed as usual. An earlier version of this backend created
+**stored direct links** through `PUT /file/source`; the site keeps serving every one
+of those as a permanent public URL until it is deleted, and revoking all of them is
+not what a link request asks for. Taking one back is a deliberate act of its own, so
+it is left to whatever the site offers for it rather than done behind `rclone link`.
 
 ### Interrupted uploads
 
