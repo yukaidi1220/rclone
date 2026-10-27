@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -2299,6 +2300,34 @@ func TestADeleteOneRefusedChainSpendsTheListingOncePerParentPerLook(t *testing.T
 	require.Equal(t, 7, len(driveFolders(drive)),
 		"four requests read the directory for the purge (three pages and the empty one that ends it) "+
 			"and three read it once for the look that answers all 450 targets together - not 450 walks")
+}
+
+// TestADeleteEvidenceReportsOnlyWhatItCounted pins the wording the resend line
+// quotes. The review caught the log saying "the 2 target(s) are still on the
+// drive" when the walk had stopped at the first hit and the second object was
+// already gone - and that line is the only record an operator has of what the
+// evidence pass concluded, so the number in it has to be what the drive was
+// actually shown.
+func TestADeleteEvidenceReportsOnlyWhatItCounted(t *testing.T) {
+	drive := &fakeDrive{t: t}
+	f := newFakeFs(t, drive)
+	drive.listingFn = func(*http.Request) string {
+		return listingJSON([]string{fileJSON("6000000000000000006", "clip-01.mp4", rootID)}, nil)
+	}
+	parent, err := strconv.ParseInt(rootID, 10, 64)
+	require.NoError(t, err)
+	targets := []taskInfo{
+		{FileID: "6000000000000000006", FileName: "clip-01.mp4", ParentID: &parent},
+		{FileID: "6000000000000000007", FileName: "gone.mp4", ParentID: &parent},
+	}
+	st := &taskStatusResponse{TaskStatus: taskStateDone, FailedCount: 1, SubTaskCount: 2}
+
+	still, why, err := f.deleteEvidenceOnce(context.Background(), targets, st)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(still), "only the object the drive still lists is outstanding")
+	require.Equal(t, "6000000000000000006", still[0].FileID, "and it is the one that is on the drive")
+	require.Equal(t, "1 of the 2 target(s) are still on the drive", why,
+		"the count it reports is what it found, not how many were sent")
 }
 
 // driveFolders copies the folderIds the drive was asked to list, under its lock.
