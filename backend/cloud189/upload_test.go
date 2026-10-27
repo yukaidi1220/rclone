@@ -118,6 +118,15 @@ type fakeDrive struct {
 	// deleteTaskCodes is the same queue for errorCode, which is what a refusal
 	// looks like when the drive does give a reason - a full drive, a spent day.
 	deleteTaskCodes []string
+	// deleteTaskHandled is the successedFileIdList of each successive task, as
+	// the ids the drive says it dealt with. Left unset, the fixture answers the
+	// list only when the task reported nothing failed and nothing skipped - the
+	// one case where the list is not a guess - because MOVE, DELETE and
+	// CLEAR_RECYCLE all answer it and a successful COPY does not (captured
+	// 2026-10-22).
+	deleteTaskHandled [][]string
+	taskInfosByID     map[string][]taskInfo
+	taskHandled       map[string][]string
 	// listFailTimes makes the next that many listings fail outright, so a test can
 	// ask what the check does when the drive will not answer at all.
 	listFailTimes int
@@ -430,10 +439,24 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.createKeys = append(d.createKeys, r.Header.Get("sessionkey"))
 		// A task of several objects reports several done, the way the drive does.
 		d.taskSubs = len(infos)
+		// The handled-id list the poll will answer with is built from what this
+		// task was actually given, so a test cannot script a list that names
+		// objects the task never saw.
+		if d.taskInfosByID == nil {
+			d.taskInfosByID = map[string][]taskInfo{}
+		}
 		// Every task gets its own id, so a test can tell a resend from the task
 		// it repeats - and so the poll can answer this task and not that one.
 		d.taskSeq++
 		taskID := fmt.Sprintf("9000000000000000%02d", d.taskSeq)
+		d.taskInfosByID[taskID] = infos
+		if len(d.deleteTaskHandled) > 0 {
+			if d.taskHandled == nil {
+				d.taskHandled = map[string][]string{}
+			}
+			d.taskHandled[taskID] = d.deleteTaskHandled[0]
+			d.deleteTaskHandled = d.deleteTaskHandled[1:]
+		}
 		if q.Get("type") == taskDelete {
 			if len(d.deleteTaskFailures) > 0 {
 				if d.taskFail == nil {
@@ -502,6 +525,8 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		failed := d.taskFail[q.Get("taskId")]
 		skipped := d.taskSkip[q.Get("taskId")]
 		code := d.taskCode[q.Get("taskId")]
+		infos := d.taskInfosByID[q.Get("taskId")]
+		handled, handledSet := d.taskHandled[q.Get("taskId")], true
 		d.mu.Unlock()
 		st := map[string]any{
 			"res_code": 0, "res_message": "成功", "taskStatus": state,
@@ -512,6 +537,19 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if state == taskStateDone {
 			st["successedCount"] = int64(subs) - failed - skipped
+			// The list the drive names is the list of what it finished with. With
+			// no script it is only safe to name everything, and only when nothing
+			// failed or skipped; naming a subset the test did not script would be
+			// the fixture inventing evidence.
+			if !handledSet && failed == 0 && skipped == 0 && q.Get("type") != taskCopy {
+				handled = make([]string, 0, len(infos))
+				for _, in := range infos {
+					handled = append(handled, in.FileID)
+				}
+			}
+			if len(handled) > 0 {
+				st["successedFileIdList"] = handled
+			}
 		}
 		writeJSON(w, http.StatusOK, st)
 
