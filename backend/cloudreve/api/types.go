@@ -243,10 +243,13 @@ type DeleteSessionRequest struct {
 // an unfinished upload. The id it names is the session holding the file's lock.
 const MetadataUploadSessionID = "sys:upload_session_id"
 
-// CurrentUser is the part of GET /user/me this backend reads: the account's own
-// ID, which is what a lock holder gives as its owner.
+// CurrentUser is the data of GET /user/me.
+//
+// The ID is what a lock conflict names as its owner; the email says whose token
+// this is, which is how a stored pair is checked against the configured account.
 type CurrentUser struct {
-	ID string `json:"id"`
+	ID    string `json:"id"`
+	Email string `json:"email"`
 }
 
 // LockConflict is one holder named by the data of a 40073 answer.
