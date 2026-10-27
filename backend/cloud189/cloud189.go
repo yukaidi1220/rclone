@@ -911,12 +911,17 @@ type Fs struct {
 	pacer      *fs.Pacer          // pacer for API calls
 	dirCache   *dircache.DirCache // map of directory path to directory id
 
-	familyID     string      // family drive id, when space is family
-	fsRootID     string      // the id the dircache was seeded with, i.e. this remote's own root
-	familyRootID string      // the family drive's real root id, once learned
-	apiBase      string      // base URL of the file API, which is apiHost for any remote a user configures
-	uploadBase   string      // where upload traffic goes: the server's host, or upload_zone
-	quota        *quotaState // the account's limits, read at run time
+	familyID     string // family drive id, when space is family
+	fsRootID     string // the id the dircache was seeded with, i.e. this remote's own root
+	familyRootID string // the id a request body names as this remote's anchor
+	// familySpaceRoot is the drive's own top level, read off a listing by
+	// discoverFamilyRoot, and the only id whose listing has to be addressed by the
+	// `0` alias. It is kept apart from familyRootID because root_folder_id can name
+	// a subdirectory, and that anchor is not the space root.
+	familySpaceRoot string      // the family drive's own top level, once discovered
+	apiBase         string      // base URL of the file API, which is apiHost for any remote a user configures
+	uploadBase      string      // where upload traffic goes: the server's host, or upload_zone
+	quota           *quotaState // the account's limits, read at run time
 
 	deleted *deletedRows // ids this process deleted, kept against the listing lag
 }
@@ -1292,6 +1297,7 @@ func (f *Fs) discoverFamilyRoot(ctx context.Context) (string, error) {
 		return "", errors.New("the family drive lists no entries to read a numeric root id from")
 	}
 	f.familyRootID = rootID
+	f.familySpaceRoot = rootID
 	return familyRootAlias, nil
 }
 
@@ -1304,13 +1310,19 @@ func (f *Fs) realDirID(id string) string {
 	return id
 }
 
-// listDirID is the id a listing has to name: the alias wherever the numeric root
-// id appears, because a family listing addressed at the numeric root answers an
-// empty page with no error and reads as an empty drive (measured 2026-10-22, the
-// reason rootID always answers the alias). Request bodies want the numeric id -
-// this is the inverse of realDirID, and the two must not be swapped.
+// listDirID is the id a listing has to name: the alias wherever the family
+// drive's own top level appears, because a family listing addressed at that
+// numeric id answers an empty page with no error and reads as an empty drive
+// (measured 2026-10-22, the reason rootID always answers the alias). Request
+// bodies want the numeric id, so this is the inverse of realDirID and the two
+// must not be swapped.
+//
+// Only familySpaceRoot is translated. familyRootID may instead be the anchor the
+// user named with root_folder_id, which is an ordinary directory whose listing
+// does answer its numeric id - rewriting that one would look in the wrong
+// directory and report whatever it holds as gone.
 func (f *Fs) listDirID(id string) string {
-	if f.opt.Space == spaceFamily && f.familyRootID != "" && id == f.familyRootID {
+	if f.opt.Space == spaceFamily && f.familySpaceRoot != "" && id == f.familySpaceRoot {
 		return familyRootAlias
 	}
 	return id
@@ -2488,29 +2500,53 @@ const (
 // deleteTaskResends is how many times a DELETE task that ended with failures and
 // no errorCode at all is sent again.
 //
-// One is enough by measurement. Captured 2026-10-22 a family directory delete
-// polled nine times (eight of them taskStatus 3) and closed failedCount 1 with no
-// code, a listing taken right after showed the directory still there, and the
-// same payload sent again finished successedCount 1 in 1.2s. The same shape cost
-// a production run on 2026-10-27: the first task came back with no reason, the
-// retry attempt's new task deleted the object.
-const deleteTaskResends = 1
+// The refusal never works itself out. Measured 2026-10-28 with the resend switched
+// off and one pass of the run: 17 of 40 objects were refused, and the directory
+// still listed 18 of them ninety seconds later with nothing else sent. So the
+// object has to be sent again; waiting instead of sending is not a remedy.
+//
+// Two resends, because one does not finish the job. Six runs of 40 objects on the
+// same day, each refusal followed by the listing pass and then a resend, produced
+// 63 refused tasks: the first resend settled 47 of them and 16 came back refused
+// again, and every one of those was gone on the pass that followed. Listing the
+// object again between the two sends is what spaces them - the check costs about
+// six seconds, and a resend sent in the same instant as the refusal is refused
+// again far more often (42% of objects at 15 simultaneous sends with no check
+// between them, against 26% when the check paces them).
+//
+// The rate does not depend on --transfers: the same fixture at transfers 15, 5 and
+// 3 was refused for 9, 10 and 9 to 12 tasks per run, so this is not a backend that
+// needs throttling, it is a server that answers some deletes with an empty
+// failure. One is enough for the case captured 2026-10-22, where a family directory
+// delete polled nine times (eight of them taskStatus 3), closed failedCount 1 with
+// no code, was still listed right after, and the same payload sent again finished
+// successedCount 1 in 1.2s. The second is for the tail this backend meets in
+// production.
+const deleteTaskResends = 2
 
 // deleteVerifyTargets bounds the listing check that follows a DELETE task that did
 // not report success. The per-object paths - sync's excess objects and rmdir -
 // carry one target; a purge can carry thousands and is worth reporting rather
 // than costing a listing per parent. Eight is my choice, not a number the protocol
-// dictates.
+// dictates. The check is bounded, the resend is not: a large task that failed for
+// no reason is still sent back once.
 const deleteVerifyTargets = 8
 
-// How long the check goes on looking for a target before it believes the object
-// is gone: three looks two seconds apart. The measured lag between a delete
-// taking effect and the listing dropping the row is about a second, seven at
-// worst, so the first look already settles the common case and the ones after it
-// cover a slow listing without turning a genuinely stuck delete into a wait.
-const (
-	deleteVerifyAttempts = 3
-	deleteVerifyWait     = 2 * time.Second
+// How the listing check gathers its evidence: up to deleteVerifyLooks looks
+// deleteVerifyWait apart, and the answer is only believed once deleteVerifyAgree
+// of them agree in a row.
+//
+// Both directions need evidence because the two mistakes cost differently. One
+// empty page read as "gone" reports a leftover as deleted and cannot be taken
+// back; a lingering row read as "still there" only delays. The measured lag
+// between a delete taking effect and the listing dropping the row is about a
+// second, seven at worst (measured 2026-10-23 through the readback window), while
+// a truncated page is a single-look trap. These are vars, not consts, so a test
+// can run the logic without paying the wait.
+var (
+	deleteVerifyLooks = 4
+	deleteVerifyAgree = 2
+	deleteVerifyWait  = 2 * time.Second
 )
 
 // Task states. 4 ends the task; the other two are states seen while it runs.
@@ -2694,31 +2730,41 @@ func (f *Fs) runBatchTask(ctx context.Context, auth taskAuth, taskType string, t
 			return st, nil
 		}
 		// A DELETE task that did not report what was asked for is not taken at its
-		// word. Two measured shapes sit behind this. One failed with no reason at
-		// all and the same targets sent again finished it (2026-10-22 captured,
-		// 2026-10-27 in production), so it is sent again once. The other closed as
-		// failed after the work was done, so what the drive actually holds decides,
-		// whatever shape the counts came in - failed, skipped, or short of the
-		// targets. Saying an object was deleted while it is still there is the one
-		// answer here that cannot be taken back.
+		// word. Two measured shapes sit behind this: one failed with no reason at
+		// all and the same targets sent again finished it (captured 2026-10-22,
+		// seen in production 2026-10-27), and one closed as failed after the work
+		// was already done. So the drive is asked what it holds before anything is
+		// sent again - gone means done, with no second task spent on it - and only
+		// what is still there goes back a second time. Whatever the second answer
+		// looks like, the listing has the last word again: the drive can refuse the
+		// repeat of a delete it has already queued, and that refusal says nothing
+		// about whether the object is on the drive. Saying an object was deleted
+		// while it is still there is the one answer here that cannot be taken back.
 		if taskType == taskDelete {
-			if st.FailedCount > 0 && string(st.ErrorCode) == "" && resends < deleteTaskResends {
+			why := "the listing could not say where they are"
+			if len(targets) <= deleteVerifyTargets {
+				gone, gerr := f.targetsGone(ctx, targets)
+				switch {
+				case gerr != nil:
+					fs.Debugf(f, "cloud189: could not check what the unfinished %s task %s left behind: %v", taskType, taskID, gerr)
+				case gone:
+					fs.Logf(f, "cloud189: %s task %s did not report success but the drive no longer holds the %d target(s); taking it as done without sending them again", taskType, taskID, len(targets))
+					return st, nil
+				default:
+					why = fmt.Sprintf("the %d target(s) are still on the drive", len(targets))
+				}
+			}
+			// A refusal the drive did give a reason for is not worth sending back:
+			// the two that appear here, a full drive and a spent day, are decided by
+			// the account and do not clear inside a run.
+			if string(st.ErrorCode) == "" && resends < deleteTaskResends {
 				resends++
-				fs.Logf(f, "cloud189: %s task %s ended with %d of %d failed and no reason; sending the same targets again", taskType, taskID, st.FailedCount, len(targets))
+				fs.Logf(f, "cloud189: %s task %s ended %d failed / %d skipped and %s; sending the same targets again", taskType, taskID, st.FailedCount, st.SkipCount, why)
 				taskID, err = f.createBatchTask(ctx, auth, taskType, targets, targetFolderID)
 				if err != nil {
 					return nil, err
 				}
 				continue
-			}
-			if len(targets) <= deleteVerifyTargets {
-				gone, gerr := f.targetsGone(ctx, targets)
-				if gerr != nil {
-					fs.Debugf(f, "cloud189: could not check what the unfinished %s task %s left behind: %v", taskType, taskID, gerr)
-				} else if gone {
-					fs.Logf(f, "cloud189: %s task %s did not report success but the drive no longer holds the %d target(s); taking it as done", taskType, taskID, len(targets))
-					return st, nil
-				}
 			}
 		}
 		return st, verdict
@@ -2765,26 +2811,31 @@ func (f *Fs) waitBatchTask(ctx context.Context, auth taskAuth, taskID api.FlexID
 // targetsGone reports whether none of the task's targets is on the drive any
 // more, judged by id under the parent the task was given.
 //
-// The listing is asked more than once. The drive keeps answering a deleted row
-// for about a second after the delete reports done, and seven at worst (measured
-// 2026-10-23 through the readback window), so one row is not yet a leftover -
-// but an empty answer is what a successful delete looks like from the first
-// second on. The wait only ever happens on a delete that did not report success.
+// The answer is only believed once two looks agree (see deleteVerifyLooks and
+// deleteVerifyAgree above): an empty page is also what a truncated walk looks
+// like, and calling a leftover deleted is the mistake that cannot be taken back.
+// The wait only ever happens on a delete that did not report success.
 func (f *Fs) targetsGone(ctx context.Context, targets []taskInfo) (bool, error) {
-	for attempt := 0; attempt < deleteVerifyAttempts; attempt++ {
-		gone, err := f.targetsGoneOnce(ctx, targets)
-		if err != nil {
-			return false, err
-		}
-		if gone {
-			return true, nil
-		}
-		if attempt < deleteVerifyAttempts-1 {
+	agree := 0
+	for look := 0; look < deleteVerifyLooks; look++ {
+		if look > 0 {
 			select {
 			case <-ctx.Done():
 				return false, ctx.Err()
 			case <-time.After(deleteVerifyWait):
 			}
+		}
+		gone, err := f.targetsGoneOnce(ctx, targets)
+		if err != nil {
+			return false, err
+		}
+		if !gone {
+			agree = 0
+			continue
+		}
+		agree++
+		if agree >= deleteVerifyAgree {
+			return true, nil
 		}
 	}
 	return false, nil
