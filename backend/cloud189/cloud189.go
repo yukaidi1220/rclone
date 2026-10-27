@@ -2606,12 +2606,21 @@ const deleteTaskResends = 2
 // deleteVerifyWait apart, and the answer is only believed once deleteVerifyAgree
 // of them agree in a row.
 //
+// The window the looks span is (deleteVerifyLooks-1)*deleteVerifyWait and it has
+// to reach past the lag this file distrusts elsewhere: a rename and a delete that
+// crossed inside one second was still unreadable seven seconds later (see
+// deletedRowWindow, and the same measurement in the capture of 2026-10-22). Five
+// looks two seconds apart span eight, so the last look is taken after that
+// window has closed rather than one second inside it. Measured on 2026-10-28 the
+// row was gone from the listing at the first look five times out of five, so the
+// extra look is headroom, not an expectation.
+//
 // Both directions need evidence because the two mistakes cost differently. One
 // empty page read as "gone" reports a leftover as deleted and cannot be taken
 // back; a lingering row read as "still there" only delays. These are vars, not
 // consts, so a test can run the logic without paying the wait.
 var (
-	deleteVerifyLooks = 4
+	deleteVerifyLooks = 5
 	deleteVerifyAgree = 2
 	deleteVerifyWait  = 2 * time.Second
 	// deleteVerifyPages bounds how many listing pages one look may read for one

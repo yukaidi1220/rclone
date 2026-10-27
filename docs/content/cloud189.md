@@ -360,6 +360,16 @@ does not use it (captured: `failedCount 1, skipCount 0, errorCode FileAlreadyExi
 so a skip is reported as "the drive declined these and did not say what became of
 them" rather than being explained.
 
+What is left outstanding after that evidence is sent back to the drive as the same
+task, up to two more times: a refused delete never applies later (measured 2026-10-28,
+an object still listed ninety seconds after the refusal, twice over, with nothing
+else sent). Only a refusal with no `errorCode` is worth repeating - one that names a
+reason is reported as it is. If the object is still on the drive after the last
+send, the delete is reported as a failure; `--cloud189-hard_delete` clears the
+recycle bin only after the delete has been settled, so a delete that came back
+refused leaves its object in the recycle bin rather than clearing something that was
+never deleted.
+
 The `fileName` a `COPY` or `MOVE` entry carries is **ignored**: the object lands in
 the target folder under its **source's** name (measured live 2026-10-24, with the
 command and the readback both kept: a copy of `A.txt` asked to arrive as
