@@ -4286,7 +4286,7 @@ func linkValidity(raw string) (time.Duration, bool) {
 	// The clock starts when the URL was signed, not when it was read, so the
 	// signing time is taken off when it is there.
 	if signedAt, err := time.Parse("20060102T150405Z", q.Get("X-Amz-Date")); err == nil {
-		return signedAt.Add(time.Duration(secs) * time.Second).Sub(time.Now()), true
+		return time.Until(signedAt.Add(time.Duration(secs) * time.Second)), true
 	}
 	return time.Duration(secs) * time.Second, true
 }
