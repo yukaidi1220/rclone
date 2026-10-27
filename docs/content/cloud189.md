@@ -485,6 +485,26 @@ top level: a purge of a subdirectory remote used to name the top level's
 contents, which is how a family drive came to be emptied from inside the test
 suite.
 
+A single-object `DELETE` task sometimes ends with one object failed and no reason
+given at all - `Couldn't delete: ... the server gave no reason` - and the object is
+still on the drive. Measured 2026-10-28 on a 40-object fixture: a pass sees 9 to 12
+of its 40 delete tasks refused this way, and the same targets sent again usually
+finish (47 of 63 refused tasks cleared on the first repeat). After both repeats a
+pass ends with nothing refused or one object left refused - three passes measured.
+Nothing about the refusal depends on how many transfers are in flight -
+`--transfers` 15, 5 and 3 produced the same counts - and waiting for the drive to
+work it out does not help: with the repeat switched off and a single pass, 17
+refused objects were still listed ninety seconds later. So the backend asks the
+drive what it holds and sends a refused delete back up to twice, the listing having
+the final word each time. A refusal that did give a reason (a full drive, a spent
+day) is not repeated, because that answer does not change inside a run. Five passes
+run with this tolerance left 1, 1, 0, 0 and 0 objects refused at the end of a pass,
+and rclone's next pass cleared each of them, so all five exited zero. What a last
+pass still cannot delete is reported, and `--retries` counts it: rclone exits
+non-zero when the last pass fails, however many passes before it recovered, so a run
+that must delete a lot needs enough retries rather than trusting this backend to
+have absorbed everything.
+
 `Rmdir` refuses a directory that still has children - the drive cannot remove one
 without taking them - and refuses the drive's top level. The root of a remote
 opened below the top level is removable when empty, which is what the test
