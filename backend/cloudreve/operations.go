@@ -488,48 +488,47 @@ func (f *Fs) setPolicy(ctx context.Context, policyID string) (any, error) {
 	return f.policyReportFor(ctx, "")
 }
 
-// PublicLink gives a direct link to the entry at remote
+// PublicLink returns the normal download link of the file at remote
 //
-// A folder gets one too, the drive's own top included. Cloudreve direct links are
-// stored records that stay valid until deleted, so expire is ignored. With unlink
-// set the links of the entry are removed instead of created.
+// It is the link every read goes through (POST /file/url, which the site answers
+// with its download_host rewrite applied): no share and no stored direct link is
+// created, so nothing has to be removed afterwards, and the link carries the
+// site's own expiry rather than one asked for here.
+//
+// The link is minted for this call rather than taken from the cache reads fill,
+// because one with a few minutes left is of little use to whoever asked for it.
+// The site hands out entity URLs for files only, so a folder has none.
 func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
-	if expire > 0 {
-		fs.Logf(f, "direct links last until they are deleted, so --expire is ignored")
-	}
 	if unlink {
-		return "", f.deleteDirectLinks(ctx, remote)
+		// rclone's contract for a backend without unlink is to ignore the flag,
+		// and a download link is stored nowhere, so nothing is left behind.
+		fs.Debugf(f, "a download link is minted per request, so there is no stored link to unlink")
 	}
-	links := []api.DirectLinkResponse{}
-	err := f.call(ctx, "PUT", "/file/source", nil, &api.DirectLinkRequest{Uris: []string{f.uriFor(remote)}}, &links)
+	if expire > 0 {
+		fs.Logf(f, "the site sets its own expiry on download links, so --expire is ignored")
+	}
+	// Ask about the named entry itself rather than going through NewObject: when
+	// the name is not there, cmd/link leaves the whole path in the Fs root and
+	// asks about "", so a plain NewObject would report a missing name as a folder.
+	file, err := f.statFile(ctx, remote)
+	if err != nil {
+		return "", f.mapMissingFile(remote, err)
+	}
+	if file.Type == api.FileTypeFolder {
+		return "", fs.ErrorCantShareDirectories
+	}
+	link, err := f.freshDownloadURL(ctx, remote)
 	if err != nil {
 		return "", err
 	}
-	if len(links) == 0 || links[0].Link == "" {
-		return "", fmt.Errorf("cloudreve: no direct link returned for %q", remote)
-	}
-	return f.absoluteURL(links[0].Link), nil
-}
-
-// deleteDirectLinks removes every stored direct link of the file
-func (f *Fs) deleteDirectLinks(ctx context.Context, remote string) error {
-	query := url.Values{}
-	query.Set("uri", f.uriFor(remote))
-	query.Set("extended", "true")
-	info := new(api.FileExtended)
-	if err := f.call(ctx, "GET", "/file/info", query, nil, info); err != nil {
-		return err
-	}
-	for _, link := range info.ExtendedInfo.DirectLinks {
-		endpoint := "/file/source/" + url.PathEscape(link.ID)
-		if err := f.call(ctx, "DELETE", endpoint, nil, nil, nil); err != nil {
-			return err
-		}
-	}
-	return nil
+	return f.absoluteURL(link), nil
 }
 
 // absoluteURL makes a server-relative URL complete
+//
+// ResolveReference is what the URL rules say: an absolute path is taken from the
+// host root, a relative one from the remote's own base, and a network-path
+// reference keeps the host it names.
 func (f *Fs) absoluteURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil || u.IsAbs() {
@@ -539,9 +538,7 @@ func (f *Fs) absoluteURL(raw string) string {
 	if err != nil {
 		return raw
 	}
-	base.Path = path.Join(base.Path, u.Path)
-	base.RawQuery = u.RawQuery
-	return base.String()
+	return base.ResolveReference(u).String()
 }
 
 // mapMissingDir turns the server's not-found answers about a folder into

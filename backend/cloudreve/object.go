@@ -115,6 +115,17 @@ func (f *Fs) forgetURL(remote string) {
 	delete(f.links, f.uriFor(remote))
 }
 
+// freshDownloadURL mints a link for this call instead of handing back one the
+// read cache still has some life in
+//
+// A read only needs a link that works right now, but a link asked for so it can
+// be passed on is worth a request of its own: one with minutes left is of little
+// use to whoever receives it.
+func (f *Fs) freshDownloadURL(ctx context.Context, remote string) (string, error) {
+	f.forgetURL(remote)
+	return f.downloadURL(ctx, remote)
+}
+
 // Open reads the object
 //
 // The link points into the object store, so it is fetched without the session
