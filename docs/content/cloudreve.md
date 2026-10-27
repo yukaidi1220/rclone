@@ -262,11 +262,12 @@ site's own expiry passes, and it cannot be revoked early. `--expire` has no effe
 for the same reason. A folder has no such URL - the site only hands out entity URLs
 for files - so asking for one is reported as unsupported.
 
-`--unlink` removes **stored direct links**, which an earlier version of this backend
-created through `PUT /file/source`. Nothing creates them any more, but the site keeps
-serving every one of them as a permanent public URL until it is deleted, so `--unlink`
-is the way to take one back, and it prints no link. A file with none stored is already
-in the wanted state and is not an error.
+`--unlink` is ignored, which is what rclone documents for a backend without unlink
+support. An earlier version of this backend created **stored direct links** through
+`PUT /file/source`; the site keeps serving every one of those as a permanent public
+URL until it is deleted, and revoking all of them is not what a link request asks
+for. Removing one is a deliberate act, so it is done in the site's own interface
+rather than behind `rclone link`.
 
 ### Interrupted uploads
 
