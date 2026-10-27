@@ -390,12 +390,3 @@ Binding changes where **new** files go and leaves what is already there alone. T
 site has no "inherit again" value, so undoing a binding means naming the policy the
 `policy` command reported beforehand. See [folders](#folders) for how a folder's
 policy is resolved.
-
-`rclone backend downloadurl remote:folder file.ext` returns the normal download URL
-of one path - the same URL reads use (honoring `download_host`), not a share link -
-so scripts and rc callers can fetch links without shelling out to a second binary.
-The URL carries the server's own expiry; re-request it when downloads start
-failing. Via the rc command `backend/command`, name the path in `arg` relative to
-the remote root (the handler reads `fs`, `command`, `opt` and `arg` only):
-
-    rclone rc backend/command command=downloadurl fs=remote: -a some/folder/file.ext
