@@ -276,3 +276,52 @@ func TestPublicLinkRefusesADirectory(t *testing.T) {
 
 	require.Zero(t, drive.downloadHits, "none of the three reached the link endpoint")
 }
+
+// TestPublicLinkHandsBackTheAddressTheBytesComeFrom is why PublicLink follows the
+// one redirect instead of quoting the drive's own endpoint. download.cloud.189.cn
+// is a redirector: the address the object is really read from is behind it
+// (measured 2026-10-27, a 302 to a presigned OBS URL), and that host is what a
+// direct-link rule keys on. A client that does not follow redirects - or that has
+// to decide the host before it asks - is handed nothing useful by the first form.
+func TestPublicLinkHandsBackTheAddressTheBytesComeFrom(t *testing.T) {
+	drive := &fakeDrive{t: t,
+		readBody:     []byte("0123456789"),
+		linkRedirect: "/store/obs?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=300&X-Amz-Signature=OBS-SIGNATURE-1",
+	}
+	f := newFakeFs(t, drive)
+	drive.listingFn = func(*http.Request) string {
+		return listingJSON([]string{fileJSON("7000000000000000007", "clip.mp4", rootID)}, nil)
+	}
+
+	link, err := f.PublicLink(context.Background(), "clip.mp4", fs.DurationOff, false)
+	require.NoError(t, err)
+	require.Contains(t, link, "X-Amz-Signature=OBS-SIGNATURE-1", "the storage address came back")
+	require.NotContains(t, link, "/store/file", "not the redirector")
+	require.NotContains(t, link, "sig=LIVE-SIGNATURE-VALUE", "and the drive's own signature is not part of what went out")
+	require.Equal(t, 1, drive.downloadHits, "learning where the link goes must not cost a second link")
+
+	require.Len(t, drive.readQueries, 2, "one request to the link, one to what it named")
+	require.Equal(t, "bytes=0-0", drive.readRanges[0], "a byte is asked for, so following the link is not a download")
+}
+
+// TestPublicLinkFallsBackToTheRedirectingLink covers the resolution failing. The
+// link the drive minted is valid and does serve anything that follows a redirect,
+// so losing only that property is worth reporting rather than losing the link -
+// and the address that refused is not passed on as if it had worked.
+func TestPublicLinkFallsBackToTheRedirectingLink(t *testing.T) {
+	drive := &fakeDrive{t: t,
+		readBody:     []byte("0123456789"),
+		readStatus:   []int{http.StatusOK, http.StatusForbidden},
+		linkRedirect: "/store/obs?X-Amz-Expires=300&X-Amz-Signature=OBS-SIGNATURE-1",
+	}
+	f := newFakeFs(t, drive)
+	drive.listingFn = func(*http.Request) string {
+		return listingJSON([]string{fileJSON("7000000000000000007", "clip.mp4", rootID)}, nil)
+	}
+
+	link, err := f.PublicLink(context.Background(), "clip.mp4", fs.DurationOff, false)
+	require.NoError(t, err, "the storage address refused, but the drive's own link is still in hand")
+	require.Contains(t, link, "/store/file", "so what goes out is the form that redirects")
+	require.NotContains(t, link, "X-Amz-Signature", "and the address that refused is not handed out as if it had worked")
+	require.Len(t, drive.readRanges, 2, "the link was followed once before giving up")
+}

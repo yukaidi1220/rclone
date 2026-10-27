@@ -112,6 +112,10 @@ type fakeDrive struct {
 	// The download link and the storage layer on the way down.
 	downloadLink string            // what getFileDownloadUrl answers; empty means the escaped link below
 	downloadHits int               // how many times a link was minted
+	// linkRedirect is the path (with query) that the link's own address 302s to.
+	// Set, it makes the storage host answer elsewhere, the way download.cloud.189.cn
+	// redirects to a presigned OBS URL (measured 2026-10-27).
+	linkRedirect string
 	readStatus   []int             // status for each successive read; shorter than the reads means 200
 	readBody     []byte            // bytes served on a read, default a short constant
 	readQueries  []string          // the query each read actually arrived with
@@ -562,22 +566,33 @@ func (d *fakeDrive) storeRead(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, map[string]any{"Error": "AccessDenied", "RequestPath": r.URL.String()})
 		return
 	}
+	if r.URL.Path == "/store/file" && d.linkRedirect != "" {
+		// The drive's own download endpoint is a redirector, not the bytes.
+		w.Header().Set("Location", "http://"+r.Host+d.linkRedirect)
+		w.WriteHeader(http.StatusFound)
+		return
+	}
 	if body == nil {
 		body = []byte("downloaded-bytes")
 	}
 	// A Range header is honoured the way the storage host honours it: 206 with
-	// the rest of the object.
+	// exactly the window asked for, clipped at the end of the object.
 	payload := body
 	status = http.StatusOK
 	if rng := r.Header.Get("Range"); strings.HasPrefix(rng, "bytes=") && len(body) > 0 {
-		spec := strings.TrimSuffix(strings.TrimPrefix(rng, "bytes="), "-")
+		spec := strings.TrimPrefix(rng, "bytes=")
+		startText, endText := spec, ""
 		if i := strings.IndexByte(spec, '-'); i >= 0 {
-			spec = spec[:i]
+			startText, endText = spec[:i], spec[i+1:]
 		}
-		if start, err := strconv.ParseInt(spec, 10, 64); err == nil && start >= 0 && start <= int64(len(body)) {
-			payload = body[start:]
+		if start, err := strconv.ParseInt(startText, 10, 64); err == nil && start >= 0 && start <= int64(len(body)) {
+			stop := int64(len(body))
+			if end, err := strconv.ParseInt(endText, 10, 64); err == nil && end >= start && end < int64(len(body)) {
+				stop = end + 1
+			}
+			payload = body[start:stop]
 			status = http.StatusPartialContent
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(body)-1, len(body)))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, stop-1, len(body)))
 		}
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
