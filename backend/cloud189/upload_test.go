@@ -1058,8 +1058,13 @@ func newFakeFs(t *testing.T, drive *fakeDrive) *Fs {
 	// The delete check's waits are production timing; a test asserts what the
 	// looks say, not how long they take. They are vars so they can be zeroed here
 	// rather than being read as a constant the tests cannot touch.
+	//
+	// The cleanup gives back what it found, not a literal: writing the production
+	// number back here would hide any change to it, and one test exists precisely
+	// to notice such a change.
+	oldWait := deleteVerifyWait
 	deleteVerifyWait = 0
-	t.Cleanup(func() { deleteVerifyWait = 2 * time.Second })
+	t.Cleanup(func() { deleteVerifyWait = oldWait })
 	f.opt.ChunkSize = fs.SizeSuffix(fakePartBase)
 	f.opt.UploadConcurrency = 2
 	f.opt.Enc = cloud189DefaultEncoding

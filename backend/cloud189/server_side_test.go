@@ -1806,11 +1806,14 @@ func TestADeleteStillFailingWithNoReasonIsReportedWhenTheObjectRemains(t *testin
 	require.Len(t, drive.tasks, 3, "both resends, and no more")
 }
 
-// TestADeleteStillRefusedAfterTheFirstResendIsSentAgainAndClears is the tail the
-// second resend is for: measured 2026-10-28, 16 of 63 refused tasks came back
-// refused from the first resend as well, and every one of them went away on the
-// send that followed. A refused delete never works itself out while the client
-// waits, so the answer is to send again, not to hold still.
+// TestADeleteStillRefusedAfterTheFirstResendIsSentAgainAndClears is what the
+// second resend is for. What was measured (2026-10-28, six passes with a tolerance
+// of one) is that 16 of 63 refused tasks came back refused from the first resend
+// too, and that those 16 were cleared by a later pass of rclone's rather than by
+// anything the backend sent inside the failed one - see the deleteTaskResends
+// comment. A refused delete never works itself out while the client waits, so
+// within one pass the answer is to send again; how many sends one pass needs is a
+// number that has not been measured.
 func TestADeleteStillRefusedAfterTheFirstResendIsSentAgainAndClears(t *testing.T) {
 	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1}}
 	f := newFakeFs(t, drive)
@@ -1819,7 +1822,15 @@ func TestADeleteStillRefusedAfterTheFirstResendIsSentAgainAndClears(t *testing.T
 	}
 
 	require.NoError(t, srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background()))
-	require.Len(t, drivesTasks(drive), 3, "the object is listed between the sends, so all three are spent")
+	sent := drivesTasks(drive)
+	require.Len(t, sent, 3, "the object is listed between the sends, so all three are spent")
+	// Every send has to carry the object. Dropping it from the second resend -
+	// which is what a resend that trims its own target list looks like - would
+	// report the delete done having only ever asked once.
+	for i := range sent {
+		require.Len(t, sent[i].infos, 1, "send %d of the chain carries the one target it was created for", i)
+		require.Equal(t, "6000000000000000006", sent[i].infos[0].FileID, "and it is the refused object, every time")
+	}
 }
 
 // TestADeleteThatIsAlreadyGoneIsNotSentAgain is the point of asking the drive
@@ -2223,6 +2234,71 @@ func TestADeleteTheListingCannotAnswerIsNotTakenAsDone(t *testing.T) {
 	err := srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background())
 	require.Error(t, err, "the listing refused to say, so nothing was concluded from it")
 	require.Len(t, drivesTasks(drive), 3, "the measured cure is owed twice")
+}
+
+// TestADeleteEvidenceWindowReachesPastTheLagItDistrusts is the one place the
+// spacing of the looks is written down as a requirement rather than as four
+// unrelated numbers. The absence check spans (looks-1)*wait between its first and
+// last look; the same package distrusts a listing that was still stale seven
+// seconds after the mutation landed (deletedRowWindow, and the capture of
+// 2026-10-22 it comes from). A window that stops inside that period asks the
+// question five times while the drive has not yet answered it.
+func TestADeleteEvidenceWindowReachesPastTheLagItDistrusts(t *testing.T) {
+	require.Equal(t, 5, deleteVerifyLooks, "five looks")
+	require.Equal(t, 2*time.Second, deleteVerifyWait, "two seconds apart")
+	window := time.Duration(deleteVerifyLooks-1) * deleteVerifyWait
+	require.GreaterOrEqual(t, window, 8*time.Second,
+		"the last look has to fall after the seven seconds the stale-row window allows, not inside it")
+}
+
+// TestADeleteLooksThatRunOutAreNotTakenAsGone covers the end of the look loop.
+// Here every look says the object is missing, so the answer never gets the two
+// agreements it asks for and the looks simply run out. That is not evidence of an
+// absence: the targets have to stay outstanding, which costs a resend and, when
+// the resends run out too, a reported failure.
+func TestADeleteLooksThatRunOutAreNotTakenAsGone(t *testing.T) {
+	drive := &fakeDrive{t: t, deleteTaskFailures: []int64{1, 1, 1}}
+	f := newFakeFs(t, drive)
+	drive.listingFn = func(*http.Request) string {
+		return listingJSON([]string{fileJSON("6000000000000000007", "other.mp4", rootID)}, nil)
+	}
+	oldAgree, oldLooks := deleteVerifyAgree, deleteVerifyLooks
+	deleteVerifyAgree, deleteVerifyLooks = 3, 2
+	t.Cleanup(func() {
+		deleteVerifyAgree, deleteVerifyLooks = oldAgree, oldLooks
+	})
+
+	err := srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background())
+	require.Error(t, err, "the looks ran out before they agreed, which settles nothing")
+	require.Len(t, drivesTasks(drive), 3, "and the undecidable answer still owes the resends")
+}
+
+// TestADeleteOneRefusedChainSpendsTheListingOncePerParentPerLook is the cost
+// contract. The directory holds 450 rows, which pages as 200+200+50, and a purge
+// of it is one task of all 450 targets. Asking the drive which of those are still
+// on the drive is answered by reading the directory once, not 450 times, because
+// the walk groups every target under its parent - so what this chain may spend is
+// the purge's own read of the directory plus one look. A check that asked per
+// target, or a look that kept going after it had the answer, moves that number.
+func TestADeleteOneRefusedChainSpendsTheListingOncePerParentPerLook(t *testing.T) {
+	var rows []string
+	for i := 1; i <= 450; i++ {
+		rows = append(rows, fileJSON(fmt.Sprintf("710000000000000%04d", i), fmt.Sprintf("g%03d.mp4", i), rootID))
+	}
+	drive := &fakeDrive{t: t,
+		deleteTaskFailures: []int64{1, 0},
+		pagedRows:          rows,
+	}
+	f := newFakeFs(t, drive)
+
+	require.NoError(t, f.Purge(context.Background(), ""), "the resend finished what the first task refused")
+
+	sent := drivesTasks(drive)
+	require.Equal(t, 2, len(sent), "one refusal, one resend, and the resend is answered clean")
+	require.Equal(t, 450, len(sent[0].infos), "the purge sends the whole directory as one task")
+	require.Equal(t, 7, len(driveFolders(drive)),
+		"four requests read the directory for the purge (three pages and the empty one that ends it) "+
+			"and three read it once for the look that answers all 450 targets together - not 450 walks")
 }
 
 // driveFolders copies the folderIds the drive was asked to list, under its lock.
