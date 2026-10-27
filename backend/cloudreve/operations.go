@@ -488,10 +488,11 @@ func (f *Fs) setPolicy(ctx context.Context, policyID string) (any, error) {
 // because one with a few minutes left is of little use to whoever asked for it.
 // The site hands out entity URLs for files only, so a folder has none.
 //
-// unlink removes the stored direct links an earlier version of this backend
-// created. Nothing creates them any more, but the site keeps serving every one
-// of them as a permanent public URL until it is deleted, so unlink stays the way
-// to take one back. It returns no link, as rclone expects of an unlink.
+// unlink is ignored, as rclone documents for a backend that cannot unlink, and a
+// link is returned anyway. The stored direct links an earlier version of this
+// backend created are permanent public URLs the site keeps serving until they are
+// deleted, and revoking every one of them for a file is not what a link request
+// asks for; how to do it is kept in the comment below.
 func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
 	if unlink {
 		// rclone's contract for a backend without unlink is to ignore the flag,
@@ -527,10 +528,10 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 
 // An earlier version of this backend created stored direct links, which the site
 // keeps serving as permanent public URLs until they are deleted, and this is how
-// it deletes them. Nothing calls it: PublicLink reports no unlink support, so a
-// run of `rclone link --unlink` leaves whatever earlier runs handed out alone.
-// Kept as a comment rather than deleted, so nobody has to work out again how the
-// site revokes one.
+// it deletes them. Nothing calls it: PublicLink ignores `--unlink`, so a run of
+// `rclone link --unlink` leaves whatever earlier runs handed out alone. Kept as a
+// comment rather than deleted, so nobody has to work out again how the site
+// revokes one - and so nobody mistakes it for code that still runs.
 //
 // func (f *Fs) deleteDirectLinks(ctx context.Context, remote string) error {
 // 	query := url.Values{}
