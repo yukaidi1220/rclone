@@ -2236,6 +2236,34 @@ func TestUnitPasskeyAccountWithAPasswordIsStillSignedIn(t *testing.T) {
 	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token"))
 }
 
+// TestUnitUnanswerableUndatedTokenIsUsedNotFailed covers the one shape left where
+// the site answers nothing about a token that cannot be traded or signed over: the
+// run goes on with it and says so, because failing would close a remote that works
+// today and there is nothing better to put in its place.
+func TestUnitUnanswerableUndatedTokenIsUsedNotFailed(t *testing.T) {
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      "",
+		"access_token":  "OPAQUE",
+		"refresh_token": "",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME"}) // the site names no email
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			assert.Equal(t, "Bearer OPAQUE", rec.header.Get("Authorization"))
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err, "nothing was learned against the token, and nothing can replace it")
+	assert.Equal(t, 1, s.count("GET", "/api/v4/user/me"), "it was asked about once")
+	assert.Equal(t, "OPAQUE", f.tok.accessToken())
+}
+
 // TestUnitAliveTokenOfAnotherAccountIsRefusedEvenWithoutAPassword is the gate
 // that has no workaround: the site says this pair belongs to somebody else, and
 // there is no password to sign in with. Every other answer the check can give is
@@ -2377,6 +2405,47 @@ func TestUnitRenewalKeepsTheRefreshTokenItWasGiven(t *testing.T) {
 	f.tok.mu.Unlock()
 	assert.Equal(t, "SEEDR", held, "the old refresh token is kept")
 	assert.Equal(t, "SEEDR", token(f, "refresh_token"), "and so in the config")
+}
+
+// TestUnitSiteRefusalIsAnAnswerNotAFault checks what counts as the site refusing a
+// refresh: an answer carrying a code, and not one that asks for another request.
+// Only a refusal means the lineage is gone; a rate limit or a 5xx says come back.
+func TestUnitSiteRefusalIsAnAnswerNotAFault(t *testing.T) {
+	business := &apiError{code: api.CodeCheckLogin, msg: "not signed in"}
+	assert.True(t, siteRefused(business), "a business code is the site's answer")
+	assert.False(t, siteRefused(errors.New("connection reset")), "a transport failure is not an answer")
+	assert.False(t, siteRefused(pacer.RetryAfterError(business, time.Second)),
+		"a rate limit or a server-side failure is worth another request, not a sign-in")
+	assert.False(t, siteRefused(nil))
+}
+
+// TestUnitDroppedRenewalDoesNotSignIn checks that a renewal which never got an
+// answer is not read as the site refusing the refresh. The site keeps a refresh
+// token working after it has been used, so a dropped connection says nothing about
+// the token - and signing in behind one would open a session for a network hiccup.
+func TestUnitDroppedRenewalDoesNotSignIn(t *testing.T) {
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      obscure.MustObscure("hunter2"),
+		"refresh_token": "SEEDR",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+		case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+			conn, _, err := w.(http.Hijacker).Hijack()
+			require.NoError(t, err)
+			_ = conn.Close() // the answer never arrives
+		default:
+			s.t.Fatalf("a dropped renewal is not a refused one: %s %s", rec.method, rec.path)
+		}
+	})
+
+	err := f.renewToken(testCtx(), f.tok.currentGeneration())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "can't renew the session")
+	assert.Equal(t, 0, s.count("POST", "/api/v4/session/token"), "no sign-in was started")
+	assert.Equal(t, 0, s.count("GET", "/api/v4/site/config/login"))
 }
 
 // TestUnitRenewalAfterARefusalIsCheckedToo covers the other place a pair changes
@@ -2533,6 +2602,124 @@ func TestUnitAChangelessRunRewritesNothing(t *testing.T) {
 		assert.Equal(t, fresh, m.Simple["access_token"])
 		assert.Equal(t, "RT2", m.Simple["refresh_token"])
 	})
+}
+
+// TestUnitForeignPairAfterARenewalStopsTheRun checks the gap between failing one
+// call and stopping the run. A renewal that comes back as another account's pair
+// leaves that pair installed; the next call would find it fresh, never ask about
+// it again, and work on that account's drive from then on. Failing the call that
+// noticed is not enough, so the run itself is stopped.
+func TestUnitForeignPairAfterARenewalStopsTheRun(t *testing.T) {
+	mine := accessToken(time.Now().Add(20 * time.Minute))
+	foreign := accessToken(time.Now().Add(time.Hour))
+	newSiteWith := func(t *testing.T, extra configmap.Simple, handle siteHandler) *Fs {
+		t.Helper()
+		f, _ := newSite(t, "", extra, handle)
+		// Stand for a run that has aged into the renewal margin.
+		f.tok.setExpiry(time.Now().Add(2 * time.Minute))
+		return f
+	}
+	renewToForeign := func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+			reply(w, api.CodeSuccess, api.Token{
+				AccessToken: foreign, RefreshToken: "RT2", AccessExpires: time.Now().Add(time.Hour)})
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			if rec.header.Get("Authorization") == "Bearer "+foreign {
+				reply(w, api.CodeSuccess, api.CurrentUser{ID: "OTHER", Email: "someone.else@example.com"})
+				return
+			}
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+		default:
+			s.t.Fatalf("nothing may be asked of the foreign account: %s %s", rec.method, rec.path)
+		}
+	}
+
+	t.Run("no password to sign in with", func(t *testing.T) {
+		f := newSiteWith(t, configmap.Simple{
+			"email":         "me@example.com",
+			"password":      "",
+			"access_token":  mine,
+			"refresh_token": "SEEDR",
+		}, renewToForeign)
+
+		_, err := f.List(testCtx(), "")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "belongs to someone.else@example.com")
+
+		_, err = f.List(testCtx(), "")
+		require.Error(t, err, "the next call must not go on with the foreign pair")
+		assert.Contains(t, err.Error(), "belongs to someone.else@example.com")
+		assert.Contains(t, err.Error(), "no password to sign in with", "and it says why the run cannot go on")
+		assert.Equal(t, mine, token(f, "access_token"), "the config still holds the pair it was given")
+	})
+
+	t.Run("signing in fails", func(t *testing.T) {
+		f := newSiteWith(t, configmap.Simple{
+			"email":         "me@example.com",
+			"password":      obscure.MustObscure("hunter2"),
+			"access_token":  mine,
+			"refresh_token": "SEEDR",
+		}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+			switch {
+			case rec.method == "GET" && rec.path == "/api/v4/site/config/login":
+				reply(w, api.CodeSuccess, api.LoginConfig{LoginCaptcha: true})
+			case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+				reply(w, api.CodeSuccess, api.Token{
+					AccessToken: foreign, RefreshToken: "RT2", AccessExpires: time.Now().Add(time.Hour)})
+			case rec.method == "GET" && rec.path == "/api/v4/user/me":
+				if rec.header.Get("Authorization") == "Bearer "+foreign {
+					reply(w, api.CodeSuccess, api.CurrentUser{ID: "OTHER", Email: "someone.else@example.com"})
+					return
+				}
+				reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+			default:
+				s.t.Fatalf("nothing may be asked of the foreign account: %s %s", rec.method, rec.path)
+			}
+		})
+
+		_, err := f.List(testCtx(), "")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "captcha", "the sign-in is what failed")
+
+		_, err = f.List(testCtx(), "")
+		require.Error(t, err, "and the pair it could not replace is not used either")
+		assert.Contains(t, err.Error(), "belongs to someone.else@example.com")
+	})
+}
+
+// TestUnitShortLivedPairIsNotRenewedPerRequest checks a site whose tokens live
+// shorter than the renewal margin. Recording such a deadline would make every
+// request treat the pair it just renewed as about to expire; the pair is used
+// instead, and renewed when the site refuses it.
+func TestUnitShortLivedPairIsNotRenewedPerRequest(t *testing.T) {
+	short := accessToken(time.Now().Add(3 * time.Minute))
+	f, s := newSite(t, "", configmap.Simple{
+		"email":         "me@example.com",
+		"password":      "",
+		"access_token":  accessToken(time.Now().Add(-time.Minute)),
+		"refresh_token": "SEEDR",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "POST" && rec.path == "/api/v4/session/token/refresh":
+			reply(w, api.CodeSuccess, api.Token{
+				AccessToken: short, RefreshToken: "RT2", AccessExpires: time.Now().Add(3 * time.Minute)})
+		case rec.method == "GET" && rec.path == "/api/v4/user/me":
+			reply(w, api.CodeSuccess, api.CurrentUser{ID: "ME", Email: "me@example.com"})
+		case rec.method == "GET" && rec.path == "/api/v4/file":
+			reply(w, api.CodeSuccess, api.ListResponse{})
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+
+	_, err := f.List(testCtx(), "")
+	require.NoError(t, err)
+	_, err = f.List(testCtx(), "")
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.count("POST", "/api/v4/session/token/refresh"),
+		"the trade at the start is the only one: a deadline this close is not kept")
+	assert.Equal(t, 1, s.count("GET", "/api/v4/user/me"), "and it is not asked about again either")
 }
 
 // TestUnitPublicLinkIsTheDownloadURL checks that a link is the URL reads use, is
@@ -3335,7 +3522,7 @@ func TestUnitRetryAfterIsHonouredAsGiven(t *testing.T) {
 		}
 		s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
 	})
-	_, err := f.request(testCtx(), "GET", "/file", nil, nil, true)
+	_, err := f.request(testCtx(), "GET", "/file", nil, nil, "test-token")
 	require.Error(t, err)
 	wait, isRetryAfter := pacer.IsRetryAfter(err)
 	require.True(t, isRetryAfter, "a rate limit is classed as worth coming back for")
