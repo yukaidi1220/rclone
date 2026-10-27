@@ -343,12 +343,32 @@ already sent.
 `createBatchTask.action` followed by `checkBatchTask.action` until the task
 reaches state 4. Nothing crosses the wire except ids.
 
-A finished task is judged **only** by its counters. `res_code` stays `0` and HTTP
-stays `200` even when the server did nothing at all: measured 2026-10-22, a family
-delete came back with `failedCount: 1`, no `errorCode` and no message of any kind,
-and the objects were still on the drive. So `failedCount`, `skipCount` and
-`successedCount` decide, and a task that reports fewer successes than objects were
-sent is an error, as is one that skipped anything.
+A finished task's counters are the trigger, not the verdict. `res_code` stays `0`
+and HTTP stays `200` even when the server did nothing at all: measured 2026-10-22, a
+family delete came back with `failedCount: 1`, no `errorCode` and no message of any
+kind, and the objects were still on the drive. So `failedCount`, `skipCount` and
+`successedCount` decide whether a task is *suspect*, and a task that reports fewer
+successes than objects were sent, or skipped anything, is not accepted at its word.
+What settles a suspect **delete** is the drive's own evidence, in this order:
+`successedFileIdList`, which names the objects the task handled (captured 2026-10-22
+for MOVE, DELETE and CLEAR_RECYCLE; a successful COPY does not answer it), and then a
+listing of each parent directory, read to its end - the drive's own `count`, which
+measured 2026-10-28 is the number of rows in the directory rather than on the page,
+has to agree with the rows actually seen before an absence may be read as a deletion.
+`skipCount` is the one counter whose meaning has not been measured: a name conflict
+does not use it (captured: `failedCount 1, skipCount 0, errorCode FileAlreadyExists`),
+so a skip is reported as "the drive declined these and did not say what became of
+them" rather than being explained.
+
+What is left outstanding after that evidence is sent back to the drive as the same
+task, up to two more times: a refused delete never applies later (measured 2026-10-28,
+an object still listed ninety seconds after the refusal, twice over, with nothing
+else sent). Only a refusal with no `errorCode` is worth repeating - one that names a
+reason is reported as it is. If the object is still on the drive after the last
+send, the delete is reported as a failure; `--cloud189-hard_delete` clears the
+recycle bin only after the delete has been settled, so a delete that came back
+refused leaves its object in the recycle bin rather than clearing something that was
+never deleted.
 
 The `fileName` a `COPY` or `MOVE` entry carries is **ignored**: the object lands in
 the target folder under its **source's** name (measured live 2026-10-24, with the
@@ -484,6 +504,26 @@ That anchor is the directory the remote resolved at open time, not the space's
 top level: a purge of a subdirectory remote used to name the top level's
 contents, which is how a family drive came to be emptied from inside the test
 suite.
+
+A single-object `DELETE` task sometimes ends with one object failed and no reason
+given at all - `Couldn't delete: ... the server gave no reason` - and the object is
+still on the drive. Measured 2026-10-28 on a 40-object fixture: a pass sees 9 to 12
+of its 40 delete tasks refused this way, and the same targets sent again usually
+finish (47 of 63 refused tasks cleared on the first repeat). After both repeats a
+pass ends with nothing refused or one object left refused - three passes measured.
+Nothing about the refusal depends on how many transfers are in flight -
+`--transfers` 15, 5 and 3 produced the same counts - and waiting for the drive to
+work it out does not help: with the repeat switched off and a single pass, 17
+refused objects were still listed ninety seconds later. So the backend asks the
+drive what it holds and sends a refused delete back up to twice, the listing having
+the final word each time. A refusal that did give a reason (a full drive, a spent
+day) is not repeated, because that answer does not change inside a run. Five passes
+run with this tolerance left 1, 1, 0, 0 and 0 objects refused at the end of a pass,
+and rclone's next pass cleared each of them, so all five exited zero. What a last
+pass still cannot delete is reported, and `--retries` counts it: rclone exits
+non-zero when the last pass fails, however many passes before it recovered, so a run
+that must delete a lot needs enough retries rather than trusting this backend to
+have absorbed everything.
 
 `Rmdir` refuses a directory that still has children - the drive cannot remove one
 without taking them - and refuses the drive's top level. The root of a remote

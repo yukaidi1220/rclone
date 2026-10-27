@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -510,7 +511,7 @@ func refuse(status int, body []byte) error {
 		Msg       string          `json:"msg"`
 		Success   *bool           `json:"success"`
 	}
-	ae := &apiError{Status: status, Body: truncate(string(body), 500)}
+	ae := &apiError{Status: status, Body: describeBody(body, 500)}
 	if err := json.Unmarshal(body, &probe); err == nil {
 		switch {
 		case probe.ErrorCode != "":
@@ -549,7 +550,7 @@ func classify(status int, body []byte) ([]byte, error) {
 		return body, nil
 	}
 	if status >= http.StatusInternalServerError || status == http.StatusTooManyRequests {
-		return body, fmt.Errorf("cloud189: server answered HTTP %d: %s", status, truncate(string(body), 200))
+		return body, fmt.Errorf("cloud189: server answered HTTP %d: %s", status, describeBody(body, 200))
 	}
 	return body, noSpaceError(refuse(status, body))
 }
@@ -559,6 +560,38 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// secretInBody matches a credential-shaped value in whatever the drive answered:
+// the key name and its separator, then the value itself.
+//
+// The key list is what the captures show this drive sending around - sessionKey
+// (which it has echoed back inside an error body, measured 2026-10-26), the
+// access token, and the signature parameters of the download and upload URLs.
+var secretInBody = regexp.MustCompile(`(?i)(session[_-]?key|access[_-]?token|refresh[_-]?token|["a-z_]*token|sk|sign(?:ature)?|cookie)(["']?\s*[:=]\s*["']?)([^"'&,\s}\\]{6,})`)
+
+// describeBody is what an error may quote from a response body.
+//
+// The body is worth quoting - a Tomcat page or an unexpected shape is otherwise
+// undebuggable - but not verbatim: this drive has been measured putting its own
+// sessionKey into an error body, and an error string goes to the log. So each
+// credential-shaped value is replaced by its length, the key name stays, and the
+// fragment is capped. Nothing that can be used to call the drive survives this.
+func describeBody(body []byte, n int) string {
+	s := truncate(string(body), n)
+	var out strings.Builder
+	for {
+		m := secretInBody.FindStringSubmatchIndex(s)
+		if m == nil {
+			out.WriteString(s)
+			return out.String()
+		}
+		// groups: 1 the key name, 2 its separator, 3 the value itself
+		valueStart, valueEnd := m[6], m[7]
+		out.WriteString(s[:valueStart])
+		fmt.Fprintf(&out, "<masked len=%d>", valueEnd-valueStart)
+		s = s[valueEnd:]
+	}
 }
 
 // newRequestID returns a random UUID v4 for the x-request-id header, which the
@@ -911,12 +944,17 @@ type Fs struct {
 	pacer      *fs.Pacer          // pacer for API calls
 	dirCache   *dircache.DirCache // map of directory path to directory id
 
-	familyID     string      // family drive id, when space is family
-	fsRootID     string      // the id the dircache was seeded with, i.e. this remote's own root
-	familyRootID string      // the family drive's real root id, once learned
-	apiBase      string      // base URL of the file API, which is apiHost for any remote a user configures
-	uploadBase   string      // where upload traffic goes: the server's host, or upload_zone
-	quota        *quotaState // the account's limits, read at run time
+	familyID     string // family drive id, when space is family
+	fsRootID     string // the id the dircache was seeded with, i.e. this remote's own root
+	familyRootID string // the id a request body names as this remote's anchor
+	// familySpaceRoot is the drive's own top level, read off a listing by
+	// discoverFamilyRoot, and the only id whose listing has to be addressed by the
+	// `0` alias. It is kept apart from familyRootID because root_folder_id can name
+	// a subdirectory, and that anchor is not the space root.
+	familySpaceRoot string      // the family drive's own top level, once discovered
+	apiBase         string      // base URL of the file API, which is apiHost for any remote a user configures
+	uploadBase      string      // where upload traffic goes: the server's host, or upload_zone
+	quota           *quotaState // the account's limits, read at run time
 
 	deleted *deletedRows // ids this process deleted, kept against the listing lag
 }
@@ -1249,6 +1287,18 @@ func (f *Fs) resolveAnchor(ctx context.Context) error {
 // empty family drive has nothing to read it from, and then only the operations
 // that accept the alias can work - which is what root_folder_id is for.
 func (f *Fs) rootID(ctx context.Context) (string, error) {
+	if f.opt.Space == spaceFamily && f.familySpaceRoot == "" {
+		// The drive's own top level has to be known even when the user named a
+		// root folder, because it may have named that very top level - which is
+		// the id the option's own help recommends. A listing addressed at the
+		// number answers an empty page with no error (measured 2026-10-22), so an
+		// absence check aimed at the number would read a full drive as empty and
+		// call a surviving object deleted. Discovery does not change what this
+		// remote is opened at; it only makes the translation in listDirID total.
+		if _, err := f.discoverFamilyRoot(ctx); err != nil {
+			fs.Debugf(f, "cloud189: could not read the family drive's own top level for the listing translation (%v)", err)
+		}
+	}
 	if f.opt.RootFolderID != "" {
 		return f.opt.RootFolderID, nil
 	}
@@ -1292,6 +1342,7 @@ func (f *Fs) discoverFamilyRoot(ctx context.Context) (string, error) {
 		return "", errors.New("the family drive lists no entries to read a numeric root id from")
 	}
 	f.familyRootID = rootID
+	f.familySpaceRoot = rootID
 	return familyRootAlias, nil
 }
 
@@ -1304,13 +1355,19 @@ func (f *Fs) realDirID(id string) string {
 	return id
 }
 
-// listDirID is the id a listing has to name: the alias wherever the numeric root
-// id appears, because a family listing addressed at the numeric root answers an
-// empty page with no error and reads as an empty drive (measured 2026-10-22, the
-// reason rootID always answers the alias). Request bodies want the numeric id -
-// this is the inverse of realDirID, and the two must not be swapped.
+// listDirID is the id a listing has to name: the alias wherever the family
+// drive's own top level appears, because a family listing addressed at that
+// numeric id answers an empty page with no error and reads as an empty drive
+// (measured 2026-10-22, the reason rootID always answers the alias). Request
+// bodies want the numeric id, so this is the inverse of realDirID and the two
+// must not be swapped.
+//
+// Only familySpaceRoot is translated. familyRootID may instead be the anchor the
+// user named with root_folder_id, which is an ordinary directory whose listing
+// does answer its numeric id - rewriting that one would look in the wrong
+// directory and report whatever it holds as gone.
 func (f *Fs) listDirID(id string) string {
-	if f.opt.Space == spaceFamily && f.familyRootID != "" && id == f.familyRootID {
+	if f.opt.Space == spaceFamily && f.familySpaceRoot != "" && id == f.familySpaceRoot {
 		return familyRootAlias
 	}
 	return id
@@ -1370,12 +1427,50 @@ func (f *Fs) family() bool { return f.opt.Space == spaceFamily }
 // Ids are de-duplicated for the same reason, and maxListPages bounds the loop
 // against a server that keeps repeating a page.
 func (f *Fs) listAll(ctx context.Context, dirID string, fn func(*api.Row) bool) error {
+	_, err := f.walkListing(ctx, dirID, maxListPages, fn)
+	return err
+}
+
+// listingWalk is what one walk of a directory came to.
+//
+// total is the number the drive itself gave for the directory: measured
+// 2026-10-28 against a directory of 240 objects, `fileListAO.count` answered 240
+// on a page that carried 200 rows and again on the page that carried 40, while
+// `fileListSize` answered the rows on that page. So count is the directory's
+// total, not the page's length, and rows == total with the walk exhausted is proof
+// the walk saw everything - which is the one thing an absence answer needs.
+type listingWalk struct {
+	rows      int
+	total     int
+	exhausted bool // a page arrived with nothing new: the listing ended
+	stopped   bool // the caller's own function ended the walk first
+}
+
+// complete reports whether the walk can be read as "everything the directory
+// holds was seen".
+//
+// Two things have to line up: the walk reached its end, and the rows it saw are
+// the number the drive itself claimed for the directory. The second half is why a
+// total of zero is never accepted - "this directory holds nothing" is exactly what
+// the endpoint also answers for an address it does not know (measured 2026-10-22 on
+// a family drive: the numeric root id returns an empty page with no error), and an
+// absence may not be inferred from a page that could not have said otherwise.
+// Concluding that instead of guessing costs nothing when the drive's own
+// successedFileIdList already named the object as handled, which is the first
+// question the evidence pass asks.
+func (w listingWalk) complete() bool {
+	return w.exhausted && !w.stopped && w.total > 0 && w.rows == w.total
+}
+
+// walkListing reads at most maxPages pages of one directory.
+func (f *Fs) walkListing(ctx context.Context, dirID string, maxPages int, fn func(*api.Row) bool) (listingWalk, error) {
+	var w listingWalk
 	seen := map[string]struct{}{}
 	requestURI := "/listFiles.action"
 	if f.family() {
 		requestURI = "/family/file/listFiles.action"
 	}
-	for pageNum := 1; pageNum <= maxListPages; pageNum++ {
+	for pageNum := 1; pageNum <= maxPages; pageNum++ {
 		extra := fmt.Sprintf("pageNum=%d&pageSize=%d&fileType=0&mediaType=0&orderBy=filename&descending=true", pageNum, listPageSize)
 		if f.family() {
 			extra = "familyId=" + url.QueryEscape(f.familyID) + "&" + extra
@@ -1390,11 +1485,18 @@ func (f *Fs) listAll(ctx context.Context, dirID string, fn func(*api.Row) bool) 
 		}
 		body, err := f.call(ctx, f.apiBase, http.MethodGet, requestURI, f.get(extra), "")
 		if err != nil {
-			return err
+			return w, err
 		}
 		listing, err := api.ParseListing(body)
 		if err != nil {
-			return err
+			return w, err
+		}
+		if listing.Count > w.total {
+			// The largest total any page claimed. A directory that is being
+			// emptied while the walk runs reports a smaller total later, and
+			// holding to the larger number keeps "complete" an answer the walk can
+			// only reach by really having seen everything.
+			w.total = listing.Count
 		}
 		stopped := false
 		count := 0
@@ -1428,13 +1530,17 @@ func (f *Fs) listAll(ctx context.Context, dirID string, fn func(*api.Row) bool) 
 			}
 		}
 		if stopped {
-			return nil
+			w.stopped = true
+			w.rows = len(seen)
+			return w, nil
 		}
 		if count == 0 {
-			return nil
+			w.exhausted = true
+			w.rows = len(seen)
+			return w, nil
 		}
 	}
-	return fmt.Errorf("cloud189: listing of %q did not terminate after %d pages, the server keeps returning data", dirID, maxListPages)
+	return w, fmt.Errorf("cloud189: listing of %q did not terminate after %d pages, the server keeps returning data", dirID, maxPages)
 }
 
 // stampParent fills in the parent a task body will need for this row.
@@ -2485,32 +2591,79 @@ const (
 	taskClearRecycle = "CLEAR_RECYCLE"
 )
 
-// deleteTaskResends is how many times a DELETE task that ended with failures and
-// no errorCode at all is sent again.
+// deleteTaskResends is how many times the outstanding part of a DELETE task that
+// ended with failures and no errorCode at all is sent again.
 //
-// One is enough by measurement. Captured 2026-10-22 a family directory delete
-// polled nine times (eight of them taskStatus 3) and closed failedCount 1 with no
-// code, a listing taken right after showed the directory still there, and the
-// same payload sent again finished successedCount 1 in 1.2s. The same shape cost
-// a production run on 2026-10-27: the first task came back with no reason, the
-// retry attempt's new task deleted the object.
-const deleteTaskResends = 1
+// The refusal never works itself out, so something has to be sent. Measured
+// 2026-10-28 with the resend switched off and one pass of the run: 17 of 40 objects
+// were refused, and the directory still listed 18 of them ninety seconds later with
+// nothing else sent, twice over with the same numbers. Waiting is not a remedy.
+//
+// Two, because one does not reliably finish the job. Six passes of the 40-object
+// fixture with a tolerance of one ended rc = 1, 1, 0, 1, 1, 0 - an object still
+// refused at the end of the last pass makes the whole command fail - while seven
+// passes with a tolerance of two, the same ordering and the same flags
+// (--retries 2 --transfers 15 --checkers 8), ended rc = 0 every time, with at most
+// one object still refused inside a pass and that one cleared by the pass after it.
+// Two runs at the size the migration chain really works at (300 excess objects, the
+// sync stage's own --transfers 3 --checkers 4) also ended rc = 0, refusing 2 and 0
+// objects in their last pass. Note what this does NOT measure: the six-and-seven
+// comparison holds the ordering fixed only for the three passes on each side that
+// share it, and no arm has yet varied the tolerance alone in one window. It is a
+// number I chose, and nothing in the protocol says two.
+//
+// What the 63 refused tasks of those six runs do say is that the first resend is
+// not wasted - 47 of them were settled by it - and that the last 16 were settled by
+// a later pass of rclone's, not by anything the backend did inside the first send.
+//
+// The refusals do not depend on how many deletes are in flight: the same fixture at
+// --transfers 15, 5 and 3 was refused for 9, 10 and 9 to 12 tasks per run, so this
+// is not a backend that needs throttling, it is a server that answers some deletes
+// with an empty failure.
+//
+// The spacing between sends is not a sleep: every resend is preceded by the
+// evidence pass in deleteStillOutstanding, which costs at least one listing.
+// Whether asking the drive first makes the resend itself more likely to succeed has
+// not been measured - the two arms that would answer that (same window, same flags,
+// resend-now against resend-after-evidence) have not been run - so the evidence
+// pass is justified by correctness alone: it is what stops a delete the drive has
+// already carried out from being sent back a third time.
+//
+// One refusal is enough for the case captured 2026-10-22, where a family directory
+// delete polled nine times (eight of them taskStatus 3), closed failedCount 1 with
+// no code, was still listed right after, and the same payload sent again finished
+// successedCount 1 in 1.2s.
+const deleteTaskResends = 2
 
-// deleteVerifyTargets bounds the listing check that follows a DELETE task that did
-// not report success. The per-object paths - sync's excess objects and rmdir -
-// carry one target; a purge can carry thousands and is worth reporting rather
-// than costing a listing per parent. Eight is my choice, not a number the protocol
-// dictates.
-const deleteVerifyTargets = 8
-
-// How long the check goes on looking for a target before it believes the object
-// is gone: three looks two seconds apart. The measured lag between a delete
-// taking effect and the listing dropping the row is about a second, seven at
-// worst, so the first look already settles the common case and the ones after it
-// cover a slow listing without turning a genuinely stuck delete into a wait.
-const (
-	deleteVerifyAttempts = 3
-	deleteVerifyWait     = 2 * time.Second
+// How the absence check gathers its evidence: up to deleteVerifyLooks looks
+// deleteVerifyWait apart, and the answer is only believed once deleteVerifyAgree
+// of them agree in a row.
+//
+// The window the looks span is (deleteVerifyLooks-1)*deleteVerifyWait and it has
+// to reach past the lag this file distrusts elsewhere: a rename and a delete that
+// crossed inside one second was still unreadable seven seconds later (see
+// deletedRowWindow, and the same measurement in the capture of 2026-10-22). Five
+// looks two seconds apart span eight, so the last look is taken after that
+// window has closed rather than one second inside it. Measured on 2026-10-28 the
+// row was gone from the listing at the first look five times out of five, so the
+// extra look is headroom, not an expectation.
+//
+// Both directions need evidence because the two mistakes cost differently. One
+// empty page read as "gone" reports a leftover as deleted and cannot be taken
+// back; a lingering row read as "still there" only delays. These are vars, not
+// consts, so a test can run the logic without paying the wait.
+var (
+	deleteVerifyLooks = 5
+	deleteVerifyAgree = 2
+	deleteVerifyWait  = 2 * time.Second
+	// deleteVerifyPages bounds how many listing pages one look may read for one
+	// parent directory. Ten pages is my choice, not a number the protocol
+	// dictates: it puts the worst case for one look at ten requests over the
+	// account's own RTT, and a directory larger than that is answered "cannot
+	// tell", which costs a resend rather than buying a wrong "gone". The number
+	// is bounded per parent, not per target, so a purge of two thousand objects in
+	// one directory is still one walk.
+	deleteVerifyPages = 10
 )
 
 // Task states. 4 ends the task; the other two are states seen while it runs.
@@ -2694,35 +2847,179 @@ func (f *Fs) runBatchTask(ctx context.Context, auth taskAuth, taskType string, t
 			return st, nil
 		}
 		// A DELETE task that did not report what was asked for is not taken at its
-		// word. Two measured shapes sit behind this. One failed with no reason at
-		// all and the same targets sent again finished it (2026-10-22 captured,
-		// 2026-10-27 in production), so it is sent again once. The other closed as
-		// failed after the work was done, so what the drive actually holds decides,
-		// whatever shape the counts came in - failed, skipped, or short of the
-		// targets. Saying an object was deleted while it is still there is the one
-		// answer here that cannot be taken back.
+		// word. Two measured shapes sit behind this: one failed with no reason at
+		// all and the same targets sent again finished it (captured 2026-10-22,
+		// seen in production 2026-10-27), and one closed as failed after the work
+		// was already done. So the drive is asked, in its own words, what is left
+		// over - the task's successedFileIdList first, then the listing of each
+		// parent - and only what is still outstanding goes back. Whatever the next
+		// answer looks like, the same question is asked again: the drive can refuse
+		// the repeat of a delete it has already carried out, and that refusal says
+		// nothing about whether the object is on the drive. Saying an object was
+		// deleted while it is still there is the one answer here that cannot be
+		// taken back.
 		if taskType == taskDelete {
-			if st.FailedCount > 0 && string(st.ErrorCode) == "" && resends < deleteTaskResends {
+			still, why, cerr := f.deleteStillOutstanding(ctx, targets, st)
+			if cerr != nil {
+				fs.Debugf(f, "cloud189: could not fully check what the unfinished %s task %s left behind: %v", taskType, taskID, cerr)
+			}
+			if len(still) == 0 {
+				fs.Logf(f, "cloud189: %s task %s did not report success but nothing of it is outstanding (%s); taking it as done", taskType, taskID, why)
+				return st, nil
+			}
+			// A refusal the drive did give a reason for is not worth sending back:
+			// the two that appear here, a full drive and a spent day, are decided by
+			// the account and do not clear inside a run.
+			if string(st.ErrorCode) == "" && resends < deleteTaskResends {
 				resends++
-				fs.Logf(f, "cloud189: %s task %s ended with %d of %d failed and no reason; sending the same targets again", taskType, taskID, st.FailedCount, len(targets))
+				fs.Logf(f, "cloud189: %s task %s ended %d failed / %d skipped and %s; sending those %d target(s) again", taskType, taskID, st.FailedCount, st.SkipCount, why, len(still))
+				targets = still
 				taskID, err = f.createBatchTask(ctx, auth, taskType, targets, targetFolderID)
 				if err != nil {
 					return nil, err
 				}
 				continue
 			}
-			if len(targets) <= deleteVerifyTargets {
-				gone, gerr := f.targetsGone(ctx, targets)
-				if gerr != nil {
-					fs.Debugf(f, "cloud189: could not check what the unfinished %s task %s left behind: %v", taskType, taskID, gerr)
-				} else if gone {
-					fs.Logf(f, "cloud189: %s task %s did not report success but the drive no longer holds the %d target(s); taking it as done", taskType, taskID, len(targets))
-					return st, nil
-				}
-			}
 		}
 		return st, verdict
 	}
+}
+
+// deleteStillOutstanding answers, for a DELETE task that did not report full
+// success, which of the targets it was sent still have to be dealt with, and in
+// what words the drive itself said so.
+//
+// Two pieces of evidence are read, in this order, and both come from the drive:
+//
+//   - successedFileIdList names the objects the task did handle (captured
+//     2026-10-22: MOVE, DELETE and CLEAR_RECYCLE all answer it, a successful COPY
+//     does not). Those are not sent back - a repeat naming them again is a repeat
+//     of work the drive already did, and the first send of a partly-failed purge
+//     used to do exactly that.
+//   - one listing per parent directory, read to its end inside deleteVerifyPages,
+//     says whether the rest are still there. Only a walk that finished may answer
+//     "not here": the same endpoint answers a folderId it does not know with an
+//     empty page and no error (measured 2026-10-22), which is what a leftover
+//     would look like to a walk that stopped early.
+//
+// Anything the evidence cannot settle stays outstanding. That costs a resend and,
+// if the resends run out, an error - both cheaper than guessing "gone".
+func (f *Fs) deleteStillOutstanding(ctx context.Context, targets []taskInfo, st *taskStatusResponse) ([]taskInfo, string, error) {
+	agree := 0
+	var still []taskInfo
+	var why string
+	var err error
+	for look := 0; look < deleteVerifyLooks; look++ {
+		if look > 0 {
+			select {
+			case <-ctx.Done():
+				return still, why, ctx.Err()
+			case <-time.After(deleteVerifyWait):
+			}
+		}
+		still, why, err = f.deleteEvidenceOnce(ctx, targets, st)
+		switch {
+		case err != nil && ctx.Err() != nil:
+			return still, why, err
+		case len(still) > 0:
+			// Something is known to be outstanding: that answer needs no second
+			// look, because a leftover read as present only costs a resend.
+			return still, why, err
+		case strings.HasPrefix(why, "the task named"):
+			// The drive itself named every target as handled, so this is not an
+			// absence inferred from a listing.
+			return nil, why, err
+		}
+		agree++
+		if agree >= deleteVerifyAgree {
+			return nil, why, err
+		}
+	}
+	// The looks ran out before they agreed. That is not evidence of anything, so
+	// the targets stay outstanding: the cost is a resend and, if the resends run
+	// out too, an error. Falling out of a loop must never read as "gone" - that is
+	// the one answer here that cannot be taken back afterwards.
+	return targets, "the drive's answers did not agree twice", err
+}
+
+// deleteEvidenceOnce is one pass of the evidence described above. The "why" it
+// returns is what the drive said, not a guess, because the resend log line quotes
+// it.
+func (f *Fs) deleteEvidenceOnce(ctx context.Context, targets []taskInfo, st *taskStatusResponse) ([]taskInfo, string, error) {
+	handled := make(map[string]bool, len(st.SuccessedFileIDs))
+	for _, id := range st.SuccessedFileIDs {
+		handled[id.String()] = true
+	}
+	unhandled := make([]taskInfo, 0, len(targets))
+	for _, t := range targets {
+		if !handled[t.FileID] {
+			unhandled = append(unhandled, t)
+		}
+	}
+	if len(unhandled) == 0 {
+		return nil, "the task named all of them in successedFileIdList", nil
+	}
+
+	byParent := make(map[string][]taskInfo)
+	for _, t := range unhandled {
+		if t.ParentID == nil {
+			return unhandled, "the task carried no parent to look under", errors.New("cloud189: a task target carries no parent to look under")
+		}
+		p := strconv.FormatInt(*t.ParentID, 10)
+		byParent[p] = append(byParent[p], t)
+	}
+
+	still := make([]taskInfo, 0, len(unhandled))
+	unread := 0
+	var walkErr error
+	for p, group := range byParent {
+		found, complete, err := f.idsPresentIn(ctx, p, group)
+		if err != nil {
+			walkErr = err
+		}
+		if !complete {
+			// The drive was not read to the end, so nothing can be concluded
+			// about what is missing from what was read.
+			unread++
+			still = append(still, group...)
+			continue
+		}
+		for _, t := range group {
+			if found[t.FileID] {
+				still = append(still, t)
+			}
+		}
+	}
+	why := fmt.Sprintf("%d of the %d target(s) are still on the drive", len(still), len(targets))
+	if unread > 0 {
+		why = fmt.Sprintf("%s and %d parent directory(ies) could not be listed to the end", why, unread)
+	}
+	return still, why, walkErr
+}
+
+// idsPresentIn reads the listing of one parent directory once and reports which of
+// the wanted ids it carries, and whether the walk reached the end of the listing.
+//
+// The walk stops early only when every wanted id has been found - the answer to
+// "is it here" is already yes - so the cost is one listing per parent per look,
+// whatever the number of targets under it.
+func (f *Fs) idsPresentIn(ctx context.Context, parent string, wanted []taskInfo) (map[string]bool, bool, error) {
+	want := make(map[string]bool, len(wanted))
+	for _, t := range wanted {
+		want[t.FileID] = true
+	}
+	found := make(map[string]bool, len(want))
+	remaining := len(want)
+	w, err := f.walkListing(ctx, f.listDirID(parent), deleteVerifyPages, func(row *api.Row) bool {
+		id := row.ID.String()
+		if want[id] && !found[id] {
+			found[id] = true
+			remaining--
+			return remaining == 0
+		}
+		return false
+	})
+	return found, w.complete(), err
 }
 
 // waitBatchTask polls one task until it reaches a terminal state and returns the
@@ -2762,59 +3059,6 @@ func (f *Fs) waitBatchTask(ctx context.Context, auth taskAuth, taskID api.FlexID
 	}
 }
 
-// targetsGone reports whether none of the task's targets is on the drive any
-// more, judged by id under the parent the task was given.
-//
-// The listing is asked more than once. The drive keeps answering a deleted row
-// for about a second after the delete reports done, and seven at worst (measured
-// 2026-10-23 through the readback window), so one row is not yet a leftover -
-// but an empty answer is what a successful delete looks like from the first
-// second on. The wait only ever happens on a delete that did not report success.
-func (f *Fs) targetsGone(ctx context.Context, targets []taskInfo) (bool, error) {
-	for attempt := 0; attempt < deleteVerifyAttempts; attempt++ {
-		gone, err := f.targetsGoneOnce(ctx, targets)
-		if err != nil {
-			return false, err
-		}
-		if gone {
-			return true, nil
-		}
-		if attempt < deleteVerifyAttempts-1 {
-			select {
-			case <-ctx.Done():
-				return false, ctx.Err()
-			case <-time.After(deleteVerifyWait):
-			}
-		}
-	}
-	return false, nil
-}
-
-// targetsGoneOnce is one look. A different object that now holds the name is not
-// this one, so the id decides.
-func (f *Fs) targetsGoneOnce(ctx context.Context, targets []taskInfo) (bool, error) {
-	for _, t := range targets {
-		if t.ParentID == nil {
-			return false, errors.New("cloud189: a task target carries no parent to look under")
-		}
-		found := false
-		err := f.listAll(ctx, f.listDirID(strconv.FormatInt(*t.ParentID, 10)), func(row *api.Row) bool {
-			if row.ID.String() == t.FileID {
-				found = true
-				return true
-			}
-			return false
-		})
-		if err != nil {
-			return false, err
-		}
-		if found {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
 // taskVerdict reads a finished task.
 //
 // A task that ends with nothing failed and nothing done is a task the server
@@ -2843,7 +3087,14 @@ func (f *Fs) taskVerdict(taskType string, wanted int, st *taskStatusResponse) er
 		return fserrors.NoRetryError(fmt.Errorf("cloud189: %s task failed for %d of %d object(s): %s", taskType, st.FailedCount, wanted, why))
 	}
 	if st.SkipCount > 0 {
-		return fserrors.NoRetryError(fmt.Errorf("cloud189: %s task skipped %d of %d object(s), which is what a name conflict answers with", taskType, st.SkipCount, wanted))
+		// What skipCount means is not measured. It is certainly not the name
+		// conflict: captured 2026-10-22 (the ledger's FileAlreadyExists case) a
+		// conflict answers failedCount 1, skipCount 0 and errorCode
+		// FileAlreadyExists. So this says only what the response says - the drive
+		// declined these objects and did not say what became of them - and a
+		// DELETE is settled by the evidence in deleteStillOutstanding before this
+		// ever reaches the caller.
+		return fserrors.NoRetryError(fmt.Errorf("cloud189: %s task declined %d of %d object(s) without saying what became of them", taskType, st.SkipCount, wanted))
 	}
 	if wanted > 0 && st.SuccessedCount < int64(wanted) {
 		return fserrors.NoRetryError(fmt.Errorf("cloud189: %s task reported success for %d of %d object(s)", taskType, st.SuccessedCount, wanted))
