@@ -72,12 +72,27 @@ Cloudreve's API authorises requests with a bearer token only - the session
 cookie the web interface uses is not read by the file endpoints - so rclone has
 to hold a token itself. Two ways in:
 
-- **`email` and `password`** - rclone signs in when the remote opens and renews
-  the session before the token expires, or again if the server refuses it. The
-  renewed pair is written back into the remote's config, because a refresh token
-  is spent by being used: saving it is what keeps the next run working.
+- **`email` and `password`** - rclone signs in when it has nothing to work with,
+  and saves the pair it gets into the remote's config. Later runs keep that pair
+  instead of signing in again: an access token states when it stops working, so a
+  run that finds one with life left asks the site only whose token it is - one
+  request, whose answer serves the lock rules too - and signs in only when the site
+  says the token belongs to a different account. A pair whose access token has run
+  out is traded with the `refresh_token`, which is one request where signing in is
+  three. Where that question cannot be answered - the reply names no email, or the
+  endpoint fails - rclone trades or signs in instead when something allows it, and
+  keeps the token in hand when nothing does. A sign-in is therefore the last resort
+  rather than the first move, which matters because each one opens a session on the
+  site that only age, a password change or signing out closes. Renewal is not a one-shot trade:
+  the site issues a new pair each time and accepts a refresh token until that token
+  itself expires, so two runs of the same remote renewing side by side do not lock
+  each other out.
 - **`access_token`** (with `refresh_token` to allow renewal) - for a token taken
-  from somewhere else.
+  from somewhere else. With no `email` named there is nothing to check such a token
+  against, so a token with life ahead of it is used as it stands and opening the
+  remote costs no request; with a `refresh_token` beside it, the pair is traded as
+  soon as the remote opens. With an `email` named the token is asked about once,
+  because its shape says nothing about who it belongs to.
 
 Before signing in, rclone asks the site how that account can prove itself, so the
 failure modes say something useful instead of "wrong password":
@@ -86,9 +101,25 @@ failure modes say something useful instead of "wrong password":
 |---|---|
 | Site asks for a login captcha | cannot answer it - turn it off, or use `access_token` |
 | Account has no local password (issued through SSO or OIDC) | no local password - set one, or use `access_token` |
-| Account signs in with a passkey | cannot present a passkey - use `access_token` |
+| Account has a passkey and no local password | names the passkey as the reason there is nothing to post - set a password, or use `access_token` |
 | Email not on this site | no account with that email |
 | Credentials refused | the site rejected this email and password pair |
+
+A passkey alongside a working password does not block signing in: the site checks
+the password either way.
+
+Two more come from reusing a pair left in the config rather than signing in:
+
+| Situation | What rclone says |
+|---|---|
+| The stored token belongs to a different account | signs in as the configured email; with no password to sign in with, it names both accounts and stops |
+| The site will not say whose token it is | a notice, then the token is kept if nothing can replace it, or replaced if something can |
+
+The question is asked wherever the token actually changes hands, which includes a
+renewal in the middle of a transfer: an access token that was ours can be sitting
+next to a refresh token that was not. A pair the site says belongs to another
+account is never written back, so a run that stops over one leaves the file as it
+found it; a pair the site will not answer for is kept, alongside the notice.
 
 ### Root
 
@@ -231,11 +262,12 @@ site's own expiry passes, and it cannot be revoked early. `--expire` has no effe
 for the same reason. A folder has no such URL - the site only hands out entity URLs
 for files - so asking for one is reported as unsupported.
 
-`--unlink` removes **stored direct links**, which an earlier version of this backend
-created through `PUT /file/source`. Nothing creates them any more, but the site keeps
-serving every one of them as a permanent public URL until it is deleted, so `--unlink`
-is the way to take one back, and it prints no link. A file with none stored is already
-in the wanted state and is not an error.
+`--unlink` is ignored, which is what rclone documents for a backend without unlink
+support. An earlier version of this backend created **stored direct links** through
+`PUT /file/source`; the site keeps serving every one of those as a permanent public
+URL until it is deleted, and revoking all of them is not what a link request asks
+for. Removing one is a deliberate act, so it is done in the site's own interface
+rather than behind `rclone link`.
 
 ### Interrupted uploads
 

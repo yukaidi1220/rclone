@@ -494,16 +494,16 @@ func (f *Fs) setPolicy(ctx context.Context, policyID string) (any, error) {
 // to take one back. It returns no link, as rclone expects of an unlink.
 func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
 	if unlink {
-		// A download link is stored nowhere, so there is nothing of this
-		// backend's own to remove. Stored direct links are a different thing:
-		// an earlier version of this backend created them, and the site still
-		// serves every one of them as a permanent public URL. Removing those is
-		// the only way to take back a link that was handed out then, so unlink
-		// keeps doing that rather than becoming a no-op.
-		if err := f.deleteDirectLinks(ctx, remote); err != nil {
-			return "", err
-		}
-		return "", nil
+		// rclone's contract for a backend without unlink is to ignore the flag,
+		// and a download link is stored nowhere, so nothing of this call's own is
+		// left behind.
+		//
+		// An earlier version of this backend did create stored direct links, which
+		// the site keeps serving as permanent public URLs until they are deleted.
+		// Deleting them from here is deliberately not done: `rclone link --unlink`
+		// is not a request to revoke every URL ever handed out for a file, and the
+		// code that did it is kept below, commented out, rather than removed.
+		fs.Debugf(f, "a download link is minted per request, so there is no stored link to unlink")
 	}
 	if expire.IsSet() {
 		fs.Logf(f, "the site sets its own expiry on download links, so --expire is ignored")
@@ -525,28 +525,29 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	return f.absoluteURL(link), nil
 }
 
-// deleteDirectLinks removes every stored direct link of the file
+// An earlier version of this backend created stored direct links, which the site
+// keeps serving as permanent public URLs until they are deleted, and this is how
+// it deletes them. Nothing calls it: PublicLink reports no unlink support, so a
+// run of `rclone link --unlink` leaves whatever earlier runs handed out alone.
+// Kept as a comment rather than deleted, so nobody has to work out again how the
+// site revokes one.
 //
-// The links are permanent public URLs the site keeps serving until they are
-// deleted, and this backend used to create them. Nothing creates them any more,
-// but the ones made back then are still out there, and this is the only way to
-// revoke one.
-func (f *Fs) deleteDirectLinks(ctx context.Context, remote string) error {
-	query := url.Values{}
-	query.Set("uri", f.uriFor(remote))
-	query.Set("extended", "true")
-	info := new(api.FileExtended)
-	if err := f.call(ctx, "GET", "/file/info", query, nil, info); err != nil {
-		return err
-	}
-	for _, link := range info.ExtendedInfo.DirectLinks {
-		endpoint := "/file/source/" + url.PathEscape(link.ID)
-		if err := f.call(ctx, "DELETE", endpoint, nil, nil, nil); err != nil {
-			return err
-		}
-	}
-	return nil
-}
+// func (f *Fs) deleteDirectLinks(ctx context.Context, remote string) error {
+// 	query := url.Values{}
+// 	query.Set("uri", f.uriFor(remote))
+// 	query.Set("extended", "true")
+// 	info := new(api.FileExtended)
+// 	if err := f.call(ctx, "GET", "/file/info", query, nil, info); err != nil {
+// 		return err
+// 	}
+// 	for _, link := range info.ExtendedInfo.DirectLinks {
+// 		endpoint := "/file/source/" + url.PathEscape(link.ID)
+// 		if err := f.call(ctx, "DELETE", endpoint, nil, nil, nil); err != nil {
+// 			return err
+// 		}
+// 	}
+// 	return nil
+// }
 
 // absoluteURL makes a server-relative URL complete
 //
