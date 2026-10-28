@@ -270,6 +270,30 @@ of those as a permanent public URL until it is deleted, and revoking all of them
 not what a link request asks for. Taking one back is a deliberate act of its own, so
 it is left to whatever the site offers for it rather than done behind `rclone link`.
 
+### Rewriting links
+
+`link_replace` replaces the scheme and host of every download link this remote
+uses, so the address can point at a proxy or CDN of your own:
+
+```
+[myremote]
+type = cloudreve
+url = https://drive.example.com
+...
+link_replace = https://storage.example.com => https://cdn.example.com/files
+```
+
+One rule per line, or per comma. The left side names the scheme and host a link
+arrives with, which is all it may name: the path belongs to the file. The right
+side is what to hand out instead, and a path on it is put in front of the file's
+own, which is how a proxy served under a sub-path is addressed. The path and query
+of the link travel through unchanged, the scheme and host are compared without
+regard to case, ports are part of the host, and the first rule that matches wins.
+
+The replacement covers both halves of the remote: the address reads fetch from,
+and the link `rclone link` prints. A rule pointing at a proxy therefore sends the
+transfer traffic through it as well. A link no rule matches is used as it came.
+
 ### Interrupted uploads
 
 An upload session locks the file it writes. If rclone is killed mid upload, that

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/rclone/rclone/backend/cloudreve/api"
@@ -62,6 +63,86 @@ func (o *Object) setFrom(file *api.File) {
 	o.modTime = file.UpdatedAt
 }
 
+// linkRewrite is one scheme-and-host replacement from link_replace
+type linkRewrite struct {
+	from string   // scheme://host, lower case, as a link arrives
+	to   *url.URL // what to put in its place, path prefix included
+}
+
+// parseLinkRewrites reads the link_replace table
+//
+// Entries are separated by lines, or by commas when a line holds more than one
+// rule, and each is "from => to" with a scheme and host on both sides. The left
+// side has to name the whole site: a link's path belongs to the file, not to
+// where it is served from.
+func parseLinkRewrites(table string) ([]linkRewrite, error) {
+	var rewrites []linkRewrite
+	for _, line := range strings.Split(table, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		entries := []string{line}
+		if strings.Count(line, "=>") > 1 {
+			entries = strings.Split(line, ",")
+		}
+		for _, entry := range entries {
+			entry = strings.TrimSpace(entry)
+			if entry == "" {
+				continue
+			}
+			from, to, ok := strings.Cut(entry, "=>")
+			if !ok {
+				return nil, fmt.Errorf("cloudreve: link_replace entry %q is not \"from => to\"", entry)
+			}
+			source, err := url.Parse(strings.TrimSpace(from))
+			if err != nil || source.Scheme == "" || source.Host == "" {
+				return nil, fmt.Errorf("cloudreve: link_replace entry %q does not name a scheme and a host", entry)
+			}
+			if (source.Path != "" && source.Path != "/") || source.RawQuery != "" || source.Fragment != "" {
+				return nil, fmt.Errorf("cloudreve: link_replace entry %q names more than a scheme and a host: a rule covers the whole site", entry)
+			}
+			target, err := url.Parse(strings.TrimSpace(to))
+			if err != nil || target.Scheme == "" || target.Host == "" {
+				return nil, fmt.Errorf("cloudreve: link_replace entry %q does not say what to put in its place", entry)
+			}
+			target.Path = strings.TrimSuffix(target.Path, "/")
+			rewrites = append(rewrites, linkRewrite{
+				from: strings.ToLower(source.Scheme) + "://" + strings.ToLower(source.Host),
+				to:   target,
+			})
+		}
+	}
+	return rewrites, nil
+}
+
+// rewriteLink hands a link out under the scheme and host link_replace asks for
+//
+// The path and query stay with the file; only the part that says where it is
+// served from is replaced. A link no rule matches is left exactly as it is.
+func (f *Fs) rewriteLink(link string) string {
+	if len(f.rewrites) == 0 {
+		return link
+	}
+	u, err := url.Parse(link)
+	if err != nil || u.Host == "" {
+		return link
+	}
+	key := strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
+	for _, rule := range f.rewrites {
+		if rule.from != key {
+			continue
+		}
+		u.Scheme = rule.to.Scheme
+		u.Host = rule.to.Host
+		if prefix := rule.to.Path; prefix != "" {
+			u.Path = prefix + "/" + strings.TrimPrefix(u.Path, "/")
+		}
+		return u.String()
+	}
+	return link
+}
+
 // cachedURL is a link the server handed out for one file
 type cachedURL struct {
 	url     string
@@ -76,7 +157,7 @@ func (f *Fs) downloadURL(ctx context.Context, remote string) (string, error) {
 	cached, found := f.links[uri]
 	f.mu.Unlock()
 	if found && time.Until(cached.expires) > urlExpiryMargin {
-		return cached.url, nil
+		return f.rewriteLink(cached.url), nil
 	}
 
 	data := new(api.FileURLData)
@@ -105,7 +186,7 @@ func (f *Fs) downloadURL(ctx context.Context, remote string) (string, error) {
 		}
 	}
 	f.mu.Unlock()
-	return data.URLs[0].URL, nil
+	return f.rewriteLink(data.URLs[0].URL), nil
 }
 
 // forgetURL drops a cached link that the storage refused
