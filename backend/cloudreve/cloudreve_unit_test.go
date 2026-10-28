@@ -1781,16 +1781,103 @@ func TestUnitLinkReplaceTakesTheFirstMatchCoveringThePort(t *testing.T) {
 		"the second rule catches the plain host, case does not matter, and its path goes in front")
 }
 
+// TestUnitLinkReplaceKeepsTheFilesOwnBytes checks that the file's path and query
+// travel through untouched. A storage URL may percent-encode characters that a
+// plain re-encode would write differently - an escaped slash inside a name, a plus
+// inside a signature - and either would address another object or break what the
+// signature covers.
+func TestUnitLinkReplaceKeepsTheFilesOwnBytes(t *testing.T) {
+	f, _ := newSite(t, "", nil, nil)
+	f.rewrites = mustRewrites(t, "https://store.example => https://cdn.example/p")
+
+	got := f.rewriteLink("https://store.example/a%2Fb%20c%2Bd?X-Signature=a%2Bb%20c&x=1")
+	assert.Equal(t, "https://cdn.example/p/a%2Fb%20c%2Bd?X-Signature=a%2Bb%20c&x=1", got,
+		"the escaped path and the query are handed on exactly as they arrived")
+}
+
+// TestUnitLinkReplaceMatchesTheDefaultPort checks that a rule naming the port the
+// scheme already implies matches links that leave it out, and the other way round.
+func TestUnitLinkReplaceMatchesTheDefaultPort(t *testing.T) {
+	f, _ := newSite(t, "", nil, nil)
+	f.rewrites = mustRewrites(t, "https://store.example:443 => https://one.example, http://plain.example => https://two.example")
+
+	assert.Equal(t, "https://one.example/a", f.rewriteLink("https://store.example/a"),
+		"443 is what https means, so naming it adds nothing")
+	assert.Equal(t, "https://one.example/a", f.rewriteLink("https://store.example:443/a"))
+	assert.Equal(t, "https://two.example/a", f.rewriteLink("http://plain.example:80/a"))
+}
+
+// TestUnitLinkReplaceResolvesARelativeLinkFirst checks a site mounted under a
+// sub-path, which answers with paths of its own: the rule applies to the address
+// the link ends up on, not to one that has no host yet.
+func TestUnitLinkReplaceResolvesARelativeLinkFirst(t *testing.T) {
+	future := time.Now().Add(time.Hour)
+	f, site := newSite(t, "", nil, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "POST" && rec.path == "/api/v4/file/url":
+			reply(w, api.CodeSuccess, api.FileURLData{
+				URLs:    []api.FileURL{{URL: "/store/a%2Fb"}}, // a path of the site's own
+				Expires: &future,
+			})
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+	f.rewrites = mustRewrites(t, site.srv.URL+" => https://proxy.example/files")
+
+	want := "https://proxy.example/files/store/a%2Fb"
+	link, err := f.downloadURL(testCtx(), "f.txt")
+	require.NoError(t, err)
+	assert.Equal(t, want, link,
+		"the link has no host of its own, so the site's is put in front before the rule applies")
+
+	// The second call comes out of the link cache, which holds what the site said.
+	link, err = f.downloadURL(testCtx(), "f.txt")
+	require.NoError(t, err)
+	assert.Equal(t, want, link, "a cached link is made whole and rewritten the same way")
+}
+
+// TestUnitLinkReplaceComesFromTheConfig checks the whole way in: a table in the
+// remote's config, read at NewFs, comma separated the way a config file can hold
+// it, and applied to what the remote hands out.
+func TestUnitLinkReplaceComesFromTheConfig(t *testing.T) {
+	future := time.Now().Add(time.Hour)
+	f, _ := newSite(t, "", configmap.Simple{
+		"link_replace": "https://nowhere.example => https://one.example, https://store.example => https://cdn.example/files",
+	}, func(s *site, w http.ResponseWriter, r *http.Request, rec seen) {
+		switch {
+		case rec.method == "GET" && rec.path == "/api/v4/file/info":
+			reply(w, api.CodeSuccess, api.File{Type: api.FileTypeFile, ID: "F1", Size: 7})
+		case rec.method == "POST" && rec.path == "/api/v4/file/url":
+			reply(w, api.CodeSuccess, api.FileURLData{
+				URLs:    []api.FileURL{{URL: "https://store.example/f.txt"}},
+				Expires: &future,
+			})
+		default:
+			s.t.Fatalf("unexpected request %s %s", rec.method, rec.path)
+		}
+	})
+	require.Len(t, f.rewrites, 2, "both rules were read")
+
+	link, err := f.PublicLink(testCtx(), "f.txt", 0, false)
+	require.NoError(t, err)
+	assert.Equal(t, "https://cdn.example/files/f.txt", link)
+}
+
 // TestUnitLinkReplaceRefusesWhatIsNotARule checks the tables NewFs refuses, so a
 // typo fails at the remote instead of quietly leaving links alone.
 func TestUnitLinkReplaceRefusesWhatIsNotARule(t *testing.T) {
 	for _, table := range []string{
-		"https://store.example",                             // no arrow
-		"store.example => https://cdn.example",              // no scheme on the left
-		"https://store.example => cdn.example",              // no scheme on the right
-		"https://store.example/site => https://cdn.example", // a path on the left
-		"https://store.example/?a=1 => https://cdn.example", // a query on the left
-		"https://store.example => ",                         // nothing to replace with
+		"https://store.example",                                // no arrow
+		"store.example => https://cdn.example",                 // no scheme on the left
+		"https://store.example => cdn.example",                 // no scheme on the right
+		"https://store.example/site => https://cdn.example",    // a path on the left
+		"https://store.example/?a=1 => https://cdn.example",    // a query on the left
+		"https://store.example => ",                            // nothing to replace with
+		"https://store.example => https://cdn.example?sig=1",   // a query on the right
+		"https://store.example => https://cdn.example#frag",    // a fragment on the right
+		"https://user:pw@store.example => https://cdn.example", // credentials on the left
+		"https://store.example => https://user:pw@cdn.example", // credentials on the right
 	} {
 		_, err := parseLinkRewrites(table)
 		assert.Error(t, err, "should refuse %q", table)
