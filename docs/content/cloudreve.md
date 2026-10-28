@@ -283,16 +283,20 @@ url = https://drive.example.com
 link_replace = https://storage.example.com => https://cdn.example.com/files
 ```
 
-One rule per line, or per comma. The left side names the scheme and host a link
-arrives with, which is all it may name: the path belongs to the file. The right
-side is what to hand out instead, and a path on it is put in front of the file's
-own, which is how a proxy served under a sub-path is addressed. The path and query
-of the link travel through unchanged, the scheme and host are compared without
-regard to case, ports are part of the host, and the first rule that matches wins.
+Separate rules with commas; a config file's values do not span lines. The left side
+names the scheme and host a link arrives with, which is all it may name: the path
+belongs to the file. The right side is what to hand out instead, and a path on it
+is put in front of the file's own, which is how a proxy served under a sub-path is
+addressed. The path and query of the link are passed on byte for byte - an escaped
+slash in a name, a signature in the query - so a rule cannot break what the storage
+signed. The scheme and host are compared without regard to case, a port the scheme
+already implies is ignored, and the first rule that matches wins.
 
 The replacement covers both halves of the remote: the address reads fetch from,
 and the link `rclone link` prints. A rule pointing at a proxy therefore sends the
-transfer traffic through it as well. A link no rule matches is used as it came.
+download traffic through it as well. Uploads are not covered: they use the signed
+addresses the upload session hands out, which a rule does not touch. A link no rule
+matches is used as it came.
 
 ### Interrupted uploads
 
