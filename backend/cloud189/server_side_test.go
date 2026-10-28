@@ -2237,6 +2237,54 @@ func TestADeleteTheListingCannotAnswerIsNotTakenAsDone(t *testing.T) {
 	require.Len(t, drivesTasks(drive), 3, "the measured cure is owed twice")
 }
 
+// TestADeleteATaskTheDriveNeverClosesIsNotTakenAsDone covers the other way the
+// wait ends. A task that keeps answering taskStatus 3 past taskPollWaitMax has
+// not closed, so it has said nothing about the objects - and saying nothing is
+// not success. The error has to name the deadline, no resend is owed (the wait
+// returns before the evidence pass is reached), and the drive is not listed,
+// because a listing whose question was never asked cannot be read either way.
+//
+// The error is deliberately not wrapped as NoRetry: the drive may still finish
+// the task after the client gave up on it, and that is exactly what the message
+// tells the caller to check before trying again. Guessing wrong costs a false
+// red - the next pass of rclone lists nothing left to delete - which is the
+// direction that can be taken back. It also skips the two steps deleteRows runs
+// only after a task comes back clean: remembering the id for the stale-row
+// window, and the recycle-bin clear that is sent only by a hard_delete remote.
+// Neither of those is a claim that the object went.
+func TestADeleteATaskTheDriveNeverClosesIsNotTakenAsDone(t *testing.T) {
+	// The fixture answers the first poll "running" and every later one from its
+	// default, so a wait that stopped honouring its deadline would see the task
+	// finish and report success.
+	drive := &fakeDrive{t: t, taskStates: []int64{taskStateRunning}}
+	f := newFakeFs(t, drive)
+	// The bound is a var for this reason: it is how long rclone waits before
+	// deciding the task is never coming back, not a measured server limit.
+	//
+	// A second in the past rather than zero. The deadline is read with
+	// time.Now().After, so a deadline of "now" is a coin flip on whether a clock
+	// tick falls between the two calls: with zero this test failed 60 of 100 runs
+	// on this host, every miss letting the fixture's default answer finish the
+	// task. A deadline already behind the call cannot be missed.
+	oldWaitMax := taskPollWaitMax
+	taskPollWaitMax = -time.Second
+	t.Cleanup(func() { taskPollWaitMax = oldWaitMax })
+
+	err := srcObject(f, "clip-01.mp4", "6000000000000000006").Remove(context.Background())
+	require.Error(t, err, "a task the drive never closed settles nothing")
+	require.Contains(t, err.Error(), "was still running after",
+		"the deadline is what ended the wait, and the error has to say so")
+	require.False(t, fserrors.IsNoRetryError(err),
+		"the drive may still finish it, so the caller may ask again - after checking")
+	drive.mu.Lock()
+	unasked := len(drive.taskStates)
+	drive.mu.Unlock()
+	require.Zero(t, unasked,
+		"the wait has to ask at least once before it decides the task is never coming back")
+	require.Len(t, drivesTasks(drive), 1, "the wait ended before the evidence pass, so no resend is owed")
+	require.Empty(t, driveFolders(drive), "and nothing was listed: the question was never asked")
+}
+
 // TestADeleteEvidenceWindowReachesPastTheLagItDistrusts is the one place the
 // spacing of the looks is written down as a requirement rather than as four
 // unrelated numbers. The absence check spans (looks-1)*wait between its first and
