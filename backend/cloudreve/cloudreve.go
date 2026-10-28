@@ -103,6 +103,7 @@ type Options struct {
 	SkipSoftDelete    bool                 `config:"skip_soft_delete"`
 	DropStaleLocks    bool                 `config:"drop_stale_locks"`
 	StaleLockAfter    fs.Duration          `config:"drop_stale_locks_after"`
+	LinkReplace       string               `config:"link_replace"`
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -166,6 +167,22 @@ func init() {
 			Default:  fs.Duration(0),
 			Advanced: true,
 		}, {
+			Name: "link_replace",
+			Help: "Rewrite the scheme and host of every download link this remote uses.\n\n" +
+				"One rule per line (or per comma): from => to, where the left side is the " +
+				"scheme and host a link arrives with, and the right side is the scheme and " +
+				"host to hand it out with instead. The path and query are kept, and a path " +
+				"on the right side goes in front of them, so a proxy served under a " +
+				"sub-path works:\n\n" +
+				"    https://storage.example.com => https://cdn.example.com/files\n\n" +
+				"A rule names the whole site, so the left side takes scheme and host only; " +
+				"host and scheme are compared without regard to case, and the first rule " +
+				"that matches wins. This applies to the links reads fetch from as well as " +
+				"to what rclone link prints, so a rule pointing at a proxy sends the " +
+				"transfer traffic there too.",
+			Advanced: true,
+			Default:  "",
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -222,6 +239,7 @@ type Fs struct {
 	policies  map[string]*api.Policy // standard path of a folder -> its policy
 	folderIDs map[string]string      // standard path of a folder -> its own ID
 	links     map[string]*cachedURL  // URI -> a download link still worth using
+	rewrites  []linkRewrite          // link_replace, in the order given
 	acctID    string                 // this account's ID, as a lock holder names its owner
 
 	uploadsMu sync.Mutex
@@ -453,6 +471,10 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 	if opt.Email == "" && opt.AccessToken == "" {
 		return nil, errors.New("cloudreve: need either email and password, or access_token")
 	}
+	rewrites, err := parseLinkRewrites(opt.LinkReplace)
+	if err != nil {
+		return nil, err
+	}
 	if opt.Email != "" && opt.Password == "" && opt.AccessToken == "" {
 		return nil, errors.New("cloudreve: email is set but password is not, so rclone cannot sign in")
 	}
@@ -487,6 +509,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		policies:  map[string]*api.Policy{},
 		folderIDs: map[string]string{},
 		links:     map[string]*cachedURL{},
+		rewrites:  rewrites,
 		uploads:   map[string]map[uint64]bool{},
 		tok:       tokenState{access: opt.AccessToken, refresh: opt.RefreshToken},
 	}
