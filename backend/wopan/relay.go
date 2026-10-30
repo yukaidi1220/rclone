@@ -514,6 +514,21 @@ func wrapFamilyDial(inner func(context.Context, string, string) (net.Conn, error
 	}
 }
 
+// relayUnavailableStatus reports an HTTP status that condemns the path to the
+// relay rather than being a rejection from the upload service behind it.
+//
+// A 5xx that the relay *forwarded* is not evidence about the relay - the existing
+// rule for that stands. These three come from the gateway in front of the relay
+// and say it could not reach the service at all, so the bytes were not stored and
+// a retry against the same host is a wasted part.
+func relayUnavailableStatus(code int) bool {
+	switch code {
+	case 502, 503, 504: // Bad Gateway, Service Unavailable, Gateway Timeout
+		return true
+	}
+	return false
+}
+
 // uploadFailure is a failure that happened before a part's answer was read. It
 // carries what the attempt had already achieved, because the two ways an attempt
 // can run out of time blame different parties.
@@ -537,6 +552,11 @@ type uploadFailure struct {
 	// sourceErr is the part's own reader having failed, so the bytes never left
 	// this machine for a reason that has nothing to do with the target.
 	sourceErr bool
+	// rejected marks an answer from the gateway in front of the relay saying it
+	// could not reach the upload service. The body did go out, so this is not a
+	// transient connection problem, but nothing was stored either - the target's
+	// path is what failed.
+	rejected bool
 	// peerFamily is the family observed on the wire, familyAny when no
 	// connection was reached.
 	peerFamily int
@@ -563,8 +583,9 @@ func (e *uploadFailure) transient() bool {
 // the source side.
 //
 // Everything else is on the target: no connection at all (no route, no DNS
-// answer, TLS refused mid-handshake), the idle clock, or a clock that expired
-// after the whole part was already on the wire.
+// answer, TLS refused mid-handshake), the idle clock, a clock that expired
+// after the whole part was already on the wire, or a gateway 502/503/504 that
+// says the relay could not reach the upload service.
 func (e *uploadFailure) blameTarget() bool {
 	if e.sourceErr {
 		return false

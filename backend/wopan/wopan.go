@@ -3323,6 +3323,21 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, route *uploadRoute, t
 		// this layer (multi-thread's "chunk %d/%d failed" covers only that
 		// engine's path).
 		err := fmt.Errorf("wopan: upload: part %d/%d session %s via %s -> %s: http %s: %s", plan.Index, total, uniqueID, target.describe(), peerAddr, res.Status, truncate(string(raw), 500))
+		if relayUnavailableStatus(res.StatusCode) {
+			// The gateway in front of the relay answered, not the upload service:
+			// measured 2026-10-30, one relay's IPv6 leg answered 504 to 264 parts in
+			// eleven minutes while the others were healthy. Treating that as "the
+			// relay is alive, retry it" re-sent every part of every file that landed
+			// there, about 1.2GiB of them. Nothing was stored upstream, so this is
+			// evidence against the target's path and the session moves on.
+			return api.UploadData{}, &uploadFailure{
+				err:        err,
+				gotConn:    true,
+				bodySent:   true,
+				rejected:   true,
+				peerFamily: fail.peerFamily,
+			}
+		}
 		// For single-part requests an HTTP-level rejection is deterministic
 		// for the given request - the server answers a bare 500 for file
 		// names it cannot store (manual test G7: certain special-symbol and
@@ -3558,6 +3573,10 @@ func (f *Fs) postPartRetry(ctx context.Context, st *partState, next func(attempt
 			switch {
 			case !blamed:
 				return api.UploadData{}, err
+			case fail.rejected:
+				// The relay's gateway answered instead of the upload service, so
+				// nothing was stored and a second POST to another relay is not a
+				// duplicate - it is the first one that can succeed.
 			case fail.bodySent:
 				// The whole object was on the wire and only the answer was lost.
 				// Re-posting onto another relay would POST the file a second time,
