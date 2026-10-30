@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
@@ -23,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -762,6 +764,7 @@ type Options struct {
 	NoRefresh         bool                 `config:"no_refresh"`
 	HardDelete        bool                 `config:"hard_delete"`
 	UploadZone        string               `config:"upload_zone"`
+	UploadRelays      fs.CommaSepList      `config:"upload_relays"`
 	DisableHTTP2      bool                 `config:"disable_http2"`
 	UploadCutoff      fs.SizeSuffix        `config:"upload_cutoff"`
 	ChunkSize         fs.SizeSuffix        `config:"chunk_size"`
@@ -821,6 +824,27 @@ func init() {
 				"When set, all upload traffic - file contents and the access token - goes " +
 				"through the given host, so only point it at a server you trust, such as " +
 				"your own reverse proxy. The URL must present a valid TLS certificate.",
+			Advanced: true,
+		}, {
+			Name: "upload_relays",
+			Help: "Relays to send upload traffic through, as \"endpoint=relay\" pairs.\n\n" +
+				"Both sides are host or host:port, without a scheme. An IPv6 address has to " +
+				"be written in brackets with its port, like [::1]:443 - a bare IPv6 address " +
+				"cannot be told apart from a port. The endpoint is the upload host the " +
+				"server assigns to the account (or the one upload_zone " +
+				"names); the port is part of its identity, so bjupload.pan.wo.cn and " +
+				"bjupload.pan.wo.cn:30443 are separate entries.\n\n" +
+				"Each upload session starts on one relay, taking them in turn, so the run's " +
+				"upload volume leaves through several source IPs instead of one. A relay " +
+				"leaves rotation for --connect-family-cooldown when an attempt fails before " +
+				"a complete HTTP response arrived (no route, TLS broken, no response headers " +
+				"within --timeout, a stalled write, or a part exceeding 5m0s of wall clock). " +
+				"An HTTP status never marks a relay dead. All IPv4 relays are preferred over " +
+				"all IPv6 relays, and only when every relay of both families is cooling does " +
+				"a session fall back to the endpoint itself.\n\n" +
+				"An endpoint missing from this list is used directly, so adding relays for " +
+				"one region does not change the others.",
+			Default:  fs.CommaSepList{},
 			Advanced: true,
 		}, {
 			Name: "disable_http2",
@@ -962,6 +986,24 @@ type Fs struct {
 	zoneMu     *sync.Mutex // protects zoneURL / zoneLoaded (a pointer so the NewFs tempF copy is safe)
 	zoneURL    string      // upload endpoint from GetZoneInfo, lazily discovered
 	zoneLoaded bool        // whether zoneURL has been fetched successfully
+
+	// relayMap is upload_relays parsed at startup. relayDead is the cooldown
+	// table for relay+family dial targets, keyed by dialTarget.deadKey.
+	relayMap  map[string][]string
+	relayDead *relayCooldownTable
+
+	// relayRound counts sessions so each one starts on the next live relay
+	// instead of parking the whole run on the first one.
+	relayRound *uint64
+
+	// relayMiss is the one-shot guard for "the table is configured but no entry
+	// matches this endpoint": a typo'd endpoint would otherwise upload direct in
+	// silence, and the operator would believe the volume is spread.
+	relayMiss *atomic.Bool
+
+	// relayPartDeadlineOverride shortens the per-attempt wall clock; tests set
+	// it so a stalled target does not cost the full 5m0s.
+	relayPartDeadlineOverride time.Duration
 
 	// dirRejects remembers directory creations the server refused, so a
 	// rejected subtree costs probes rather than one listing plus one create per
@@ -1779,6 +1821,8 @@ func newHTTPClient(ctx context.Context, opt *Options) *http.Client {
 		if opt.DisableHTTP2 {
 			t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 		}
+		// Upload parts carry an address-family pin; see wrapFamilyDial.
+		t.DialContext = wrapFamilyDial(t.DialContext)
 	})
 }
 
@@ -1826,6 +1870,9 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		httpClient: newHTTPClient(ctx, opt),
 		spaceType:  spacePersonal,
 		zoneMu:     new(sync.Mutex),
+		relayDead:  newRelayCooldownTable(),
+		relayRound: new(uint64),
+		relayMiss:  new(atomic.Bool),
 		dirRejects: newRejectCache(),
 	}
 	if opt.FamilyID != "" {
@@ -1851,6 +1898,13 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		}
 		opt.UploadZone = strings.TrimSuffix(opt.UploadZone, "/")
 	}
+	// Parse the relay table before any traffic can ask for a route: a malformed
+	// item must fail the remote at startup, not silently upload direct.
+	relayMap, err := parseRelayConfig(opt.UploadRelays)
+	if err != nil {
+		return nil, err
+	}
+	f.relayMap = relayMap
 
 	// Bootstrap the shared state before anything needs a token. It is keyed by
 	// the configured credentials until the userId is known.
@@ -2910,10 +2964,16 @@ func (f *Fs) uploadZone(ctx context.Context) (string, error) {
 // the token it was encrypted with, and the uniqueId that binds the parts.
 // Every call generates a fresh uniqueId, so a retried upload cannot mix with
 // the orphaned parts of the aborted session.
-func (f *Fs) newUploadSession(ctx context.Context, dirID, name string, size int64, src fs.ObjectInfo) (zoneURL, fiEnc string, fiJSON []byte, uniqueID, token string, err error) {
-	zoneURL, err = f.uploadZone(ctx)
+// uploadRoute is the per-session choice of where to POST the parts: normally one
+// of the operator's relays, and the endpoint itself when none is left.
+func (f *Fs) newUploadSession(ctx context.Context, dirID, name string, size int64, src fs.ObjectInfo) (route *uploadRoute, fiEnc string, fiJSON []byte, uniqueID, token string, err error) {
+	endpoint, err := f.uploadZone(ctx)
 	if err != nil {
-		return "", "", nil, "", "", err
+		return nil, "", nil, "", "", err
+	}
+	route, err = f.uploadRouteFor(endpoint)
+	if err != nil {
+		return nil, "", nil, "", "", err
 	}
 	fi := api.UploadFileInfo{
 		SpaceType:   f.spaceType,
@@ -2931,7 +2991,7 @@ func (f *Fs) newUploadSession(ctx context.Context, dirID, name string, size int6
 	fi.ShootingTime = formatShootingTime(src.ModTime(ctx))
 	fiJSON, err = json.Marshal(fi)
 	if err != nil {
-		return "", "", nil, "", "", err
+		return nil, "", nil, "", "", err
 	}
 	// Read the token once: the fileInfo is encrypted with the key derived from
 	// it and the form carries the same value, so a concurrent refresh between
@@ -2939,14 +2999,14 @@ func (f *Fs) newUploadSession(ctx context.Context, dirID, name string, size int6
 	token = f.tok.accessTokenNow()
 	fiEnc, err = aesEncrypt(fiJSON, aesKeyFor(chanWoHome, token))
 	if err != nil {
-		return "", "", nil, "", "", err
+		return nil, "", nil, "", "", err
 	}
 	// A random uniqueId: the server aggregates a shard session by it, so a
 	// collision between concurrent uploads (same millisecond under
 	// --transfers > 1) could merge or clobber sessions. A timestamp alone is
 	// not enough (fifth round B4).
 	uniqueID = random.String(16)
-	return zoneURL, fiEnc, fiJSON, uniqueID, token, nil
+	return route, fiEnc, fiJSON, uniqueID, token, nil
 }
 
 // uploadSingle uploads a file of known size to the upload2C endpoint.
@@ -2960,7 +3020,7 @@ func (f *Fs) newUploadSession(ctx context.Context, dirID, name string, size int6
 // across parts, and changed between attempts so a retried upload cannot mix
 // with the orphaned parts of the aborted session.
 func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string, size int64, src fs.ObjectInfo) (api.UploadData, error) {
-	zoneURL, fiEnc, fiJSON, uniqueID, token, err := f.newUploadSession(ctx, dirID, name, size, src)
+	route, fiEnc, fiJSON, uniqueID, token, err := f.newUploadSession(ctx, dirID, name, size, src)
 	if err != nil {
 		return api.UploadData{}, err
 	}
@@ -2993,7 +3053,7 @@ func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string,
 			if _, serr := seeker.Seek(0, io.SeekStart); serr != nil {
 				return api.UploadData{}, serr
 			}
-			zoneURL, fiEnc, fiJSON, uniqueID, token, err = f.newUploadSession(ctx, dirID, name, size, src)
+			route, fiEnc, fiJSON, uniqueID, token, err = f.newUploadSession(ctx, dirID, name, size, src)
 			if err != nil {
 				return api.UploadData{}, err
 			}
@@ -3004,25 +3064,39 @@ func (f *Fs) uploadSingle(ctx context.Context, in io.Reader, dirID, name string,
 				uniqueID, total, f.opt.ChunkSize)
 		}
 		if total == 1 {
-			err = f.pacer.CallNoRetry(func() (bool, error) {
-				d, err := f.uploadPart(ctx, io.LimitReader(in, size), zoneURL, dirID, name, size, fiEnc, uniqueID, token, plans[0], total)
-				if err != nil {
-					var ae *apiError
-					if asAPIError(err, &ae) {
-						// A business rejection never succeeds on retry.
-						return false, err
-					}
-					// A transport failure: signal the pacer to back off, but do not
-					// retry here - that is left to the outer copy retry loop.
-					return true, err
+			// One POST holds the whole file. A transport failure re-posts it onto
+			// the next dial target, because another relay means another source IP
+			// and that is the reason the table exists. Without relays the route has
+			// one candidate, so this is the single attempt it always was: a
+			// business rejection or a bare 500 for an unstorable name cannot
+			// succeed on a second POST of the same request.
+			_, err = f.postPartRetry(ctx, st, func(attempt int) (io.Reader, error) {
+				if attempt == 1 {
+					return io.LimitReader(in, size), nil
 				}
-				st.note(d)
-				return false, nil
-			})
+				// A re-post needs the part's bytes again. Rewind what the copy
+				// engine handed over when it can be rewound; otherwise reopen the
+				// source, because one part here is the whole object.
+				if seeker, ok := in.(io.Seeker); ok {
+					if _, serr := seeker.Seek(0, io.SeekStart); serr != nil {
+						return nil, serr
+					}
+					return io.LimitReader(in, size), nil
+				}
+				obj, ok := src.(fs.Object)
+				if !ok {
+					return nil, fmt.Errorf("wopan: cannot re-post the single part of session %s: source %T can be neither rewound nor reopened", uniqueID, src)
+				}
+				rc, oerr := obj.Open(ctx)
+				if oerr != nil {
+					return nil, oerr
+				}
+				return &reOpenReader{Reader: io.LimitReader(rc, size), rc: rc}, nil
+			}, route, dirID, name, size, fiEnc, uniqueID, token, plans[0], total)
 		} else {
 			// The reader is consumed sequentially while the parts are sent
 			// concurrently, mirroring the s3 backend's multipart pipeline.
-			err = f.uploadPartsConcurrent(ctx, in, zoneURL, dirID, name, size, fiEnc, uniqueID, token, plans, total, st)
+			err = f.uploadPartsConcurrent(ctx, in, route, dirID, name, size, fiEnc, uniqueID, token, plans, total, st)
 		}
 		fs.Debugf(f, "wopan: upload attempt #%d took %s (err=%v)", attempt+1, time.Since(uploadStart).Round(time.Millisecond), err)
 		if err == nil || !isAuthInvalid(err) || attempt > 0 || f.opt.NoRefresh {
@@ -3065,7 +3139,7 @@ type partJob struct {
 // only the sending needs concurrency. A part whose transport fails is re-posted
 // before anything else is decided; any failure that survives that cancels the
 // remaining parts.
-func (f *Fs) uploadPartsConcurrent(ctx context.Context, in io.Reader, zoneURL, dirID, name string, size int64, fiEnc, uniqueID, token string, plans []api.PartPlan, total int64, st *partState) error {
+func (f *Fs) uploadPartsConcurrent(ctx context.Context, in io.Reader, route *uploadRoute, dirID, name string, size int64, fiEnc, uniqueID, token string, plans []api.PartPlan, total int64, st *partState) error {
 	concurrency := f.opt.UploadConcurrency
 	if concurrency < 1 {
 		concurrency = 1
@@ -3117,7 +3191,7 @@ func (f *Fs) uploadPartsConcurrent(ctx context.Context, in io.Reader, zoneURL, d
 				// part while this one is still being sent.
 				_, err := f.postPartRetry(gctx, st, func(int) (io.Reader, error) {
 					return bytes.NewReader(job.buf), nil
-				}, zoneURL, dirID, name, size, fiEnc, uniqueID, token, job.plan, total)
+				}, route, dirID, name, size, fiEnc, uniqueID, token, job.plan, total)
 				free <- job.buf
 				if err != nil {
 					return err
@@ -3131,7 +3205,14 @@ func (f *Fs) uploadPartsConcurrent(ctx context.Context, in io.Reader, zoneURL, d
 
 // uploadPart sends one part to the upload2C endpoint and decodes the response.
 // in must yield exactly plan.PartSize bytes.
-func (f *Fs) uploadPart(ctx context.Context, in io.Reader, zoneURL, dirID, name string, size int64, fileInfoEnc, uniqueID, token string, plan api.PartPlan, total int64) (api.UploadData, error) {
+//
+// The caller hands over the dial target rather than letting this pick one: the
+// failure can only be charged to the target the attempt actually used, and other
+// workers of the same session may have moved the route since this attempt began.
+// Failures before an answer is read come back as *uploadFailure so the caller can
+// decide who to blame.
+func (f *Fs) uploadPart(ctx context.Context, in io.Reader, route *uploadRoute, target dialTarget, dirID, name string, size int64, fileInfoEnc, uniqueID, token string, plan api.PartPlan, total int64) (api.UploadData, error) {
+	partCtx := withFamilyPin(ctx, target.family)
 	params := url.Values{}
 	params.Set("uniqueId", uniqueID)
 	params.Set("accessToken", token)
@@ -3151,57 +3232,97 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, zoneURL, dirID, name 
 	// so ContentLength must be overhead + size. http2 rejects a body larger
 	// than the declared length ("request body larger than specified content
 	// length"), and http1 would silently truncate the upload.
-	body, contentType, overhead, err := rest.MultipartUpload(ctx, in, params, "file", name, "application/octet-stream")
+	watch := &partReader{r: in, want: plan.PartSize}
+	body, contentType, overhead, err := rest.MultipartUpload(ctx, watch, params, "file", name, "application/octet-stream")
 	if err != nil {
 		return api.UploadData{}, err
 	}
 	defer func() { _ = body.Close() }()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, zoneURL+"/openapi/client/upload2C", body)
+	req, err := http.NewRequestWithContext(partCtx, http.MethodPost, route.urlFor(target)+"/openapi/client/upload2C", body)
 	if err != nil {
 		return api.UploadData{}, err
 	}
+	// --timeout is an idle clock that renews on every byte, so this per-attempt
+	// wall clock is the only bound on a target that trickles. A re-post onto
+	// another relay starts a fresh clock.
+	attemptCtx, cancelAttempt := context.WithTimeout(req.Context(), f.relayPartDeadline())
+	defer cancelAttempt()
+	req = req.WithContext(attemptCtx)
+
 	req.Header.Set("Content-Type", contentType)
 	req.ContentLength = overhead + plan.PartSize
 	req.Header.Set("Origin", "https://pan.wo.cn")
 	req.Header.Set("Referer", "https://pan.wo.cn/")
 	req.Header.Set("User-Agent", defaultUserAgent)
 
-	// Capture which endpoint (zone host + peer IP) actually served this part:
+	// Capture which endpoint (dial target + peer IP) actually served this part:
 	// with a CDN/reverse proxy in front of the upload zone the DNS answer
 	// rotates, so per-part attribution is the only way to correlate speed
-	// with the edge the request landed on.
-	zoneHost := zoneURL
-	if u, perr := url.Parse(zoneURL); perr == nil {
-		zoneHost = u.Host
-	}
+	// with the edge the request landed on. The peer's family is recorded too,
+	// because a request that rides an idle pooled connection keeps that
+	// connection's family, and a cooldown must be charged to the family that
+	// carried the failure.
+	fail := &uploadFailure{err: nil, peerFamily: target.family}
 	var peerAddr string
-	var reusedConn bool
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
 		GotConn: func(info httptrace.GotConnInfo) {
+			fail.gotConn = true
+			fail.reused = info.Reused
 			if info.Conn != nil {
 				peerAddr = info.Conn.RemoteAddr().String()
+				if host, _, splitErr := net.SplitHostPort(peerAddr); splitErr == nil {
+					if ip := net.ParseIP(host); ip != nil {
+						fail.peerFamily = familyV6
+						if ip.To4() != nil {
+							fail.peerFamily = familyV4
+						}
+					}
+				}
 			}
-			reusedConn = info.Reused
+		},
+		// WroteRequest is the line between "we were still feeding the part" and
+		// "the whole part is on the wire": only in the second case can a slow
+		// attempt be charged to the target instead of the source.
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			if info.Err == nil {
+				fail.bodySent = true
+			}
 		},
 	}))
 
 	t0 := time.Now()
 	res, err := f.httpClient.Do(req)
 	if err != nil {
-		return api.UploadData{}, err
+		if ctx.Err() != nil {
+			// The caller gave up; this says nothing about the dial target.
+			return api.UploadData{}, err
+		}
+		fail.err = err
+		fail.deadline = errors.Is(err, context.DeadlineExceeded)
+		fail.sourceErr = watch.sourceFault()
+		return api.UploadData{}, fail
 	}
 	defer func() { _ = res.Body.Close() }()
 	raw, err := io.ReadAll(res.Body)
 	if err != nil {
-		return api.UploadData{}, err
+		if ctx.Err() != nil {
+			return api.UploadData{}, err
+		}
+		// The answer began and then stopped. How much of the part the target ever
+		// got is what WroteRequest recorded, and nothing else: a relay can answer
+		// and die before the body it forwarded was complete, and the single-part
+		// path decides whether to POST again on exactly that flag.
+		fail.err = err
+		fail.sourceErr = watch.sourceFault()
+		return api.UploadData{}, fail
 	}
 	if res.StatusCode >= 300 {
 		// part/session context is the only way to attribute a failed POST
 		// from the logs: the Put/Update path has no per-chunk logging above
 		// this layer (multi-thread's "chunk %d/%d failed" covers only that
 		// engine's path).
-		err := fmt.Errorf("wopan: upload: part %d/%d session %s via %s -> %s: http %s: %s", plan.Index, total, uniqueID, zoneHost, peerAddr, res.Status, truncate(string(raw), 500))
+		err := fmt.Errorf("wopan: upload: part %d/%d session %s via %s -> %s: http %s: %s", plan.Index, total, uniqueID, target.describe(), peerAddr, res.Status, truncate(string(raw), 500))
 		// For single-part requests an HTTP-level rejection is deterministic
 		// for the given request - the server answers a bare 500 for file
 		// names it cannot store (manual test G7: certain special-symbol and
@@ -3236,7 +3357,7 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, zoneURL, dirID, name 
 	}
 	elapsed := time.Since(t0)
 	fs.Debugf(f, "wopan: uploaded part %d/%d (%v) in session %s via %s -> %s (reused=%v) in %v (%s)",
-		plan.Index, total, fs.SizeSuffix(plan.PartSize), uniqueID, zoneHost, peerAddr, reusedConn,
+		plan.Index, total, fs.SizeSuffix(plan.PartSize), uniqueID, observedTarget(target, fail.peerFamily).describe(), peerAddr, fail.reused,
 		elapsed.Round(time.Millisecond), fs.SizeSuffix(float64(plan.PartSize)/elapsed.Seconds()).ByteRateUnit())
 	return ur.Data, nil
 }
@@ -3333,7 +3454,17 @@ func partSleep(ctx context.Context, d time.Duration) error {
 //
 // Only transport-level failures are re-posted. A business code is deterministic
 // for the request, and 4xx rejections and the single-part path are already
-// marked no-retry by uploadPart, so they come straight back.
+// marked no-retry by uploadPart, so they come straight back. An HTTP status,
+// including 5xx, is not a transport failure: a relay that forwarded a bare 500
+// answered, so re-posting goes to the same target rather than blaming it.
+//
+// uploadPart parks whatever target an attempt failed on and moves the session's
+// route along. The single-part path re-posts only when that move actually
+// happened, so it never POSTs the same request twice.
+//
+// A failure on a pooled connection that had already been closed by the far end is
+// the exception: no byte of the request left us, so it is re-posted to the same
+// target on a fresh connection and nothing is recorded against that relay.
 //
 // A part is never re-posted once the session has produced a fid. Completing a
 // session requires every part to be present, so a fid means this part's bytes are
@@ -3343,20 +3474,27 @@ func partSleep(ctx context.Context, d time.Duration) error {
 // When the attempts run out the error carries no fserrors.RetryError marker, so
 // the copy engine does not re-upload the whole file this round and --retries
 // decides whether to run the command again.
-func (f *Fs) postPartRetry(ctx context.Context, st *partState, next func(attempt int) (io.Reader, error), zoneURL, dirID, name string, size int64, fileInfoEnc, uniqueID, token string, plan api.PartPlan, total int64) (api.UploadData, error) {
+func (f *Fs) postPartRetry(ctx context.Context, st *partState, next func(attempt int) (io.Reader, error), route *uploadRoute, dirID, name string, size int64, fileInfoEnc, uniqueID, token string, plan api.PartPlan, total int64) (api.UploadData, error) {
 	attempts := max(fs.GetConfig(ctx).LowLevelRetries, 1)
 	if total <= 1 {
 		// One part holds the whole file. uploadPart marks an HTTP rejection
 		// there as no-retry because the server answers a bare 500 for names it
 		// cannot store, and a second POST of that cannot succeed; leave the
-		// whole-file ladder in the caller as the only retry, as before.
+		// whole-file ladder in the caller as the only retry, as before. A relay
+		// table changes only the part of that rule that is about the *target*:
+		// another relay is another source IP, so re-posting there is new
+		// information, while re-posting to the same host still is not.
 		attempts = 1
+		if route.hasRelays() {
+			attempts = route.attemptCount()
+		}
 	}
 	var lastErr error
 	for attempt := 1; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return api.UploadData{}, err
 		}
+		via := route.target()
 		// Only a re-post may be skipped this way. A part that has never been
 		// posted has to be posted: the measured invariant is that a completed
 		// session implies every part arrived, so a fid that appeared while this
@@ -3374,7 +3512,7 @@ func (f *Fs) postPartRetry(ctx context.Context, st *partState, next func(attempt
 		}
 		var data api.UploadData
 		err = f.pacer.CallNoRetry(func() (bool, error) {
-			d, uerr := f.uploadPart(ctx, body, zoneURL, dirID, name, size, fileInfoEnc, uniqueID, token, plan, total)
+			d, uerr := f.uploadPart(ctx, body, route, via, dirID, name, size, fileInfoEnc, uniqueID, token, plan, total)
 			if uerr != nil {
 				var ae *apiError
 				if asAPIError(uerr, &ae) {
@@ -3386,6 +3524,12 @@ func (f *Fs) postPartRetry(ctx context.Context, st *partState, next func(attempt
 			data = d
 			return false, nil
 		})
+		// Whatever next() handed over may own a reader of its own, such as a
+		// reopened source. Closing it here, on both paths, is what keeps an
+		// abandoned attempt from leaking one per try.
+		if c, ok := body.(io.Closer); ok {
+			_ = c.Close()
+		}
 		if err == nil {
 			st.note(data)
 			return data, nil
@@ -3393,6 +3537,42 @@ func (f *Fs) postPartRetry(ctx context.Context, st *partState, next func(attempt
 		var ae *apiError
 		if asAPIError(err, &ae) || fserrors.IsNoRetryError(err) {
 			return api.UploadData{}, err
+		}
+		// Only a failure before an answer was read says anything about the dial
+		// target. An HTTP status is the target answering, so it is retried where it
+		// is, exactly as before relays existed.
+		var fail *uploadFailure
+		blamed := errors.As(err, &fail)
+		if blamed && fail.transient() {
+			// A pooled connection the far end had already closed. None of this
+			// request left us, so the next POST - to the same target, on a fresh
+			// connection, since the broken one is out of the pool - is still the
+			// first send of the part. Recording it would move the session off a
+			// working relay and park it for a cooldown window it never earned.
+			fs.Debugf(f, "wopan: part %d/%d of session %s attempt %d/%d died on an idle pooled connection to %s, re-posting on a fresh one: %v",
+				plan.Index, total, uniqueID, attempt, attempts, via.describe(), err)
+		} else if blamed {
+			_, _ = route.noteDead(f, via, fail.peerFamily, fail.blameTarget(), relayCooldownFrom(ctx), err, time.Now())
+		}
+		if total <= 1 {
+			switch {
+			case !blamed:
+				return api.UploadData{}, err
+			case fail.bodySent:
+				// The whole object was on the wire and only the answer was lost.
+				// Re-posting onto another relay would POST the file a second time,
+				// and whether the drive then holds one entry or two has never been
+				// measured. That stays the whole-file ladder's business, as it was
+				// before relays existed.
+				return api.UploadData{}, err
+			case fail.transient():
+				// Not a "same host twice" case: nothing was sent to that host.
+			case route.target() == via:
+				// The attempt did not move the session onto another dial target, so
+				// a second POST would be the same request to the same host - exactly
+				// what the single-attempt rule exists to avoid.
+				return api.UploadData{}, err
+			}
 		}
 		lastErr = err
 		if attempt >= attempts {
@@ -3403,8 +3583,8 @@ func (f *Fs) postPartRetry(ctx context.Context, st *partState, next func(attempt
 			return api.UploadData{}, noLowLevelRetry(err)
 		}
 		delay := partRetryDelay(attempt, int(plan.Index))
-		fs.Debugf(f, "wopan: part %d/%d of session %s attempt %d/%d failed, re-posting in %v: %v",
-			plan.Index, total, uniqueID, attempt, attempts, delay, err)
+		fs.Debugf(f, "wopan: part %d/%d of session %s attempt %d/%d on %s failed, re-posting in %v via %s: %v",
+			plan.Index, total, uniqueID, attempt, attempts, via.describe(), delay, route.target().describe(), err)
 		if err := partSleep(ctx, delay); err != nil {
 			return api.UploadData{}, noLowLevelRetry(lastErr)
 		}
@@ -3462,7 +3642,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		info = fs.ChunkWriterInfo{ChunkSize: hitChunk, Concurrency: 1}
 		return info, transferredChunkWriter{}, nil
 	}
-	zoneURL, fiEnc, _, uniqueID, token, err := f.newUploadSession(ctx, dirID, leaf, size, src)
+	route, fiEnc, _, uniqueID, token, err := f.newUploadSession(ctx, dirID, leaf, size, src)
 	if err != nil {
 		return info, nil, err
 	}
@@ -3472,7 +3652,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	}
 	w := &wopanChunkWriter{
 		f:        f,
-		zoneURL:  zoneURL,
+		route:    route,
 		dirID:    dirID,
 		name:     leaf,
 		size:     size,
@@ -3494,7 +3674,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 // session, one POST per WriteChunk call.
 type wopanChunkWriter struct {
 	f        *Fs
-	zoneURL  string
+	route    *uploadRoute
 	dirID    string
 	name     string
 	size     int64
@@ -3534,7 +3714,7 @@ func (w *wopanChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 			}
 		}
 		return io.LimitReader(reader, plan.PartSize), nil
-	}, w.zoneURL, w.dirID, w.name, w.size, w.fiEnc, w.uniqueID, w.token, plan, w.total)
+	}, w.route, w.dirID, w.name, w.size, w.fiEnc, w.uniqueID, w.token, plan, w.total)
 	if err != nil {
 		if isAuthInvalid(err) && !w.f.opt.NoRefresh {
 			// The token was rotated by someone else after this session opened.
