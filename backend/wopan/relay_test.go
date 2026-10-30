@@ -530,9 +530,17 @@ func TestUnitRelayCooldownAndDeadline(t *testing.T) {
 	assert.Equal(t, 30*time.Second, relayCooldown(30*time.Second))
 
 	f := &Fs{relayDead: newRelayCooldownTable()}
-	assert.Equal(t, 5*time.Minute, f.relayPartDeadline(), "the default bounds one attempt")
+	assert.Equal(t, 5*time.Minute, f.relayPartDeadline(8<<20), "the default bounds one attempt")
+	assert.Equal(t, 5*time.Minute, f.relayPartDeadline(1), "a small part is not given a shorter clock")
+	// The clock is stated per 8 MiB, so the bandwidth it demands does not move
+	// with the part. On a flat 5m0s bound, the 64 MiB single part that a default
+	// --wopan-upload_cutoff allows would ask for 1.8 Mbit/s, and the measured
+	// relay legs here run about 180 KiB/s (1.4 Mbit/s) per connection.
+	assert.Equal(t, 40*time.Minute, f.relayPartDeadline(64<<20), "default cutoff single part")
+	assert.Equal(t, 10*time.Minute, f.relayPartDeadline((8<<20)+1), "one byte past the floor is another whole 5m")
+	assert.Equal(t, 10*time.Minute, f.relayPartDeadline(16<<20))
 	f.relayPartDeadlineOverride = time.Millisecond
-	assert.Equal(t, time.Millisecond, f.relayPartDeadline())
+	assert.Equal(t, time.Millisecond, f.relayPartDeadline(64<<20))
 }
 
 func TestUnitDescribeTargets(t *testing.T) {
@@ -1580,6 +1588,23 @@ func TestUnitSinglePart503KeepsTheErrorRetryable(t *testing.T) {
 	assert.Equal(t, []string{relayZoneHost}, rec.uploadHosts(), "no other target to move to")
 }
 
+// TestUnitGatewayStatusWithoutRelaysKeepsTheOldError: a remote with no relay
+// table has nowhere to move, so it must answer exactly as it did before relays
+// existed - a non-retryable rejection - rather than picking up the new relay
+// semantics.
+func TestUnitGatewayStatusWithoutRelaysKeepsTheOldError(t *testing.T) {
+	withPartRetries(t, 3)
+	rec := &zoneRecorder{zoneURL: relayZoneURL, gatewayStatus: 504, gatewayPart: 1, gatewayTimes: 9, gatewayHost: relayZoneHost}
+	f := smallPartFs(t, rec)
+
+	small := int64(64 << 10)
+	src := fsobject.NewStaticObjectInfo("small.bin", time.Now(), small, true, nil, nil)
+	_, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, small)), "dirID", "small.bin", small, src)
+	require.Error(t, err)
+	assert.True(t, fserrors.IsNoRetryError(err), "no relay table, so the pre-relays no-retry shape must stand")
+	assert.Equal(t, []string{relayZoneHost}, rec.uploadHosts())
+}
+
 // TestUnitGatewayFailureOnDirectPathPostsOnce: the session is already on the
 // endpoint (every relay cooling), so the gateway answer has nowhere to move it.
 // Re-posting would put the same request on the same host, which is exactly what
@@ -1634,6 +1659,35 @@ func TestUnitDirectAttemptHasNoWallClock(t *testing.T) {
 	data, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, small)), "dirID", "small.bin", small, src)
 	require.NoError(t, err, "a direct attempt must not be cut by the relay wall clock")
 	assert.NotEmpty(t, data.Fid)
+}
+
+// TestUnitWallClockScalesWithThePart reads the clock off the request itself: the
+// bound is 5m0s per 8 MiB of part, so a 24 MiB single part is given 15 minutes.
+// A flat 5m0s clock would demand 1.8 Mbit/s from the 64 MiB part a default
+// --wopan-upload_cutoff allows, and the relay legs measured here run about
+// 180 KiB/s per connection, so the scaling is what keeps big parts uploadable.
+func TestUnitWallClockScalesWithThePart(t *testing.T) {
+	withPartRetries(t, 3)
+	size := int64(24 << 20)
+	rec := &zoneRecorder{zoneURL: relayZoneURL}
+	f := smallPartFs(t, rec, "r1.example:443")
+	src := fsobject.NewStaticObjectInfo("mid.bin", time.Now(), size, true, nil, nil)
+	_, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, size)), "dirID", "mid.bin", size, src)
+	require.NoError(t, err)
+
+	ds := rec.uploadDeadlines()
+	require.Len(t, ds, 1, "one part, one post")
+	assert.Greater(t, ds[0], 14*time.Minute, "24 MiB is three 8 MiB floors, so 15m")
+	assert.LessOrEqual(t, ds[0], 15*time.Minute)
+
+	// The same part sent with no relay table is still a direct attempt, and a
+	// direct attempt carries no clock at any size.
+	rec2 := &zoneRecorder{zoneURL: relayZoneURL}
+	f2 := smallPartFs(t, rec2)
+	_, err = f2.uploadSingle(context.Background(), bytes.NewReader(make([]byte, size)), "dirID", "mid.bin", size, src)
+	require.NoError(t, err)
+	require.Len(t, rec2.uploadDeadlines(), 1)
+	assert.Zero(t, rec2.uploadDeadlines()[0], "a direct attempt has no wall clock")
 }
 
 // TestUnitSinglePartOnDirectPathPostsOnce: with every relay cooling the session

@@ -46,13 +46,21 @@ const (
 // The same 5 minutes the address-family table uses; no new knob.
 const defaultRelayCooldown = 5 * time.Minute
 
-// defaultRelayPartDeadline bounds one attempt's wall clock.
+// defaultRelayPartDeadline bounds one attempt's wall clock for one part of
+// relayPartFloorBytes, which is the default --wopan-chunk-size.
 //
 // --timeout is an idle clock that renews on every byte, so a target that trickles
 // never trips it: measured 2026-10-21 a single part held a worker for 91 minutes.
-// At the default 8 MiB chunk size this value implies a floor of about 1.4 Mbit/s;
-// a much larger --wopan-chunk-size needs the clock raised with it.
+// The bound is a constant, so it is applied per 8 MiB of part - the bandwidth it
+// demands is the same 0.22 Mbit/s whether the part is 8 MiB or the 64 MiB a
+// default --wopan-upload_cutoff single-part upload can reach, and a deployment
+// that raises chunk_size far above 8 MiB gets a longer clock rather than an
+// unreachable demand. There is no user-facing knob for it
+// (relayPartDeadlineOverride is test-only).
 const defaultRelayPartDeadline = 5 * time.Minute
+
+// relayPartFloorBytes is the part size defaultRelayPartDeadline is stated for.
+const relayPartFloorBytes = 8 << 20
 
 // dialTarget is one place an upload part can be POSTed.
 type dialTarget struct {
@@ -467,13 +475,18 @@ func relayCooldown(d time.Duration) time.Duration {
 	return d
 }
 
-// relayPartDeadline is the per-attempt wall clock. The override field exists so
-// tests do not have to sleep for five minutes.
-func (f *Fs) relayPartDeadline() time.Duration {
+// relayPartDeadline is the per-attempt wall clock for a part of partSize: the
+// constant bound per relayPartFloorBytes, so the bandwidth it asks for does not
+// depend on how big the part is. The override field exists so tests do not have
+// to sleep for five minutes.
+func (f *Fs) relayPartDeadline(partSize int64) time.Duration {
 	if f.relayPartDeadlineOverride > 0 {
 		return f.relayPartDeadlineOverride
 	}
-	return defaultRelayPartDeadline
+	if partSize <= relayPartFloorBytes {
+		return defaultRelayPartDeadline
+	}
+	return defaultRelayPartDeadline * time.Duration((partSize+relayPartFloorBytes-1)/relayPartFloorBytes)
 }
 
 // familyPin carries the address family a request must dial, through the context
