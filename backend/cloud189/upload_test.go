@@ -1878,7 +1878,7 @@ func TestChunkWriterWriteChunkRejectsAnImpossibleChunk(t *testing.T) {
 	}
 	_, err = w.WriteChunk(context.Background(), 7, bytes.NewReader(pattern(10)))
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "past the 2 parts")
+	require.Contains(t, err.Error(), "past the 2 chunks")
 
 	_, err = w.WriteChunk(context.Background(), 0, bytes.NewReader(pattern(int(fakePartBase)+1)))
 	require.NoError(t, err, "a chunk longer than the part is cut to the part")
@@ -1892,8 +1892,45 @@ func TestChunkWriterWriteChunkRejectsAnImpossibleChunk(t *testing.T) {
 	require.NoError(t, w.Abort(context.Background()))
 }
 
-// TestChunkWriterEndToEnd uploads through the writer interface, which is what a
-// multi-threaded copy does.
+// TestChunkWriterDownloadChunkDecoupledFromPart guards download_chunk_size: the
+// copy engine then hands us chunks that are several parts wide, and every byte
+// must still land at its own offset with the part count left alone.
+func TestChunkWriterDownloadChunkDecoupledFromPart(t *testing.T) {
+	f := &Fs{}
+	f.opt.ChunkSize = fs.SizeSuffix(fakePartBase)
+	size := fakePartBase * 4
+	chunk := fakePartBase * 2
+	tmp, err := os.CreateTemp(t.TempDir(), "wide-")
+	require.NoError(t, err)
+	w := &chunkWriter{
+		f: f, tmp: tmp, tmpPath: tmp.Name(), leaf: "wide.bin",
+		size: size, partSize: fakePartBase, chunkSize: chunk,
+		plans: api.PlanParts(size, fakePartBase),
+		done:  make([]bool, 2),
+	}
+	first := pattern(int(chunk))
+	n, err := w.WriteChunk(context.Background(), 0, bytes.NewReader(first))
+	require.NoError(t, err)
+	require.Equal(t, chunk, n, "one download chunk covers two parts")
+	require.True(t, w.done[0])
+
+	_, err = w.WriteChunk(context.Background(), 2, bytes.NewReader(pattern(10)))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "past the 2 chunks", "the engine's chunk count, not the part count")
+
+	// A chunk that is short of the download chunk is a hole, not a short write.
+	_, err = w.WriteChunk(context.Background(), 1, bytes.NewReader(pattern(int(chunk)-1)))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "where 2097152 were due")
+	require.False(t, w.done[1])
+
+	// The bytes already staged sit at the right offset, which is what the part
+	// digests at Close are computed from.
+	staged, err := os.ReadFile(tmp.Name())
+	require.NoError(t, err)
+	require.Equal(t, first, staged[:chunk])
+	require.NoError(t, w.Abort(context.Background()))
+}
 func TestChunkWriterEndToEnd(t *testing.T) {
 	drive := &fakeDrive{t: t}
 	f := newFakeFs(t, drive)
