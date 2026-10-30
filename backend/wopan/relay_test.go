@@ -1480,6 +1480,67 @@ func TestUnitTruncatedAnswerDecidesOnWhatWasSent(t *testing.T) {
 	})
 }
 
+// TestUnitGatewayFailureParksTheRelay covers the answer that comes from the
+// gateway in front of a relay rather than from the upload service. Measured
+// 2026-10-30: one relay's IPv6 leg answered 504 to 264 parts in eleven minutes
+// while the other relays were healthy, and because an HTTP status used to mean
+// "the relay is alive", every one of those parts was re-sent to the same host.
+func TestUnitGatewayFailureParksTheRelay(t *testing.T) {
+	withPartRetries(t, 3)
+	rec := &zoneRecorder{
+		zoneURL:       relayZoneURL,
+		gatewayStatus: 504,
+		gatewayPart:   1,
+		gatewayTimes:  1,
+		gatewayHost:   "r1.example:443",
+	}
+	f := relayFs(rec, "r1.example:443", "r2.example:443")
+	uploadThreeParts(t, f, "big.bin")
+
+	assert.Equal(t, []string{
+		"r1.example:443", "r2.example:443", "r2.example:443", "r2.example:443",
+	}, rec.uploadHosts(), "the part is re-posted on the relay the session moved to")
+	assert.Equal(t, 2, rec.countOf(1))
+	assert.True(t, f.relayDead.parkedByKey("r1.example:443|4", time.Now()),
+		"a gateway 504 is the relay failing to reach the service, not an answer from it")
+}
+
+// TestUnitGatewayFailureOnASinglePartRepostsElsewhere: one part holds the whole
+// file, so the usual rule is "never POST the same request twice". A gateway 504
+// means nothing was stored upstream, so the second POST is the first one that can
+// succeed - and staying on the same relay would just waste the file.
+func TestUnitGatewayFailureOnASinglePartRepostsElsewhere(t *testing.T) {
+	withPartRetries(t, 3)
+	rec := &zoneRecorder{
+		zoneURL:       relayZoneURL,
+		gatewayStatus: 504,
+		gatewayPart:   1,
+		gatewayTimes:  1,
+		gatewayHost:   "r1.example:443",
+	}
+	f := smallPartFs(t, rec, "r1.example:443", "r2.example:443")
+
+	small := int64(64 << 10)
+	src := fsobject.NewStaticObjectInfo("small.bin", time.Now(), small, true, nil, nil)
+	data, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, small)), "dirID", "small.bin", small, src)
+	require.NoError(t, err, "the file must finish on the relay the session moved to")
+	assert.NotEmpty(t, data.Fid)
+	assert.Equal(t, []string{"r1.example:443", "r2.example:443"}, rec.uploadHosts())
+	assert.True(t, f.relayDead.parkedByKey("r1.example:443|4", time.Now()))
+}
+
+// TestUnitRelayUnavailableStatus pins which statuses condemn the path. 500 and
+// the 4xx rejections are answers from the upload service and must keep their old
+// meaning.
+func TestUnitRelayUnavailableStatus(t *testing.T) {
+	for _, code := range []int{502, 503, 504} {
+		assert.True(t, relayUnavailableStatus(code), "%d comes from the gateway in front of the relay", code)
+	}
+	for _, code := range []int{200, 400, 401, 403, 404, 413, 429, 500, 501, 505} {
+		assert.False(t, relayUnavailableStatus(code), "%d is not a gateway failure", code)
+	}
+}
+
 // TestUnitSinglePartOnDirectPathPostsOnce: with every relay cooling the session
 // opens on the endpoint. The re-post ladder would otherwise let one part - which
 // here is the whole file - be POSTed once per candidate, and the rule that a

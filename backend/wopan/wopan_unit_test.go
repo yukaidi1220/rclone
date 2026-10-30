@@ -1239,6 +1239,13 @@ type zoneRecorder struct {
 	// HTTP 500, driving the transport-level failure path of the chunked
 	// upload.
 	failPart5xx int
+	// gatewayStatus, with gatewayPart and gatewayTimes, answers that HTTP status
+	// to the first N posts of one part from one host: the shape of the gateway in
+	// front of a relay timing out. 0 leaves every answer alone.
+	gatewayStatus int
+	gatewayPart   int
+	gatewayTimes  int
+	gatewayHost   string
 	// failPartCode, if non-empty, is the business code answered for failPart
 	// instead of the generic 9999.
 	failPartCode string
@@ -1485,6 +1492,17 @@ func (z *zoneRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
 				return nil, errors.New(`Post "https://tjupload.pan.wo.cn/openapi/client/upload2C": ` +
 					"wsarecv: An existing connection was forcibly closed by the remote host.")
 			}
+		}
+		if z.gatewayStatus != 0 && idx == strconv.Itoa(z.gatewayPart) && n <= z.gatewayTimes &&
+			(z.gatewayHost == "" || r.URL.Host == z.gatewayHost) {
+			const page = "<html><head><title>504 Gateway Time-out</title></head><body><h1>504 Gateway Time-out</h1></body></html>"
+			return &http.Response{
+				StatusCode:    z.gatewayStatus,
+				Status:        strconv.Itoa(z.gatewayStatus) + " Gateway Time-out",
+				Body:          io.NopCloser(strings.NewReader(page)),
+				ContentLength: int64(len(page)),
+				Header:        http.Header{"Content-Type": []string{"text/html"}},
+			}, nil
 		}
 		if idx, err := strconv.Atoi(pv.Get("partIndex")); err == nil && idx == z.failPart5xx {
 			return &http.Response{
