@@ -30,7 +30,6 @@ func directRoute(t *testing.T, f *Fs, endpoint string) *uploadRoute {
 	r, err := f.newUploadRoute(endpoint, 0)
 	require.NoError(t, err)
 	require.False(t, r.hasRelays(), "directRoute is only for the no-relay shape")
-	require.Equal(t, 1, r.attemptCount())
 	return r
 }
 
@@ -769,7 +768,9 @@ func TestUnitRelayFiveHundredAnswerDoesNotParkTheRelay(t *testing.T) {
 	for _, h := range []string{"r1.example:443|4", "r2.example:443|4"} {
 		assert.False(t, f.relayDead.parkedByKey(h, time.Now()), "a forwarded 5xx must not park %s", h)
 	}
-	assert.Equal(t, []string{"r1.example:443", "r1.example:443", "r1.example:443"}, rec.uploadHosts()[:3],
+	hosts := rec.uploadHosts()
+	require.GreaterOrEqual(t, len(hosts), 3, "the first part must have been posted three times")
+	assert.Equal(t, []string{"r1.example:443", "r1.example:443", "r1.example:443"}, hosts[:3],
 		"the part is re-posted to the same relay that answered")
 }
 
@@ -890,11 +891,15 @@ func TestUnitNewFsAcceptsCommaSeparatedRelays(t *testing.T) {
 	// newFs goes on to validate the token against the service, which unit tests
 	// have no business doing: the error it returns must therefore be about the
 	// network, not about the relay line.
-	_, err := newFs(context.Background(), "wopan-test", "", m)
+	f, err := newFs(context.Background(), "wopan-test", "", m)
 	if err != nil {
 		assert.NotContains(t, err.Error(), "upload_relays",
 			"two comma separated pairs must parse")
+		return
 	}
+	// A remote that came up despite the token check must have parsed the line:
+	// without this the assertion below is vacuous on the success path.
+	assert.Equal(t, map[string][]string{"hyupload.pan.wo.cn:443": {"r1.example:443", "r2.example:8443"}}, f.relayMap)
 }
 
 func TestUnitWrapFamilyDialLeavesOtherNetworksAlone(t *testing.T) {
@@ -949,13 +954,26 @@ func TestUnitNewFsRejectsMalformedRelays(t *testing.T) {
 
 // An endpoint that carries its own path would build one URL for the direct
 // branch and another for a relay branch. Refusing beats being inconsistent.
-func TestUnitNewUploadRouteRejectsEndpointWithPath(t *testing.T) {
-	f := &Fs{relayDead: newRelayCooldownTable()}
-	for _, bad := range []string{"https://ep:443/upload", "https://ep:443?x=1"} {
-		_, err := f.newUploadRoute(bad, 0)
-		require.Error(t, err, bad)
-		assert.Contains(t, err.Error(), "without path or query")
-	}
+// TestUnitNewUploadRouteKeepsTheEndpointPath: upload_zone used to be usable with
+// a path (`https://proxy.example/wopan`), and the upload2C suffix was appended to
+// it. That has to keep working, on the direct branch and through a relay alike.
+func TestUnitNewUploadRouteKeepsTheEndpointPath(t *testing.T) {
+	f := &Fs{relayDead: newRelayCooldownTable(), relayMap: map[string][]string{"ep:443": {"r1:443"}}}
+	r, err := f.newUploadRoute("https://ep:443/wopan", 0)
+	require.NoError(t, err)
+	assert.Equal(t, "https://r1:443/wopan", currentURL(r), "a relay carries the same mount point")
+	assert.Equal(t, "https://ep:443/wopan", r.urlFor(dialTarget{host: "ep:443", direct: true}))
+
+	// A trailing slash must not become a doubled separator.
+	r, err = f.newUploadRoute("https://ep:443/wopan/", 0)
+	require.NoError(t, err)
+	assert.Equal(t, "https://r1:443/wopan", currentURL(r))
+	assert.Equal(t, "https://ep:443/wopan", r.urlFor(dialTarget{host: "ep:443", direct: true}))
+
+	// A query cannot compose with an appended path and is still refused.
+	_, err = f.newUploadRoute("https://ep:443?x=1", 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "query")
 }
 
 func TestUnitSessionOpenSkipsCoolingRelays(t *testing.T) {
@@ -1531,14 +1549,71 @@ func TestUnitGatewayFailureOnASinglePartRepostsElsewhere(t *testing.T) {
 
 // TestUnitRelayUnavailableStatus pins which statuses condemn the path. 500 and
 // the 4xx rejections are answers from the upload service and must keep their old
-// meaning.
+// meaning; 503 is the usual shape of rate limiting and only means "come back
+// later", so it must not take a relay out of rotation for a whole cooldown.
 func TestUnitRelayUnavailableStatus(t *testing.T) {
-	for _, code := range []int{502, 503, 504} {
+	for _, code := range []int{502, 504} {
 		assert.True(t, relayUnavailableStatus(code), "%d comes from the gateway in front of the relay", code)
 	}
-	for _, code := range []int{200, 400, 401, 403, 404, 413, 429, 500, 501, 505} {
-		assert.False(t, relayUnavailableStatus(code), "%d is not a gateway failure", code)
+	for _, code := range []int{200, 400, 401, 403, 404, 413, 429, 500, 501, 503, 505} {
+		assert.False(t, relayUnavailableStatus(code), "%d is not a gateway path failure", code)
 	}
+}
+
+// TestUnitGatewayFailureOnDirectPathPostsOnce: the session is already on the
+// endpoint (every relay cooling), so the gateway answer has nowhere to move it.
+// Re-posting would put the same request on the same host, which is exactly what
+// the single-attempt rule prevents.
+func TestUnitGatewayFailureOnDirectPathPostsOnce(t *testing.T) {
+	withPartRetries(t, 3)
+	rec := &zoneRecorder{
+		zoneURL:       relayZoneURL,
+		gatewayStatus: 502,
+		gatewayPart:   1,
+		gatewayTimes:  9,
+		gatewayHost:   relayZoneHost,
+	}
+	f := smallPartFs(t, rec, "r1.example:443")
+	now := time.Now()
+	for _, target := range []dialTarget{
+		{host: "r1.example:443", family: familyV4},
+		{host: "r1.example:443", family: familyV6},
+	} {
+		require.True(t, f.relayDead.parkRelay(target, time.Hour, now))
+	}
+
+	small := int64(64 << 10)
+	src := fsobject.NewStaticObjectInfo("small.bin", time.Now(), small, true, nil, nil)
+	_, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, small)), "dirID", "small.bin", small, src)
+	require.Error(t, err, "a gateway answer from the endpoint itself must be reported")
+	assert.Equal(t, []string{relayZoneHost}, rec.uploadHosts(),
+		"the cursor had nowhere to move, so exactly one POST is the rule")
+	assert.False(t, f.relayDead.parkedByKey(relayZoneHost+"|0", now), "the endpoint itself is never parked")
+}
+
+// TestUnitDirectAttemptHasNoWallClock: the per-attempt clock exists so a stalled
+// relay can be abandoned for the next one. A direct attempt has nowhere to go, so
+// imposing one would abandon a legitimately slow upload of up to upload_cutoff
+// bytes. The override makes the difference observable without waiting minutes.
+func TestUnitDirectAttemptHasNoWallClock(t *testing.T) {
+	withPartRetries(t, 3)
+	// A real transport: the fake RoundTripper ignores the request context, so a
+	// clock-wrapped attempt would still answer and the test could not tell the
+	// difference.
+	endpoint := startAnsweringTarget(t)
+	f := newUnitTestFs(nil)
+	f.httpClient = newHTTPClient(context.Background(), &Options{})
+	f.zoneURL = endpoint.URL
+	f.zoneLoaded = true
+	// Far too short for anything real: if the clock were applied to a direct
+	// attempt this upload could not finish.
+	f.relayPartDeadlineOverride = time.Nanosecond
+
+	small := int64(64 << 10)
+	src := fsobject.NewStaticObjectInfo("small.bin", time.Now(), small, true, nil, nil)
+	data, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, small)), "dirID", "small.bin", small, src)
+	require.NoError(t, err, "a direct attempt must not be cut by the relay wall clock")
+	assert.NotEmpty(t, data.Fid)
 }
 
 // TestUnitSinglePartOnDirectPathPostsOnce: with every relay cooling the session

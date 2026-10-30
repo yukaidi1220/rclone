@@ -96,10 +96,12 @@ The advanced options are:
   `--connect-family-cooldown` when an attempt fails before a complete HTTP
   response arrived: no route, TLS broken, no response headers within `--timeout`,
   or the part's own 5m0s wall clock expiring after the whole part had been
-  written. An HTTP status the relay forwarded never marks it dead, because a
-  relay that forwarded a 500 answered; 502, 503 and 504 are the exception, since
-  those come from the gateway in front of the relay and say it could not reach
-  the upload service at all. Three shapes are not counted against a relay either,
+  written. That clock only applies to attempts that go through a relay: a direct
+  attempt has no other target to move to, so it keeps the old behaviour of no
+  wall clock. An HTTP status the relay forwarded never marks it dead, because a
+  relay that forwarded a 500 answered; 502 and 504 are the exception, since those
+  come from the gateway in front of the relay and say it could not reach the
+  upload service at all. Three shapes are not counted against a relay either,
   because they cannot be told apart from the source or from a stale keep-alive:
   the wall clock expiring while the part is still being fed, the source itself
   erroring, and a pooled connection the far end had already closed. The last one
