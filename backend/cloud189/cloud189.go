@@ -163,6 +163,7 @@ type Options struct {
 	NoRefresh         bool                 `config:"no_refresh"`
 	HardDelete        bool                 `config:"hard_delete"`
 	ChunkSize         fs.SizeSuffix        `config:"chunk_size"`
+	DownloadChunkSize fs.SizeSuffix        `config:"download_chunk_size"`
 	UploadConcurrency int                  `config:"upload_concurrency"`
 	MaxFileSize       fs.SizeSuffix        `config:"max_file_size"`
 	NoQuotaCheck      bool                 `config:"no_quota_check"`
@@ -252,6 +253,20 @@ func init() {
 				"the block rclone holds in memory for each of the " +
 				"--cloud189-upload-concurrency parts that are in flight.",
 			Default:  defaultChunkSize,
+			Advanced: true,
+		}, {
+			Name: "download_chunk_size",
+			Help: "Size of each chunk the multi-thread copy engine reads from the source.\n\n" +
+				"The upload part size stays the server's ladder value (chunk_size); this option only " +
+				"changes how many bytes one stream reads before handing them to the staged file. Fewer, " +
+				"bigger chunks mean fewer source requests and fewer per-chunk hashes, which is where a " +
+				"small part size costs.\n\n" +
+				"Memory per stream equals this value: the engine reserves one chunk per stream before it " +
+				"opens the source, so raising it raises peak memory by --multi-thread-streams times the " +
+				"increase, per file in flight.\n\n" +
+				"0 means use the upload part size, which is also what every measurement before " +
+				"2026-10-31 assumed.",
+			Default:  fs.SizeSuffix(0),
 			Advanced: true,
 		}, {
 			Name: "upload_concurrency",
@@ -1124,6 +1139,12 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 	}
 	if opt.UploadConcurrency < 1 {
 		return nil, fmt.Errorf("cloud189: upload_concurrency must be 1 or more, got %d", opt.UploadConcurrency)
+	}
+	// download_chunk_size only decides how much one stream reads at a time, so
+	// it has no server-side constraint; 0 keeps the old behaviour (one upload
+	// part per read).
+	if opt.DownloadChunkSize < 0 {
+		return nil, fmt.Errorf("cloud189: download_chunk_size must be 0 or more, got %s", opt.DownloadChunkSize)
 	}
 	uploadBase, err := parseUploadZone(opt.UploadZone)
 	if err != nil {
@@ -5098,38 +5119,52 @@ func digestsFrom(ra io.ReaderAt, plans []api.PartPlan, partSize int64) (string, 
 // opened with the digest of every part in it. So this writer collects, and the
 // protocol runs at Close.
 type chunkWriter struct {
-	f        *Fs
-	tmp      *os.File
-	tmpPath  string
-	remote   string
-	dirID    string
-	leaf     string // the name as it goes on the wire
-	size     int64
-	partSize int64
-	plans    []api.PartPlan
+	f         *Fs
+	tmp       *os.File
+	tmpPath   string
+	remote    string
+	dirID     string
+	leaf      string // the name as it goes on the wire
+	size      int64
+	partSize  int64 // upload part size: the ladder value the server checks
+	chunkSize int64 // download chunk size: what the copy engine hands us per call
+	plans     []api.PartPlan
 
 	mu   sync.Mutex
-	done []bool // one per part, so a chunk that never arrived is a hole and not a shorter sum
+	done []bool // one per download chunk, so a chunk that never arrived is a hole and not a shorter sum
 }
 
-// WriteChunk stores one part at its offset in the staged file.
+// WriteChunk stores one download chunk at its offset in the staged file.
 //
 // Chunks arrive from several goroutines at once, which is why the file is
-// opened once and written at absolute offsets rather than appended to.
+// opened once and written at absolute offsets rather than appended to. The
+// chunk size here is the engine's (download_chunk_size), not the upload part
+// size: the staged file is the same bytes either way, and the part digests are
+// computed from it at Close.
 func (w *chunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if chunkNumber < 0 || chunkNumber >= len(w.plans) {
-		return 0, fserrors.NoRetryError(fmt.Errorf("cloud189: %s: chunk %d is past the %d parts this upload was planned around", w.leaf, chunkNumber, len(w.plans)))
+	chunkSize := w.chunkSize
+	if chunkSize <= 0 {
+		// Writers built before download_chunk_size existed (and their tests)
+		// only carry partSize, where one read was one part.
+		chunkSize = w.partSize
 	}
-	plan := w.plans[chunkNumber]
-	n, err := io.Copy(io.NewOffsetWriter(w.tmp, int64(chunkNumber)*w.partSize), io.LimitReader(reader, plan.Size))
+	if chunkNumber < 0 || chunkNumber >= len(w.done) {
+		return 0, fserrors.NoRetryError(fmt.Errorf("cloud189: %s: chunk %d is past the %d chunks this copy was planned around", w.leaf, chunkNumber, len(w.done)))
+	}
+	start := int64(chunkNumber) * chunkSize
+	due := chunkSize
+	if remaining := w.size - start; remaining < due {
+		due = remaining
+	}
+	n, err := io.Copy(io.NewOffsetWriter(w.tmp, start), io.LimitReader(reader, due))
 	if err != nil {
 		return 0, fmt.Errorf("cloud189: %s: staging chunk %d: %w", w.leaf, chunkNumber+1, err)
 	}
-	if n != plan.Size {
-		return 0, fserrors.NoRetryError(fmt.Errorf("cloud189: %s: chunk %d gave %d bytes where %d were due", w.leaf, chunkNumber+1, n, plan.Size))
+	if n != due {
+		return 0, fserrors.NoRetryError(fmt.Errorf("cloud189: %s: chunk %d gave %d bytes where %d were due", w.leaf, chunkNumber+1, n, due))
 	}
 	w.mu.Lock()
 	w.done[chunkNumber] = true
@@ -5219,6 +5254,17 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	partSize := chunkPlan(size, int64(f.opt.ChunkSize))
 	plans := api.PlanParts(size, partSize)
 
+	// The copy engine reads the source chunk_size bytes at a time; the upload
+	// part size above is what the server checks. They are allowed to differ:
+	// every chunk lands at its absolute offset in the staged file either way.
+	chunkSize := partSize
+	if f.opt.DownloadChunkSize > 0 {
+		chunkSize = int64(f.opt.DownloadChunkSize)
+	}
+	if chunkSize > size {
+		chunkSize = size
+	}
+
 	tmp, err := os.CreateTemp("", "rclone-cloud189-")
 	if err != nil {
 		return fs.ChunkWriterInfo{}, nil, fmt.Errorf("cloud189: opening the temp file: %w", err)
@@ -5229,18 +5275,20 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		return fs.ChunkWriterInfo{}, nil, fmt.Errorf("cloud189: making room in the temp file: %w", err)
 	}
 	w := &chunkWriter{
-		f:        f,
-		tmp:      tmp,
-		tmpPath:  tmp.Name(),
-		remote:   remote,
-		dirID:    dirID,
-		leaf:     wireLeaf,
-		size:     size,
-		partSize: partSize,
-		plans:    plans,
-		done:     make([]bool, len(plans)),
+		f:         f,
+		tmp:       tmp,
+		tmpPath:   tmp.Name(),
+		remote:    remote,
+		dirID:     dirID,
+		leaf:      wireLeaf,
+		size:      size,
+		partSize:  partSize,
+		chunkSize: chunkSize,
+		plans:     plans,
+		done:      make([]bool, (size+chunkSize-1)/chunkSize),
 	}
-	return fs.ChunkWriterInfo{ChunkSize: partSize, Concurrency: f.opt.UploadConcurrency}, w, nil
+	fs.Debugf(remote, "cloud189: open chunk writer: %d download chunks of %v, %d upload parts of %v", len(w.done), fs.SizeSuffix(chunkSize), len(plans), fs.SizeSuffix(partSize))
+	return fs.ChunkWriterInfo{ChunkSize: chunkSize, Concurrency: f.opt.UploadConcurrency}, w, nil
 }
 
 // ------------------------------------------------------------ assertions ---
