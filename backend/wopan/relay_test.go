@@ -108,7 +108,7 @@ func TestUnitParseRelayConfig(t *testing.T) {
 // TestUnitBuildCandidatesOrder locks the operator's rule: every relay's IPv4
 // first, then every relay's IPv6, then the endpoint itself.
 func TestUnitBuildCandidatesOrder(t *testing.T) {
-	got := buildCandidates("hyupload.pan.wo.cn:443", []string{"r1.example:443", "r2.example:443"})
+	got := buildCandidates("hyupload.pan.wo.cn:443", []string{"r1.example:443", "r2.example:443"}, nil)
 	want := []dialTarget{
 		{host: "r1.example:443", family: familyV4},
 		{host: "r2.example:443", family: familyV4},
@@ -121,11 +121,103 @@ func TestUnitBuildCandidatesOrder(t *testing.T) {
 	// With no relay there is nothing but the endpoint, so a remote that never
 	// configured relays keeps exactly one candidate.
 	assert.Equal(t, []dialTarget{{host: "hyupload.pan.wo.cn:443", family: familyAny, direct: true}},
-		buildCandidates("hyupload.pan.wo.cn:443", nil))
+		buildCandidates("hyupload.pan.wo.cn:443", nil, nil))
+}
+
+// TestUnitCandidatesDropTheFamilyWithNoRecords: measured 2026-10-30, with the
+// relays' overseas acceleration turned off the names carry A records and no AAAA
+// at all, so every session used to spend one doomed IPv6 dial per cooldown window
+// forever. The probe's answer takes that candidate away instead.
+func TestUnitCandidatesDropTheFamilyWithNoRecords(t *testing.T) {
+	fams := map[string]int{
+		"r1:443": famBitV4,
+		"r2:443": famBitV6,
+		"r3:443": 0,
+		"r4:443": famBitAny,
+	}
+	got := buildCandidates("ep:443", []string{"r1:443", "r2:443", "r3:443", "r4:443"}, fams)
+	assert.Equal(t, []dialTarget{
+		{host: "r1:443", family: familyV4},
+		{host: "r4:443", family: familyV4},
+		{host: "r2:443", family: familyV6},
+		{host: "r4:443", family: familyV6},
+		{host: "ep:443", family: familyAny, direct: true},
+	}, got, "only the families the probe saw stay candidates")
+
+	// "The probe has nothing about this host" is not the same fact as "this host
+	// has no records", so an unseen relay keeps both families.
+	both := buildCandidates("ep:443", []string{"rX:443"}, map[string]int{"other:443": 0})
+	assert.Equal(t, []dialTarget{
+		{host: "rX:443", family: familyV4},
+		{host: "rX:443", family: familyV6},
+		{host: "ep:443", family: familyAny, direct: true},
+	}, both)
+}
+
+func TestUnitFamilyBitsClassifyTheAnswer(t *testing.T) {
+	v4 := []net.IPAddr{{IP: net.ParseIP("198.51.100.7")}}
+	v6 := []net.IPAddr{{IP: net.ParseIP("2001:db8::1")}}
+	both := []net.IPAddr{{IP: net.ParseIP("198.51.100.7")}, {IP: net.ParseIP("2001:db8::1")}}
+	mapped := []net.IPAddr{{IP: net.ParseIP("::ffff:198.51.100.7")}}
+
+	assert.Equal(t, famBitV4, relayFamilyBitsFor(v4, nil))
+	assert.Equal(t, famBitV6, relayFamilyBitsFor(v6, nil))
+	assert.Equal(t, famBitAny, relayFamilyBitsFor(both, nil))
+	assert.Equal(t, famBitV4, relayFamilyBitsFor(mapped, nil), "an IPv4-mapped answer is still IPv4")
+	assert.Equal(t, 0, relayFamilyBitsFor(nil, nil), "a reply with no records is nothing")
+	// The one shape that must not take a relay away: the lookup itself failed. A
+	// resolver briefly down would otherwise cost a working family for the run.
+	assert.Equal(t, famBitAny, relayFamilyBitsFor(v4, errors.New("server misbehaving")),
+		"a failed lookup is unknown, not empty")
+}
+
+// TestUnitRelayFamilyNoticesSayWhatWasTakenAway: a relay that resolves to nothing
+// is never used at all, and silence there would read as the volume being spread.
+func TestUnitRelayFamilyNoticesSayWhatWasTakenAway(t *testing.T) {
+	got := relayFamilyNotices(map[string]int{
+		"dead.example:443":   0,
+		"v4only.example:443": famBitV4,
+		"v6only.example:443": famBitV6,
+		"both.example:443":   famBitAny,
+	})
+	assert.Equal(t, []string{
+		"wopan: relay dead.example:443 resolves to no addresses at all, it is not used",
+		"wopan: relay v4only.example:443 has no IPv6 records, its IPv6 candidate is dropped",
+		"wopan: relay v6only.example:443 has no IPv4 records, its IPv4 candidate is dropped",
+	}, got, "the relay with both families says nothing, and the order is by name")
+}
+
+// TestUnitLookupRelayFamiliesReadsLiteralsWithoutQuery: a bracketed IPv6 relay and
+// a plain IPv4 one are named addresses, so the probe must not touch DNS for them.
+func TestUnitLookupRelayFamiliesReadsLiteralsWithoutQuery(t *testing.T) {
+	fams := lookupRelayFamilies(context.Background(), map[string][]string{
+		"ep:443": {"[2001:db8::1]:443", "198.51.100.7:443"},
+	})
+	assert.Equal(t, famBitV6, fams["[2001:db8::1]:443"])
+	assert.Equal(t, famBitV4, fams["198.51.100.7:443"])
+}
+
+// TestUnitRouteCarriesTheProbeAwayFromTheTable: the filter has to reach the route
+// a session actually builds, not only the helper.
+func TestUnitRouteCarriesTheProbeAwayFromTheTable(t *testing.T) {
+	f := &Fs{
+		relayDead: newRelayCooldownTable(),
+		relayMap:  map[string][]string{"ep:443": {"r1:443"}},
+		relayFams: map[string]int{"r1:443": famBitV4},
+	}
+	for rotate := 0; rotate < 4; rotate++ {
+		r, err := f.newUploadRoute("https://ep:443", rotate)
+		require.NoError(t, err)
+		assert.Equal(t, []dialTarget{
+			{host: "r1:443", family: familyV4},
+			{host: "ep:443", family: familyAny, direct: true},
+		}, r.cands, "no IPv6 candidate for a name without AAAA")
+		assert.Equal(t, "r1:443 IPv4", r.target().describe())
+	}
 }
 
 func TestUnitPickTargetPrefersIPv4Group(t *testing.T) {
-	cands := buildCandidates("ep:443", []string{"r1:443", "r2:443"})
+	cands := buildCandidates("ep:443", []string{"r1:443", "r2:443"}, nil)
 	alive := func(dialTarget) bool { return false }
 
 	idx, ok := pickTarget(cands, alive, 0)
@@ -163,7 +255,7 @@ func TestUnitPickTargetPrefersIPv4Group(t *testing.T) {
 }
 
 func TestUnitPickTargetRotatesAcrossLiveRelays(t *testing.T) {
-	cands := buildCandidates("ep:443", []string{"r1:443", "r2:443", "r3:443"})
+	cands := buildCandidates("ep:443", []string{"r1:443", "r2:443", "r3:443"}, nil)
 	alive := func(dialTarget) bool { return false }
 	var hosts []string
 	for rotate := 0; rotate < 4; rotate++ {

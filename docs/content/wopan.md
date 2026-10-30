@@ -109,7 +109,12 @@ The advanced options are:
   erroring, and a pooled connection the far end had already closed. The last one
   is retried on the same relay with a fresh connection. All IPv4 relays are
   preferred over all IPv6 relays, and only when every relay of both families is
-  cooling does a session fall back to the endpoint itself. An endpoint missing
+  cooling does a session fall back to the endpoint itself. rclone resolves each
+  relay name once when the remote starts and drops the candidates of a family it
+  has no records in, so a name without AAAA is never dialled over IPv6; a relay
+  that resolves to nothing at all is not used. Either case logs one notice naming
+  the relay, because silence there would read as the volume being spread.
+  An endpoint missing
   from the list is used directly, and rclone logs one notice naming it, so a
   mistyped entry cannot look like it is working. A relay
   sees the file contents and the access token, so list only servers you control.
