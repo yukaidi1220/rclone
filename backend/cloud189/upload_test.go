@@ -1928,6 +1928,7 @@ func TestChunkWriterDownloadChunkDecoupledFromPart(t *testing.T) {
 	// digests at Close are computed from.
 	staged, err := os.ReadFile(tmp.Name())
 	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(staged), int(chunk))
 	require.Equal(t, first, staged[:chunk])
 	require.NoError(t, w.Abort(context.Background()))
 }
@@ -1959,6 +1960,46 @@ func TestChunkWriterEndToEnd(t *testing.T) {
 		start := int64(i) * fakePartBase
 		end := start + plans[i].Size
 		require.Equal(t, content[start:end], put.body, "part %d", i+1)
+	}
+}
+
+// TestChunkWriterEndToEndWithBiggerDownloadChunks is the one that guards the
+// wiring: it goes through OpenChunkWriter with download_chunk_size set, so it
+// fails if the option is ignored, if the writer keeps the old part-sized
+// offsets, or if the hole bookkeeping still counts parts instead of chunks.
+func TestChunkWriterEndToEndWithBiggerDownloadChunks(t *testing.T) {
+	drive := &fakeDrive{t: t}
+	f := newFakeFs(t, drive)
+	const dlChunk = 2 * fakePartBase
+	f.opt.DownloadChunkSize = fs.SizeSuffix(dlChunk)
+	content := pattern(int(fakePartBase*4 + 7)) // five upload parts, three read chunks
+
+	info, w, err := f.OpenChunkWriter(context.Background(), "wide.bin", staticObject("wide.bin", int64(len(content))))
+	require.NoError(t, err)
+	require.EqualValues(t, dlChunk, info.ChunkSize, "the engine must read two parts per chunk")
+
+	plans := api.PlanParts(int64(len(content)), fakePartBase)
+	require.Len(t, plans, 5)
+	writer := w.(*chunkWriter)
+	require.Len(t, writer.done, 3, "holes are counted in read chunks, not upload parts")
+
+	for i := 0; i < len(writer.done); i++ {
+		start := int64(i) * dlChunk
+		end := start + dlChunk
+		if end > int64(len(content)) {
+			end = int64(len(content))
+		}
+		_, err := w.WriteChunk(context.Background(), i, bytes.NewReader(content[int(start):int(end)]))
+		require.NoErrorf(t, err, "chunk %d", i)
+	}
+	require.NoError(t, w.Close(context.Background()))
+
+	require.Len(t, drive.putCalls(), len(plans))
+	require.Equal(t, upperHex(content), drive.initPlains[0]["fileMd5"])
+	for i := range plans {
+		put := putFor(t, drive, fmt.Sprintf("part%d", i+1))
+		start := int64(i) * fakePartBase
+		require.Equal(t, content[start:start+plans[i].Size], put.body, "part %d was uploaded from the wrong offset", i+1)
 	}
 }
 
