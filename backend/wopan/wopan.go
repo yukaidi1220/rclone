@@ -1003,6 +1003,11 @@ type Fs struct {
 	// silence, and the operator would believe the volume is spread.
 	relayMiss *atomic.Bool
 
+	// relayFams is what the startup probe saw for each relay name: which address
+	// families it has records for. A name missing from it was not resolved, so
+	// both families stay usable.
+	relayFams map[string]int
+
 	// relayPartDeadlineOverride shortens the per-attempt wall clock; tests set
 	// it so a stalled target does not cost the full 5m0s.
 	relayPartDeadlineOverride time.Duration
@@ -1907,6 +1912,14 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		return nil, err
 	}
 	f.relayMap = relayMap
+	if len(relayMap) > 0 {
+		// Ask now which families each relay actually has, so no session pays a
+		// doomed dial for a family the name has no record in.
+		f.relayFams = lookupRelayFamilies(ctx, relayMap)
+		for _, line := range relayFamilyNotices(f.relayFams) {
+			fs.Logf(f, "%s", line)
+		}
+	}
 
 	// Bootstrap the shared state before anything needs a token. It is keyed by
 	// the configured credentials until the userId is known.

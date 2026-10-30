@@ -7,10 +7,12 @@ package wopan
 // put self-built relays in front of that endpoint to spread it. This file owns
 // that choice; wopan.go keeps the protocol.
 //
-// Two rules come from the operator, not from the protocol:
+// Three rules come from the operator, not from the protocol:
 //   - Every relay's IPv4 is tried before any relay's IPv6. Measured 2026-10-23,
 //     the relay path stalled 398 times on IPv6 against 8 on IPv4, so interleaving
 //     the families would make each part pay an IPv6 probe first.
+//   - A family the relay name has no address records in is not offered as a
+//     candidate at all, which the startup probe decides once per remote.
 //   - A dial target is dead when an attempt fails before a complete HTTP response
 //     arrived: no route, TLS broken, no response headers within --timeout, a
 //     stalled write, or the per-attempt wall clock. An HTTP status, including 5xx,
@@ -26,6 +28,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -146,15 +149,125 @@ func parseRelayConfig(items []string) (map[string][]string, error) {
 	return out, nil
 }
 
+// Which address families the startup probe saw for a relay name.
+const (
+	famBitV4  = 1
+	famBitV6  = 2
+	famBitAny = famBitV4 | famBitV6
+)
+
+// relayProbeTimeout bounds one startup resolution of a relay name. It is my
+// choice, not a protocol value: the answer only decides whether a family is
+// worth dialling, and a lookup that has not answered in a few seconds would not
+// have made the upload faster.
+const relayProbeTimeout = 5 * time.Second
+
+// relayFamilyBitsFor classifies what a lookup gave back.
+//
+// A failed lookup is unknown rather than empty: a resolver that is briefly down
+// must not cost a working relay for the whole run, so both families stay and the
+// next session can still use it.
+func relayFamilyBitsFor(ips []net.IPAddr, err error) int {
+	if err != nil {
+		return famBitAny
+	}
+	var bits int
+	for _, ip := range ips {
+		if ip.IP.To4() != nil {
+			bits |= famBitV4
+		} else {
+			bits |= famBitV6
+		}
+	}
+	return bits
+}
+
+// relayFamilyAllows reports whether the probe left that family standing. A host
+// the probe has nothing about keeps both, so an Fs built without it - and every
+// remote with no relay table - behaves exactly as before.
+func relayFamilyAllows(fams map[string]int, host string, bit int) bool {
+	bits, known := fams[host]
+	return !known || bits&bit != 0
+}
+
+// relayFamilyNotices names what the probe took away. A relay that resolves to
+// nothing would otherwise look like it is carrying traffic while it never gets
+// a session at all.
+func relayFamilyNotices(fams map[string]int) []string {
+	hosts := make([]string, 0, len(fams))
+	for h := range fams {
+		hosts = append(hosts, h)
+	}
+	sort.Strings(hosts)
+	var out []string
+	for _, h := range hosts {
+		switch fams[h] {
+		case 0:
+			out = append(out, fmt.Sprintf("wopan: relay %s resolves to no addresses at all, it is not used", h))
+		case famBitV4:
+			out = append(out, fmt.Sprintf("wopan: relay %s has no IPv6 records, its IPv6 candidate is dropped", h))
+		case famBitV6:
+			out = append(out, fmt.Sprintf("wopan: relay %s has no IPv4 records, its IPv4 candidate is dropped", h))
+		}
+	}
+	return out
+}
+
+// lookupRelayFamilies resolves each relay name in the table once, at startup, so
+// a session does not have to find out by dialling that a family has no address.
+//
+// Measured 2026-10-30: with the relays' overseas acceleration turned off, the
+// names had A records and no AAAA at all, so every session spent one doomed IPv6
+// attempt per five-minute cooldown window, forever.
+func lookupRelayFamilies(ctx context.Context, relayMap map[string][]string) map[string]int {
+	seen := map[string]bool{}
+	var hosts []string
+	for _, relays := range relayMap {
+		for _, r := range relays {
+			if !seen[r] {
+				seen[r] = true
+				hosts = append(hosts, r)
+			}
+		}
+	}
+	sort.Strings(hosts)
+	ctx, cancel := context.WithTimeout(ctx, relayProbeTimeout)
+	defer cancel()
+	fams := make(map[string]int, len(hosts))
+	for _, h := range hosts {
+		name := h
+		if host, _, err := net.SplitHostPort(h); err == nil {
+			name = host
+		}
+		if ip := net.ParseIP(name); ip != nil {
+			// A literal address needs no query, and brackets are already off.
+			if ip.To4() != nil {
+				fams[h] = famBitV4
+			} else {
+				fams[h] = famBitV6
+			}
+			continue
+		}
+		ips, err := net.DefaultResolver.LookupIPAddr(ctx, name)
+		fams[h] = relayFamilyBitsFor(ips, err)
+	}
+	return fams
+}
+
 // buildCandidates returns the attempt order for one endpoint: every relay's IPv4
-// in written order, then every relay's IPv6, then the endpoint itself.
-func buildCandidates(origin string, relays []string) []dialTarget {
+// in written order, then every relay's IPv6, then the endpoint itself. A relay
+// the startup probe found without addresses in a family gets no candidate there.
+func buildCandidates(origin string, relays []string, fams map[string]int) []dialTarget {
 	cands := make([]dialTarget, 0, 2*len(relays)+1)
 	for _, r := range relays {
-		cands = append(cands, dialTarget{host: r, family: familyV4})
+		if relayFamilyAllows(fams, r, famBitV4) {
+			cands = append(cands, dialTarget{host: r, family: familyV4})
+		}
 	}
 	for _, r := range relays {
-		cands = append(cands, dialTarget{host: r, family: familyV6})
+		if relayFamilyAllows(fams, r, famBitV6) {
+			cands = append(cands, dialTarget{host: r, family: familyV6})
+		}
 	}
 	cands = append(cands, dialTarget{host: origin, family: familyAny, direct: true})
 	return cands
@@ -413,7 +526,7 @@ func (f *Fs) newUploadRoute(endpoint string, rotate int) (*uploadRoute, error) {
 	} else {
 		f.noteRelayMiss(hostKey, len(f.relayMap))
 	}
-	r.cands = buildCandidates(hostKey, relays)
+	r.cands = buildCandidates(hostKey, relays, f.relayFams)
 	// The fallback candidate is labelled with the host that actually goes on the
 	// wire, so a log line cannot name a port the request never used.
 	r.cands[len(r.cands)-1].host = origin.Host
