@@ -83,6 +83,30 @@ The advanced options are:
   contents and the access token included - goes through the given host, so
   only point it at a server you trust, such as your own reverse proxy. The
   URL must present a valid TLS certificate.
+- `--wopan-upload_relays`: relays to send upload traffic through, given as
+  `endpoint=relay` pairs - comma separated in the config file, repeatable on the
+  command line. Both sides are `host` or `host:port`, without a scheme; an IPv6
+  address must be written in brackets with its port (`[::1]:443`), because a bare
+  IPv6 address cannot be told apart from a port. The endpoint is the upload
+  host the server assigns to the account (or the one `--wopan-upload_zone`
+  names), and the port is part of its identity, so `bjupload.pan.wo.cn` and
+  `bjupload.pan.wo.cn:30443` are separate entries.
+  Each upload session starts on the next relay in turn, so a run's upload volume
+  leaves through several source IPs instead of one. A relay leaves rotation for
+  `--connect-family-cooldown` when an attempt fails before a complete HTTP
+  response arrived: no route, TLS broken, no response headers within `--timeout`,
+  or the part's own 5m0s wall clock expiring after the whole part had been
+  written. An HTTP status never marks a relay dead, because a relay that
+  forwarded a 500 answered. Three shapes are not counted against a relay either,
+  because they cannot be told apart from the source or from a stale keep-alive:
+  the wall clock expiring while the part is still being fed, the source itself
+  erroring, and a pooled connection the far end had already closed. The last one
+  is retried on the same relay with a fresh connection. All IPv4 relays are
+  preferred over all IPv6 relays, and only when every relay of both families is
+  cooling does a session fall back to the endpoint itself. An endpoint missing
+  from the list is used directly, and rclone logs one notice naming it, so a
+  mistyped entry cannot look like it is working. A relay
+  sees the file contents and the access token, so list only servers you control.
 - `--wopan-upload_cutoff`: files above this size are uploaded in chunks of
   `--wopan-chunk_size` instead of a single request. Defaults to `64Mi`.
   Smaller files are sent as one request, where the server's ETag is the

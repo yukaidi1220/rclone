@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"strconv"
 	"strings"
@@ -712,6 +714,7 @@ func TestUnitUploadSingleNonSeekable1001(t *testing.T) {
 		pacer:      fs.NewPacer(context.Background(), pacer.NewDefault(pacer.MinSleep(time.Millisecond))),
 		httpClient: &http.Client{Transport: routingTransport{}},
 		zoneMu:     new(sync.Mutex),
+		relayDead:  newRelayCooldownTable(),
 		zoneURL:    "https://zone.example",
 		zoneLoaded: true,
 	}
@@ -853,6 +856,7 @@ func newUnitTestFs(transport http.RoundTripper) *Fs {
 		pacer:      fs.NewPacer(context.Background(), pacer.NewDefault(pacer.MinSleep(time.Millisecond))),
 		httpClient: &http.Client{Transport: transport},
 		zoneMu:     new(sync.Mutex),
+		relayDead:  newRelayCooldownTable(),
 		dirRejects: newRejectCache(),
 	}
 	f.dirCache = dircache.New("", "root-id", f)
@@ -1251,11 +1255,42 @@ type zoneRecorder struct {
 	// fidPart, if non-zero, is the partIndex whose answer carries the fid even
 	// when it is not the highest index. Measured 2026-10-21: the fid belongs to
 	// whichever part completes the server's set, not to the last part index.
-	fidPart  int
-	mu       sync.Mutex
-	urls     []string
-	parts    []partValues
-	attempts map[string]int
+	fidPart int
+	// failHost makes the first N round trips to that URL host fail with no
+	// answer at all. This is the shape a dead relay or a dark address family
+	// produces, and the dial never yields a peer, so the cooldown has to be
+	// charged to the family the attempt asked for.
+	failHost map[string]int
+	// failTrace makes the first N round trips to that host fail *after* firing the
+	// httptrace events a real transport would have fired before giving up. The
+	// blame rules read those events, so this is how a test says "the connection
+	// was an idle pooled one" or "the peer was IPv6 although the pin said IPv4"
+	// without waiting on a real socket.
+	failTrace map[string]hostFault
+	// halfAnswerHost makes the first N round trips to that host answer a 200 whose
+	// body stops in the middle: the shape of a relay that died after the status
+	// line. Whether the part itself had gone out is decided by the trace events in
+	// the hostFault, which is what the single-part path then reads.
+	halfAnswerHost map[string]hostFault
+	// meetHost holds a round trip to that host until meetWant POSTs have arrived,
+	// so a test claiming two workers failed on one relay has proved they were
+	// there at the same time. meetArrived says how many actually did.
+	meetHost    string
+	meetWant    int
+	meetArrived atomic.Int32
+	// blockHost parks round trips to that host until the request's own context
+	// is done: the shape of a target that is neither answering nor refusing.
+	blockHost string
+	hostFails map[string]int
+	// deadlineFired counts attempts the request context gave up on; neverGivenUp
+	// counts attempts that had to be released by the recorder's own guard, which
+	// means no per-attempt clock was watching them.
+	deadlineFired int
+	neverGivenUp  int
+	mu            sync.Mutex
+	urls          []string
+	parts         []partValues
+	attempts      map[string]int
 }
 
 type partValues struct {
@@ -1276,7 +1311,97 @@ func jsonResponse(body string) (*http.Response, error) {
 	}, nil
 }
 
+// hostFault describes how far an attempt had got when the recorder gives up on
+// it, in the same httptrace terms the real transport reports.
+type hostFault struct {
+	// attempts is how many POSTs to that host are affected; after that the host
+	// answers normally, which is what lets a re-post succeed.
+	attempts int
+	// peer is the IP the connection had. Empty means the dial never reached one,
+	// which is what leaves the pinned family as the only thing to charge.
+	peer string
+	// reused and bodySent are the two flags blameTarget reads.
+	reused   bool
+	bodySent bool
+	// deadline makes the failure be context.DeadlineExceeded, the one error the
+	// attempt classifies by value rather than by trace event.
+	deadline bool
+}
+
+// fakePeer is a connection the trace can name a peer for. Only RemoteAddr is ever
+// called on it.
+type fakePeer struct {
+	net.Conn
+	addr net.Addr
+}
+
+func (p fakePeer) RemoteAddr() net.Addr { return p.addr }
+
+// fireTrace tells the request's own trace what the attempt had achieved. A
+// RoundTripper that returns an error without this looks, to the blame rules,
+// exactly like a dial that never connected - which is the opposite of what these
+// tests are for.
+func fireTrace(r *http.Request, hf hostFault) {
+	tr := httptrace.ContextClientTrace(r.Context())
+	if tr == nil {
+		return
+	}
+	if tr.GotConn != nil && hf.peer != "" {
+		tr.GotConn(httptrace.GotConnInfo{
+			Conn:   fakePeer{addr: &net.TCPAddr{IP: net.ParseIP(hf.peer), Port: 443}},
+			Reused: hf.reused,
+		})
+	}
+	if tr.WroteRequest != nil && hf.bodySent {
+		tr.WroteRequest(httptrace.WroteRequestInfo{})
+	}
+}
+
+// faultCause is the error a traced failure reports back.
+func (hf hostFault) faultCause() error {
+	if hf.deadline {
+		return context.DeadlineExceeded
+	}
+	//nolint:revive // the exact Windows text the live service produces on a reset socket
+	return errors.New("wsarecv: An existing connection was forcibly closed by the remote host.")
+}
+
+// halfAnswerResponse is a 200 whose body stops before it is complete.
+func halfAnswerResponse() *http.Response {
+	const head = `{"code":"0000","data":{"fid":"`
+	return &http.Response{
+		StatusCode:    http.StatusOK,
+		Status:        "200 OK",
+		Body:          io.NopCloser(io.MultiReader(strings.NewReader(head), errReader{})),
+		ContentLength: int64(len(head) + 200),
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+	}
+}
+
+// errReader ends a body mid-stream, the way a truncated answer looks to a reader.
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+// meet releases a round trip once meetWant POSTs to the meet host have arrived.
+// The bound is what turns "the concurrency this test claims never happened" into
+// a failed assertion instead of a hung package.
+func (z *zoneRecorder) meet() {
+	n := z.meetArrived.Add(1)
+	if int(n) >= z.meetWant {
+		return
+	}
+	for int(z.meetArrived.Load()) < z.meetWant {
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func (z *zoneRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
+	if z.meetHost != "" && r.URL.Host == z.meetHost {
+		// Before the lock: a rendezvous that holds the mutex deadlocks the very
+		// second arrival it is waiting for.
+		z.meet()
+	}
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	z.urls = append(z.urls, r.URL.String())
@@ -1303,6 +1428,54 @@ func (z *zoneRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
 		idx := pv.Get("partIndex")
 		z.attempts[idx]++
 		n := z.attempts[idx]
+		// Per-host injections happen after the form is parsed, so a failed
+		// attempt still shows up in the part and attempt counts: the tests assert
+		// that a re-post carries the same bytes as the attempt it replaced.
+		if z.blockHost != "" && r.URL.Host == z.blockHost {
+			// Which branch gave up is the evidence. The per-attempt clock
+			// abandoning the request is the feature; the guard below firing means
+			// nothing abandoned it, and the test would be passing on a thirty
+			// second timeout instead of on the deadline.
+			select {
+			case <-r.Context().Done():
+				z.deadlineFired++
+				return nil, r.Context().Err()
+			case <-time.After(30 * time.Second):
+				z.neverGivenUp++
+				return nil, errors.New("blocked host was never given up on: no per-attempt deadline fired")
+			}
+		}
+		if hf, ok := z.failTrace[r.URL.Host]; ok {
+			if z.hostFails == nil {
+				z.hostFails = map[string]int{}
+			}
+			z.hostFails[r.URL.Host]++
+			if z.hostFails[r.URL.Host] <= hf.attempts {
+				fireTrace(r, hf)
+				return nil, hf.faultCause()
+			}
+		}
+		if hf, ok := z.halfAnswerHost[r.URL.Host]; ok {
+			if z.hostFails == nil {
+				z.hostFails = map[string]int{}
+			}
+			z.hostFails[r.URL.Host]++
+			if z.hostFails[r.URL.Host] <= hf.attempts {
+				fireTrace(r, hf)
+				return halfAnswerResponse(), nil
+			}
+		}
+		if times, ok := z.failHost[r.URL.Host]; ok {
+			if z.hostFails == nil {
+				z.hostFails = map[string]int{}
+			}
+			z.hostFails[r.URL.Host]++
+			if z.hostFails[r.URL.Host] <= times {
+				// Bare cause: the http client wraps it into the same
+				// Post "url": dial tcp ... shape the live service produces.
+				return nil, errors.New("dial tcp: lookup " + r.URL.Host + ": no such host")
+			}
+		}
 		if z.transportFailPart > 0 && idx == strconv.Itoa(z.transportFailPart) {
 			switch {
 			case z.hardCap > 0 && n > z.hardCap:
@@ -1375,6 +1548,26 @@ func (z *zoneRecorder) contentOf(idx int) [][]byte {
 		if pv.Get("partIndex") == strconv.Itoa(idx) {
 			out = append(out, pv.fileContent)
 		}
+	}
+	return out
+}
+
+// uploadHosts is the host of every upload2C post, in the order they went out.
+// The relay feature changes the host an attempt is sent to, so which host
+// carried which part is the fact the assertions need.
+func (z *zoneRecorder) uploadHosts() []string {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	var out []string
+	for _, u := range z.urls {
+		if !strings.HasSuffix(u, "/openapi/client/upload2C") {
+			continue
+		}
+		parsed, err := url.Parse(u)
+		if err != nil {
+			continue
+		}
+		out = append(out, parsed.Host)
 	}
 	return out
 }
@@ -1497,7 +1690,7 @@ func TestUnitPartRetryStopsAfterSessionCompleted(t *testing.T) {
 
 	data, err := f.postPartRetry(context.Background(), st, func(int) (io.Reader, error) {
 		return bytes.NewReader(make([]byte, 8<<20)), nil
-	}, "https://zone-from-server.example", "dirID", "big.bin", threePartSize, "enc", "unit-session", testAccessToken, api.PartPlan{Index: 2, PartSize: 8 << 20}, 3)
+	}, directRoute(t, f, "https://zone-from-server.example"), "dirID", "big.bin", threePartSize, "enc", "unit-session", testAccessToken, api.PartPlan{Index: 2, PartSize: 8 << 20}, 3)
 	require.NoError(t, err)
 	assert.Equal(t, 1, posts, "the failed part must be posted once and then left alone")
 	assert.Equal(t, "F", data.Fid, "the completion answer recorded by the other part is what the caller gets back")
@@ -1536,10 +1729,12 @@ func (c *countingSeeker) Seek(offset int64, whence int) (int64, error) {
 	return c.Reader.Seek(offset, whence)
 }
 
-func newChunkWriter(f *Fs) *wopanChunkWriter {
+// newChunkWriter builds a two-part writer over the route the caller chose, so a
+// relayed test and a direct one share the rest of the shape.
+func newChunkWriter(t *testing.T, f *Fs, route *uploadRoute) *wopanChunkWriter {
 	return &wopanChunkWriter{
 		f:        f,
-		zoneURL:  "https://zone-from-server.example",
+		route:    route,
 		dirID:    "dirID",
 		name:     "big.bin",
 		size:     12 << 20,
@@ -1569,7 +1764,7 @@ func TestUnitWriteChunkRepostsAndRewinds(t *testing.T) {
 		buf[i] = byte(i)
 	}
 	rs := &countingSeeker{Reader: bytes.NewReader(buf)}
-	w := newChunkWriter(f)
+	w := newChunkWriter(t, f, directRoute(t, f, "https://zone-from-server.example"))
 	n, err := w.WriteChunk(context.Background(), 0, rs)
 	require.NoError(t, err)
 	assert.Equal(t, int64(8<<20), n)
@@ -1589,7 +1784,7 @@ func TestUnitWriteChunkGivesUpStripped(t *testing.T) {
 	f.zoneURL = "https://zone-from-server.example"
 	f.zoneLoaded = true
 	rs := &countingSeeker{Reader: bytes.NewReader(make([]byte, 16<<20))}
-	w := newChunkWriter(f)
+	w := newChunkWriter(t, f, directRoute(t, f, "https://zone-from-server.example"))
 	_, err := w.WriteChunk(context.Background(), 0, rs)
 	require.Error(t, err)
 	assert.Equal(t, 2, rec.countOf(1))
@@ -1606,7 +1801,7 @@ func TestUnitWriteChunkSeekFailureNotReposted(t *testing.T) {
 	f.zoneURL = "https://zone-from-server.example"
 	f.zoneLoaded = true
 	rs := &countingSeeker{Reader: bytes.NewReader(make([]byte, 16<<20)), seekFails: errors.New("seek not supported here")}
-	w := newChunkWriter(f)
+	w := newChunkWriter(t, f, directRoute(t, f, "https://zone-from-server.example"))
 	_, err := w.WriteChunk(context.Background(), 0, rs)
 	require.Error(t, err)
 	assert.Equal(t, 1, rec.countOf(1), "with no way to rewind, nothing may be re-posted")

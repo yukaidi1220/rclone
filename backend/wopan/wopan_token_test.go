@@ -260,7 +260,7 @@ func TestUnitChunkWriterRefreshesARotatedToken(t *testing.T) {
 	tr := &rotatingTokenTransport{}
 	f := newUnitTestFs(tr)
 	w := &wopanChunkWriter{
-		f: f, zoneURL: "https://zone.test", dirID: "dir-1", name: "movie.bin",
+		f: f, route: directRoute(t, f, "https://zone.test"), dirID: "dir-1", name: "movie.bin",
 		size: 2, chunk: 1, total: 2, fiEnc: "enc", uniqueID: "u-1", token: testAccessToken,
 	}
 
@@ -279,7 +279,7 @@ func TestUnitChunkWriterRefreshesARotatedToken(t *testing.T) {
 	// What rclone's whole-file retry does: a new session, opened after the
 	// refresh, which therefore carries the new token.
 	w2 := &wopanChunkWriter{
-		f: f, zoneURL: "https://zone.test", dirID: "dir-1", name: "movie.bin",
+		f: f, route: directRoute(t, f, "https://zone.test"), dirID: "dir-1", name: "movie.bin",
 		size: 2, chunk: 1, total: 2, fiEnc: "enc", uniqueID: "u-2", token: f.tok.accessTokenNow(),
 	}
 	_, err = w2.WriteChunk(ctx, 0, strings.NewReader("a"))
@@ -298,7 +298,7 @@ func TestUnitChunkWriterCoalescesOnTheSessionToken(t *testing.T) {
 	// session still carries the old one.
 	f.tok.accessToken = testFreshAT
 	w := &wopanChunkWriter{
-		f: f, zoneURL: "https://zone.test", dirID: "dir-1", name: "movie.bin",
+		f: f, route: directRoute(t, f, "https://zone.test"), dirID: "dir-1", name: "movie.bin",
 		size: 2, chunk: 1, total: 2, fiEnc: "enc", uniqueID: "u-1", token: testAccessToken,
 	}
 
@@ -319,7 +319,7 @@ func TestUnitChunkWriterKeepsNoRefreshHonest(t *testing.T) {
 	f := newUnitTestFs(tr)
 	f.opt.NoRefresh = true
 	w := &wopanChunkWriter{
-		f: f, zoneURL: "https://zone.test", dirID: "dir-1", name: "movie.bin",
+		f: f, route: directRoute(t, f, "https://zone.test"), dirID: "dir-1", name: "movie.bin",
 		size: 2, chunk: 1, total: 2, fiEnc: "enc", uniqueID: "u-1", token: testAccessToken,
 	}
 

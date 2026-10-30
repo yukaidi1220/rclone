@@ -145,7 +145,7 @@ var ConfigOptionsInfo = Options{{
 }, {
 	Name:    "connect_family_cooldown",
 	Default: 5 * time.Minute,
-	Help:    "How long to avoid a host's address family after it fails. Only used when --connect-family is set; 0 disables",
+	Help:    "How long to avoid a host's address family after it fails. Used when --connect-family is set, and by the wopan backend to cool a relay down after a failed upload attempt; 0 disables",
 	Groups:  "Networking",
 }, {
 	Name:    "expect_continue_timeout",
