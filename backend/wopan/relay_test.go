@@ -17,6 +17,7 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/fserrors"
 	fsobject "github.com/rclone/rclone/fs/object"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -891,15 +892,12 @@ func TestUnitNewFsAcceptsCommaSeparatedRelays(t *testing.T) {
 	// newFs goes on to validate the token against the service, which unit tests
 	// have no business doing: the error it returns must therefore be about the
 	// network, not about the relay line.
-	f, err := newFs(context.Background(), "wopan-test", "", m)
-	if err != nil {
-		assert.NotContains(t, err.Error(), "upload_relays",
-			"two comma separated pairs must parse")
-		return
-	}
-	// A remote that came up despite the token check must have parsed the line:
-	// without this the assertion below is vacuous on the success path.
-	assert.Equal(t, map[string][]string{"hyupload.pan.wo.cn:443": {"r1.example:443", "r2.example:8443"}}, f.relayMap)
+	// newFs always goes on to check the token against the service, so this cannot
+	// reach a working Fs offline; what it can do is prove the relay line parsed.
+	_, err := newFs(context.Background(), "wopan-test", "", m)
+	require.Error(t, err, "the token check must be what stops newFs here")
+	assert.NotContains(t, err.Error(), "upload_relays",
+		"two comma separated pairs must parse")
 }
 
 func TestUnitWrapFamilyDialLeavesOtherNetworksAlone(t *testing.T) {
@@ -952,8 +950,6 @@ func TestUnitNewFsRejectsMalformedRelays(t *testing.T) {
 	}
 }
 
-// An endpoint that carries its own path would build one URL for the direct
-// branch and another for a relay branch. Refusing beats being inconsistent.
 // TestUnitNewUploadRouteKeepsTheEndpointPath: upload_zone used to be usable with
 // a path (`https://proxy.example/wopan`), and the upload2C suffix was appended to
 // it. That has to keep working, on the direct branch and through a relay alike.
@@ -969,6 +965,13 @@ func TestUnitNewUploadRouteKeepsTheEndpointPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "https://r1:443/wopan", currentURL(r))
 	assert.Equal(t, "https://ep:443/wopan", r.urlFor(dialTarget{host: "ep:443", direct: true}))
+
+	// An escaped character must survive on both branches: the direct URL is kept
+	// verbatim and the relay one is rebuilt, so a decoded path would diverge.
+	r, err = f.newUploadRoute("https://ep:443/a%2Fb", 0)
+	require.NoError(t, err)
+	assert.Equal(t, "https://r1:443/a%2Fb", currentURL(r))
+	assert.Equal(t, "https://ep:443/a%2Fb", r.urlFor(dialTarget{host: "ep:443", direct: true}))
 
 	// A query cannot compose with an appended path and is still refused.
 	_, err = f.newUploadRoute("https://ep:443?x=1", 0)
@@ -1558,6 +1561,23 @@ func TestUnitRelayUnavailableStatus(t *testing.T) {
 	for _, code := range []int{200, 400, 401, 403, 404, 413, 429, 500, 501, 503, 505} {
 		assert.False(t, relayUnavailableStatus(code), "%d is not a gateway path failure", code)
 	}
+}
+
+// TestUnitSinglePart503KeepsTheErrorRetryable: a 503 is overload, not a
+// rejection of this request. Without a relay to move to there is nothing to do
+// this round, but the error must not carry the no-retry marker or the whole-file
+// ladder cannot run the command again later.
+func TestUnitSinglePart503KeepsTheErrorRetryable(t *testing.T) {
+	withPartRetries(t, 3)
+	rec := &zoneRecorder{zoneURL: relayZoneURL, gatewayStatus: 503, gatewayPart: 1, gatewayTimes: 9, gatewayHost: relayZoneHost}
+	f := smallPartFs(t, rec)
+
+	small := int64(64 << 10)
+	src := fsobject.NewStaticObjectInfo("small.bin", time.Now(), small, true, nil, nil)
+	_, err := f.uploadSingle(context.Background(), bytes.NewReader(make([]byte, small)), "dirID", "small.bin", small, src)
+	require.Error(t, err)
+	assert.False(t, fserrors.IsNoRetryError(err), "a 503 must stay retryable")
+	assert.Equal(t, []string{relayZoneHost}, rec.uploadHosts(), "no other target to move to")
 }
 
 // TestUnitGatewayFailureOnDirectPathPostsOnce: the session is already on the

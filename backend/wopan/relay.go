@@ -195,16 +195,17 @@ type uploadRoute struct {
 	// byte-for-byte as it did before relays existed.
 	originURL string
 	scheme    string
-	// path is the endpoint's own path, empty for the usual scheme://host form. The
-	// upload2C suffix is appended to it, and a relay carries the same prefix so an
-	// endpoint behind a mount point works through both branches.
-	path      string
-	cands     []dialTarget
-	mu        sync.Mutex
-	cur       int
-	rotate    int
-	relaysSet bool            // an entry existed in the relay table for this endpoint
-	failed    map[string]bool // deadKeys this session must not retry
+	// escapedPath is the endpoint's own path as it was written, empty for the usual
+	// scheme://host form. The upload2C suffix is appended to it, and a relay carries
+	// the same prefix, so an endpoint behind a mount point works on both branches
+	// and an escaped character is not decoded on one of them only.
+	escapedPath string
+	cands       []dialTarget
+	mu          sync.Mutex
+	cur         int
+	rotate      int
+	relaysSet   bool            // an entry existed in the relay table for this endpoint
+	failed      map[string]bool // deadKeys this session must not retry
 }
 
 func (r *uploadRoute) target() dialTarget {
@@ -218,7 +219,7 @@ func (r *uploadRoute) urlFor(t dialTarget) string {
 	if t.direct {
 		return r.originURL
 	}
-	return r.scheme + "://" + t.host + r.path
+	return r.scheme + "://" + t.host + r.escapedPath
 }
 
 // hasRelays reports whether the table offered anything beyond the endpoint.
@@ -383,20 +384,20 @@ func (f *Fs) newUploadRoute(endpoint string, rotate int) (*uploadRoute, error) {
 	if origin.RawQuery != "" {
 		return nil, fmt.Errorf("wopan: upload endpoint %q must not carry a query", endpoint)
 	}
-	path := strings.TrimSuffix(origin.Path, "/")
-	if path == "/" {
-		path = ""
+	escapedPath := strings.TrimSuffix(origin.EscapedPath(), "/")
+	if escapedPath == "/" {
+		escapedPath = ""
 	}
 	hostKey, err := normalizeHostPort(origin.Host, "upload endpoint")
 	if err != nil {
 		return nil, fmt.Errorf("wopan: %w", err)
 	}
 	r := &uploadRoute{
-		originURL: strings.TrimSuffix(endpoint, "/"),
-		scheme:    origin.Scheme,
-		path:      path,
-		rotate:    rotate,
-		failed:    map[string]bool{},
+		originURL:   strings.TrimSuffix(endpoint, "/"),
+		scheme:      origin.Scheme,
+		escapedPath: escapedPath,
+		rotate:      rotate,
+		failed:      map[string]bool{},
 	}
 	relays := f.relayMap[hostKey]
 	if len(relays) > 0 {
@@ -596,7 +597,7 @@ func (e *uploadFailure) transient() bool {
 //
 // Everything else is on the target: no connection at all (no route, no DNS
 // answer, TLS refused mid-handshake), the idle clock, a clock that expired
-// after the whole part was already on the wire, or a gateway 502/503/504 that
+// after the whole part was already on the wire, or a gateway 502/504 that
 // says the relay could not reach the upload service.
 func (e *uploadFailure) blameTarget() bool {
 	if e.sourceErr {
