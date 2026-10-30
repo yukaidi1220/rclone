@@ -195,6 +195,10 @@ type uploadRoute struct {
 	// byte-for-byte as it did before relays existed.
 	originURL string
 	scheme    string
+	// path is the endpoint's own path, empty for the usual scheme://host form. The
+	// upload2C suffix is appended to it, and a relay carries the same prefix so an
+	// endpoint behind a mount point works through both branches.
+	path      string
 	cands     []dialTarget
 	mu        sync.Mutex
 	cur       int
@@ -214,7 +218,7 @@ func (r *uploadRoute) urlFor(t dialTarget) string {
 	if t.direct {
 		return r.originURL
 	}
-	return r.scheme + "://" + t.host
+	return r.scheme + "://" + t.host + r.path
 }
 
 // hasRelays reports whether the table offered anything beyond the endpoint.
@@ -373,11 +377,15 @@ func (f *Fs) newUploadRoute(endpoint string, rotate int) (*uploadRoute, error) {
 	if origin.Host == "" || origin.Scheme == "" {
 		return nil, fmt.Errorf("wopan: upload endpoint %q is not a scheme://host URL", endpoint)
 	}
-	// The upload2C path is appended to whatever this is, so an endpoint carrying
-	// its own path would build a different URL for the direct branch (kept whole)
-	// than for a relay branch (host only). Refusing is cheaper than being wrong.
-	if origin.Path != "" && origin.Path != "/" || origin.RawQuery != "" {
-		return nil, fmt.Errorf("wopan: upload endpoint %q must be scheme://host[:port], without path or query", endpoint)
+	// upload_zone may carry a path: rclone used to keep it and append the
+	// upload2C suffix, so an endpoint behind a mount point has to keep working.
+	// A query cannot compose with that suffix and is refused.
+	if origin.RawQuery != "" {
+		return nil, fmt.Errorf("wopan: upload endpoint %q must not carry a query", endpoint)
+	}
+	path := strings.TrimSuffix(origin.Path, "/")
+	if path == "/" {
+		path = ""
 	}
 	hostKey, err := normalizeHostPort(origin.Host, "upload endpoint")
 	if err != nil {
@@ -386,6 +394,7 @@ func (f *Fs) newUploadRoute(endpoint string, rotate int) (*uploadRoute, error) {
 	r := &uploadRoute{
 		originURL: strings.TrimSuffix(endpoint, "/"),
 		scheme:    origin.Scheme,
+		path:      path,
 		rotate:    rotate,
 		failed:    map[string]bool{},
 	}
@@ -518,12 +527,15 @@ func wrapFamilyDial(inner func(context.Context, string, string) (net.Conn, error
 // relay rather than being a rejection from the upload service behind it.
 //
 // A 5xx that the relay *forwarded* is not evidence about the relay - the existing
-// rule for that stands. These three come from the gateway in front of the relay
-// and say it could not reach the service at all, so the bytes were not stored and
-// a retry against the same host is a wasted part.
+// rule for that stands. These two come from the gateway in front of the relay and
+// say it could not reach the service at all, so the bytes were not stored and a
+// retry against the same host is a wasted part. 503 is deliberately not here: it
+// is the usual answer for rate limiting or a briefly overloaded upstream, where
+// the right response is to come back later rather than to take a whole relay out
+// of rotation for a cooldown window.
 func relayUnavailableStatus(code int) bool {
 	switch code {
-	case 502, 503, 504: // Bad Gateway, Service Unavailable, Gateway Timeout
+	case 502, 504: // Bad Gateway, Gateway Timeout
 		return true
 	}
 	return false

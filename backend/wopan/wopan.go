@@ -3244,11 +3244,17 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, route *uploadRoute, t
 		return api.UploadData{}, err
 	}
 	// --timeout is an idle clock that renews on every byte, so this per-attempt
-	// wall clock is the only bound on a target that trickles. A re-post onto
-	// another relay starts a fresh clock.
-	attemptCtx, cancelAttempt := context.WithTimeout(req.Context(), f.relayPartDeadline())
+	// wall clock is the only bound on a relay that trickles; a re-post onto
+	// another relay starts a fresh clock. A direct attempt has no other target to
+	// move to, so it keeps the old behaviour of no wall clock at all - imposing
+	// one there would abandon a legitimately slow upload of up to upload_cutoff
+	// bytes with nothing to show for it.
+	reqCtx, cancelAttempt := req.Context(), context.CancelFunc(func() {})
+	if !target.direct {
+		reqCtx, cancelAttempt = context.WithTimeout(req.Context(), f.relayPartDeadline())
+	}
 	defer cancelAttempt()
-	req = req.WithContext(attemptCtx)
+	req = req.WithContext(reqCtx)
 
 	req.Header.Set("Content-Type", contentType)
 	req.ContentLength = overhead + plan.PartSize
@@ -3576,7 +3582,13 @@ func (f *Fs) postPartRetry(ctx context.Context, st *partState, next func(attempt
 			case fail.rejected:
 				// The relay's gateway answered instead of the upload service, so
 				// nothing was stored and a second POST to another relay is not a
-				// duplicate - it is the first one that can succeed.
+				// duplicate - it is the first one that can succeed. When the session
+				// had nowhere to move (it was already direct), the next POST would go
+				// to the same host, which is exactly what the single-attempt rule is
+				// there to prevent.
+				if route.target() == via {
+					return api.UploadData{}, err
+				}
 			case fail.bodySent:
 				// The whole object was on the wire and only the answer was lost.
 				// Re-posting onto another relay would POST the file a second time,
