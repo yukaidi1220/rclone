@@ -3247,13 +3247,15 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, route *uploadRoute, t
 	}
 	// --timeout is an idle clock that renews on every byte, so this per-attempt
 	// wall clock is the only bound on a relay that trickles; a re-post onto
-	// another relay starts a fresh clock. A direct attempt has no other target to
-	// move to, so it keeps the old behaviour of no wall clock at all - imposing
-	// one there would abandon a legitimately slow upload of up to upload_cutoff
-	// bytes with nothing to show for it.
+	// another relay starts a fresh clock. It is stated per 8 MiB of part, so a
+	// part larger than that gets proportionally more time rather than a harder
+	// demand. A direct attempt has no other target to move to, so it keeps the
+	// old behaviour of no wall clock at all - imposing one there would abandon a
+	// legitimately slow upload of up to upload_cutoff bytes with nothing to
+	// show for it.
 	reqCtx, cancelAttempt := req.Context(), context.CancelFunc(func() {})
 	if !target.direct {
-		reqCtx, cancelAttempt = context.WithTimeout(req.Context(), f.relayPartDeadline())
+		reqCtx, cancelAttempt = context.WithTimeout(req.Context(), f.relayPartDeadline(plan.PartSize))
 	}
 	defer cancelAttempt()
 	req = req.WithContext(reqCtx)
@@ -3331,8 +3333,10 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, route *uploadRoute, t
 		// this layer (multi-thread's "chunk %d/%d failed" covers only that
 		// engine's path).
 		err := fmt.Errorf("wopan: upload: part %d/%d session %s via %s -> %s: http %s: %s", plan.Index, total, uniqueID, target.describe(), peerAddr, res.Status, truncate(string(raw), 500))
-		if relayUnavailableStatus(res.StatusCode) {
-			// The gateway in front of the relay answered, not the upload service:
+		if relayUnavailableStatus(res.StatusCode) && route.hasRelays() {
+			// The gateway in front of the relay answered, not the upload service.
+			// Only with a relay table: a remote that has none keeps the exact error
+			// shape it had before relays existed.
 			// measured 2026-10-30, one relay's IPv6 leg answered 504 to 264 parts in
 			// eleven minutes while the others were healthy. Treating that as "the
 			// relay is alive, retry it" re-sent every part of every file that landed

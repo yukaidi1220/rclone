@@ -95,8 +95,10 @@ The advanced options are:
   leaves through several source IPs instead of one. A relay leaves rotation for
   `--connect-family-cooldown` when an attempt fails before a complete HTTP
   response arrived: no route, TLS broken, no response headers within `--timeout`,
-  or the part's own 5m0s wall clock expiring after the whole part had been
-  written. That clock only applies to attempts that go through a relay: a direct
+  or the part's own wall clock expiring after the whole part had been
+  written - that clock is 5m0s per 8 MiB of part, so a larger part gets
+  proportionally more time instead of a harder bandwidth demand. That clock only
+  applies to attempts that go through a relay: a direct
   attempt has no other target to move to, so it keeps the old behaviour of no
   wall clock. An HTTP status the relay forwarded never marks it dead, because a
   relay that forwarded a 500 answered; 502 and 504 are the exception, since those

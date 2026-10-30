@@ -1296,6 +1296,9 @@ type zoneRecorder struct {
 	neverGivenUp  int
 	mu            sync.Mutex
 	urls          []string
+	// deadlinesSeen is the wall clock each request still had when RoundTrip saw
+	// it, index-aligned with urls; 0 means the request carried no deadline.
+	deadlinesSeen []time.Duration
 	parts         []partValues
 	attempts      map[string]int
 }
@@ -1398,7 +1401,8 @@ func (z *zoneRecorder) meet() {
 	if int(n) >= z.meetWant {
 		return
 	}
-	for int(z.meetArrived.Load()) < z.meetWant {
+	deadline := time.Now().Add(10 * time.Second)
+	for int(z.meetArrived.Load()) < z.meetWant && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 }
@@ -1412,6 +1416,11 @@ func (z *zoneRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	z.urls = append(z.urls, r.URL.String())
+	if dl, ok := r.Context().Deadline(); ok {
+		z.deadlinesSeen = append(z.deadlinesSeen, time.Until(dl))
+	} else {
+		z.deadlinesSeen = append(z.deadlinesSeen, 0)
+	}
 	body := `{"code":"0000","data":{"fid":"F","wcFileId":"W"},"msg":"ok"}`
 	if mr, err := r.MultipartReader(); err == nil {
 		pv := partValues{Values: url.Values{}}
@@ -1586,6 +1595,23 @@ func (z *zoneRecorder) uploadHosts() []string {
 			continue
 		}
 		out = append(out, parsed.Host)
+	}
+	return out
+}
+
+// uploadDeadlines is the wall clock each upload2C post still had when the
+// transport saw it, in the order they went out; 0 means that post carried no
+// clock at all. It is how a test reads which deadline the part-size scaling
+// actually put on the request, instead of only checking the helper.
+func (z *zoneRecorder) uploadDeadlines() []time.Duration {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	var out []time.Duration
+	for i, u := range z.urls {
+		if !strings.HasSuffix(u, "/openapi/client/upload2C") {
+			continue
+		}
+		out = append(out, z.deadlinesSeen[i])
 	}
 	return out
 }
