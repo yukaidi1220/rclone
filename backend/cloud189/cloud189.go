@@ -258,12 +258,15 @@ func init() {
 			Name: "download_chunk_size",
 			Help: "Size of each chunk the multi-thread copy engine reads from the source.\n\n" +
 				"The upload part size stays the server's ladder value (chunk_size); this option only " +
-				"changes how many bytes one stream reads before handing them to the staged file. Fewer, " +
-				"bigger chunks mean fewer source requests and fewer per-chunk hashes, which is where a " +
-				"small part size costs.\n\n" +
-				"Memory per stream equals this value: the engine reserves one chunk per stream before it " +
-				"opens the source, so raising it raises peak memory by --multi-thread-streams times the " +
-				"increase, per file in flight.\n\n" +
+				"changes how many bytes one stream reads before handing them to the staged file. Bigger " +
+				"chunks mean fewer source range requests, fewer buffer allocations and less per-chunk " +
+				"staging work - the part digests at Close are still computed once per upload part, so " +
+				"this does not cut hashing.\n\n" +
+				"Memory: the engine reserves one chunk per stream, plus one more while it waits for a " +
+				"slot, and the stream count is the larger of this backend's upload_concurrency and " +
+				"--multi-thread-streams, so expect about (streams+1) times this value per file in " +
+				"flight. The engine hangs without an error if --max-buffer-memory is set below this " +
+				"value.\n\n" +
 				"0 means use the upload part size, which is also what every measurement before " +
 				"2026-10-31 assumed.",
 			Default:  fs.SizeSuffix(0),
@@ -1142,9 +1145,14 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 	}
 	// download_chunk_size only decides how much one stream reads at a time, so
 	// it has no server-side constraint; 0 keeps the old behaviour (one upload
-	// part per read).
+	// part per read). A tiny value is refused because the copy engine allocates
+	// one bool per chunk plus one buffer per stream, so 1 byte would ask for as
+	// many chunks as the file has bytes.
 	if opt.DownloadChunkSize < 0 {
 		return nil, fmt.Errorf("cloud189: download_chunk_size must be 0 or more, got %s", opt.DownloadChunkSize)
+	}
+	if opt.DownloadChunkSize > 0 && opt.DownloadChunkSize < fs.SizeSuffix(1<<20) {
+		return nil, fmt.Errorf("cloud189: download_chunk_size must be 0 (use the upload part size) or at least 1Mi, got %s", opt.DownloadChunkSize)
 	}
 	uploadBase, err := parseUploadZone(opt.UploadZone)
 	if err != nil {
@@ -5181,7 +5189,7 @@ func (w *chunkWriter) Close(ctx context.Context) error {
 			// A hole would upload a file with the right size and the wrong
 			// bytes, and the digests would agree with the hole, because they are
 			// computed from what is in the file.
-			return fserrors.NoRetryError(fmt.Errorf("cloud189: %s: chunk %d of %d never arrived, so the staged file is incomplete", w.leaf, i+1, len(w.plans)))
+			return fserrors.NoRetryError(fmt.Errorf("cloud189: %s: chunk %d of %d never arrived, so the staged file is incomplete", w.leaf, i+1, len(w.done)))
 		}
 	}
 	if err := w.f.gateUpload(ctx, w.leaf, w.size); err != nil {
