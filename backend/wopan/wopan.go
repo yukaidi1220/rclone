@@ -838,8 +838,10 @@ func init() {
 				"upload volume leaves through several source IPs instead of one. A relay " +
 				"leaves rotation for --connect-family-cooldown when an attempt fails before " +
 				"a complete HTTP response arrived (no route, TLS broken, no response headers " +
-				"within --timeout, a stalled write, or a part exceeding 5m0s of wall clock). " +
-				"An HTTP status never marks a relay dead. All IPv4 relays are preferred over " +
+				"within --timeout, a stalled write, or a part exceeding 5m0s of wall clock, " +
+				"which applies to relay attempts only). An HTTP status the relay forwarded " +
+				"never marks it dead; 502 and 504 from the gateway in front of it do, because " +
+				"they mean the request never reached the upload service. All IPv4 relays are preferred over " +
 				"all IPv6 relays, and only when every relay of both families is cooling does " +
 				"a session fall back to the endpoint itself.\n\n" +
 				"An endpoint missing from this list is used directly, so adding relays for " +
@@ -3355,6 +3357,12 @@ func (f *Fs) uploadPart(ctx context.Context, in io.Reader, route *uploadRoute, t
 		// chunked path stays retryable: a minutes-long upload should get its
 		// whole-file retry instead of dying without one. 4xx rejections
 		// remain deterministic.
+		if res.StatusCode == http.StatusServiceUnavailable {
+			// Overload, not a rejection of this request: there is no other relay to
+			// move to when the session is direct, but the whole-file ladder may run
+			// the command again later, so leave the error retryable.
+			return api.UploadData{}, err
+		}
 		if total <= 1 || res.StatusCode < 500 {
 			return api.UploadData{}, fserrors.NoRetryError(err)
 		}
