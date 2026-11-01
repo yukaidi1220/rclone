@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rclone/rclone/backend/cloud189/api"
 	"github.com/rclone/rclone/fs"
@@ -576,6 +577,13 @@ func classify(status int, body []byte) ([]byte, error) {
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	// Snap back to the beginning of a rune. Names on this drive are as often
+	// Chinese as not, and a three-byte character cut in two comes out of a %q
+	// argument as \xe6 escapes - which is not the name and cannot be pasted into
+	// a search for it.
+	for i := 0; i < 3 && n > 0 && !utf8.RuneStart(s[n]); i++ {
+		n--
 	}
 	return s[:n] + "..."
 }
@@ -1384,6 +1392,28 @@ func (f *Fs) realDirID(id string) string {
 	return id
 }
 
+// logPath names an object the way a reader of the run looks for it: the directory
+// this run knows that id as, with the name the drive holds after it. A line about
+// `index.html` in a run over two hundred directories says nothing without the
+// directory, and the id that carries it is useless to a human.
+//
+// The directory is left off when the cache does not know the id - after a
+// DirCacheFlush, or for a remote opened at an id this run never resolved to a path
+// - because a bare id would be worse than nothing. The root is the same case by
+// construction: the cache knows it as the empty path, so the leaf stands alone.
+//
+// The name is the drive's own spelling, which is not the user's when a name encoding
+// is in use, and for a server-side copy or move it is spelled the way the source
+// remote stores it.
+func (f *Fs) logPath(dirID, wireName string) string {
+	for _, id := range []string{dirID, f.realDirID(dirID)} {
+		if path, ok := f.dirCache.GetInv(id); ok && path != "" {
+			return path + "/" + wireName
+		}
+	}
+	return wireName
+}
+
 // listDirID is the id a listing has to name: the alias wherever the family
 // drive's own top level appears, because a family listing addressed at that
 // numeric id answers an empty page with no error and reads as an empty drive
@@ -2068,6 +2098,8 @@ func (f *Fs) clearName(ctx context.Context, dirID, wireName string, exceptID str
 	if err := f.renameObject(ctx, row.ID.String(), rowIsDir(row), parked); err != nil {
 		return nil, err
 	}
+	fs.Debugf(f, "cloud189: clearing %q: it was held by object %s, which now sits at %q",
+		f.logPath(dirID, wireName), row.ID, parked)
 	moved := *row
 	moved.Name = parked
 	return &moved, nil
@@ -2075,7 +2107,17 @@ func (f *Fs) clearName(ctx context.Context, dirID, wireName string, exceptID str
 
 // restoreName puts a parked row back under the name it was cleared from.
 func (f *Fs) restoreName(ctx context.Context, parked *api.Row, name string) error {
-	return f.renameObject(ctx, parked.ID.String(), rowIsDir(parked), name)
+	if err := f.renameObject(ctx, parked.ID.String(), rowIsDir(parked), name); err != nil {
+		return err
+	}
+	// Every path that hands a name back comes through here, so this is where the
+	// clearing line gets its second half. Without it a -v run reads a name cleared
+	// for an operation that then did not take it, and never learns the object that
+	// was on the drive before the run went back. The row's own Name is not printed:
+	// some callers hand over the row as it was before the park, so the park name it
+	// carries depends on which caller this is.
+	fs.Debugf(f, "cloud189: object %s is given back the name %q", parked.ID, f.logPath(parked.ParentID.String(), name))
+	return nil
 }
 
 // Copy duplicates an object on the drive, which moves no bytes and costs the
@@ -2274,6 +2316,8 @@ func (f *Fs) finishClear(ctx context.Context, cleared *api.Row, arrivalName, wan
 		return
 	}
 	if arrivalName == wantedName {
+		fs.Debugf(f, "cloud189: the object that held %q (id %s, parked as %q) is being deleted: %s",
+			f.logPath(cleared.ParentID.String(), wantedName), cleared.ID, cleared.Name, why)
 		f.dropObject(ctx, cleared, why)
 		return
 	}
@@ -4019,6 +4063,8 @@ func (f *Fs) installObject(ctx context.Context, dirID, name string, res *uploadR
 		switch {
 		case err == fs.ErrorObjectNotFound:
 			// Free. The object only needs the rename.
+			fs.Debugf(f, "cloud189: %q is free, so the object arriving as %q only needs the rename",
+				f.logPath(dirID, name), res.name)
 		case err != nil:
 			f.discard(ctx, own, oursIsNew, "the name it wanted could not be looked up")
 			return err
@@ -4031,6 +4077,8 @@ func (f *Fs) installObject(ctx context.Context, dirID, name string, res *uploadR
 			// thing standing in the way is itself. Parking it would move the new
 			// bytes aside and the delete that finishes the swap would take them
 			// off the drive.
+			fs.Debugf(f, "cloud189: %q already lists this run's object (id %s), so nothing moves",
+				f.logPath(dirID, name), res.id)
 			return nil
 		default:
 			occupier = row
@@ -4043,6 +4091,14 @@ func (f *Fs) installObject(ctx context.Context, dirID, name string, res *uploadR
 			f.discard(ctx, own, oursIsNew, "the object it was meant to replace could not be moved aside")
 			return err
 		}
+		// Only what has happened. Which of the three ways here an object came to be
+		// named that way is known to its caller and cannot be told from this
+		// function without guessing, and a log that guesses is worse than one that
+		// stops at the facts: an upload the drive stored beside a holder, a task that
+		// landed its object under the source's name, and bytes the drive already held
+		// all arrive looking the same from here.
+		fs.Infof(f, "cloud189: replacing %q: it was held by object %s, which now sits at %q; this run's object is on the drive as %q",
+			f.logPath(dirID, name), occupier.ID, parked, res.name)
 	}
 	if err := f.renameObject(ctx, res.id, false, name); err != nil {
 		if occupier != nil {
@@ -4058,6 +4114,8 @@ func (f *Fs) installObject(ctx context.Context, dirID, name string, res *uploadR
 	if occupier != nil {
 		replaced := *occupier
 		replaced.Name = parked
+		fs.Debugf(f, "cloud189: %q is now held by id %s; the object it displaced (id %s) sits at %q",
+			f.logPath(dirID, name), res.id, occupier.ID, parked)
 		f.dropObject(ctx, &replaced, "it was replaced by a newer copy")
 	}
 	return nil
@@ -4857,6 +4915,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if err := o.fs.renameObject(ctx, o.id, false, parkedName); err != nil {
 		return err
 	}
+	fs.Debugf(o.fs, "cloud189: replacing %q: the object this run is replacing (id %s) now sits at %q",
+		o.remote, o.id, parkedName)
 	parked := *fileRow(o.id, parkedName, dirID)
 	res, err := o.fs.upload(ctx, in, dirID, wireLeaf, src.Size())
 	if err != nil {
@@ -4873,6 +4933,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	// object holds, which is the park name here. So the decision is made from the
 	// listing, not from what the upload reported.
 	if res.id == o.id {
+		fs.Infof(o.fs, "cloud189: %q: the drive answered the upload with the object it had just parked (id %s), so these bytes were already on the drive and none went up",
+			o.remote, o.id)
 		if err := o.fs.restoreOrConfirm(ctx, dirID, wireLeaf, &parked); err != nil {
 			// The object is not confirmed back under its name, and this branch has
 			// no fresh object of its own to leave there: put the original back

@@ -86,7 +86,8 @@ type fakeDrive struct {
 	commitName      string // the name the commit reports; empty means the requested one
 	commitID        string
 	commitIDBare    bool              // answer the id as a bare number, the way the capture does
-	failInstall     bool              // the rename that should give the new object its name collides
+	failInstall     bool              // and the rename that should give the new object its name collides
+	failPark        bool              // the rename that moves the holder aside is refused outright
 	refuseFirstPut  bool              // the storage layer answers the first PUT 400, then accepts it
 	refuseAllPuts   bool              // and never accepts one after that
 	listing         string            // JSON the listing answers with
@@ -365,6 +366,13 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.renames = append(d.renames, renameCall{id: id, name: name})
 		installNumber := len(d.renames)
 		d.mu.Unlock()
+		if d.failPark && installNumber == 1 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"res_code":    "FileAlreadyExists",
+				"res_message": "renameFile() - operId=1, parentId = -11, newFileName = rclone-park, exist.",
+			})
+			return
+		}
 		if d.failInstall && installNumber == 2 {
 			writeJSON(w, http.StatusBadRequest, map[string]any{
 				"res_code":    "FileAlreadyExists",
@@ -1228,6 +1236,7 @@ func TestUpdateParksTheNameBeforeTheNewBytesGoUp(t *testing.T) {
 			`{"id":"9000000000000001","name":"movie.bin","size":10,"type":"1"}]}}`,
 	}
 	f := newFakeFs(t, drive)
+	logged := captureLogs(t, fs.LogLevelDebug)
 	content := pattern(int(fakePartBase))
 
 	old := &Object{fs: f, remote: "movie.bin", id: "5000000000000000001", size: 1, urlMu: new(sync.Mutex)}
@@ -1270,6 +1279,8 @@ func TestUpdateParksTheNameBeforeTheNewBytesGoUp(t *testing.T) {
 		"POST /batch/createBatchTask.action",
 		"POST /batch/checkBatchTask.action",
 	}, sequenceOf(drive))
+	require.Contains(t, logged.raw(), "replacing \"movie.bin\": the object this run is replacing (id 5000000000000000001) now sits at \""+drive.renames[0].name+"\"",
+		"the replacement every sync does says where the bytes it displaced went")
 }
 
 // TestUpdateRestoresTheParkedObjectWhenTheUploadFails: the bytes that were on the
@@ -1300,6 +1311,7 @@ func TestUpdateRestoresTheParkedObjectWhenTheUploadFails(t *testing.T) {
 func TestUpdateKeepsTheOriginalWhenTheDriveReusesItsId(t *testing.T) {
 	drive := &fakeDrive{t: t, commitID: "5000000000000000001"}
 	f := newFakeFs(t, drive)
+	logged := captureLogs(t, fs.LogLevelInfo)
 	content := pattern(int(fakePartBase))
 
 	old := &Object{fs: f, remote: "movie.bin", id: "5000000000000000001", size: 1, urlMu: new(sync.Mutex)}
@@ -1310,6 +1322,8 @@ func TestUpdateKeepsTheOriginalWhenTheDriveReusesItsId(t *testing.T) {
 	require.Equal(t, "5000000000000000001", drive.renames[1].id)
 	require.Equal(t, "movie.bin", drive.renames[1].name)
 	require.Empty(t, drive.tasks, "nothing is deleted: the fresh bytes are the object this run replaced")
+	require.Contains(t, logged.raw(), "\"movie.bin\": the drive answered the upload with the object it had just parked (id 5000000000000000001), so these bytes were already on the drive and none went up",
+		"the dedup case walks back the park it made, and the log has to say so")
 }
 
 // TestUpdateRestoresWithARenameEvenWhenTheListingStillShowsTheObject: a listing that
@@ -1465,6 +1479,7 @@ func TestPutDetectsARacingOccupant(t *testing.T) {
 			`{"id":"7000000000000000002","name":"movie.bin","parentId":"-11","size":10,"type":"1"}]}}`,
 	}
 	f := newFakeFs(t, drive)
+	logged := captureLogs(t, fs.LogLevelInfo)
 	content := pattern(int(fakePartBase))
 
 	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
@@ -1473,6 +1488,56 @@ func TestPutDetectsARacingOccupant(t *testing.T) {
 	require.Equal(t, "7000000000000000002", drive.renames[0].id, "the object that appeared is the one parked")
 	require.Len(t, drive.tasks, 1)
 	require.Equal(t, "7000000000000000002", drive.tasks[0].infos[0].FileID)
+	require.Contains(t, logged.raw(), "replacing \"movie.bin\": it was held by object 7000000000000000002, which now sits at \""+drive.renames[0].name+"\"; this run's object is on the drive as \"movie(20261022191708).bin\"",
+		"the swap says who it moved, where to, and what this run's object is called on the drive")
+	require.NotContains(t, logged.raw(), "is now held by id", "the -vv bookkeeping does not show at -v")
+}
+
+// TestParkRefusedIsNotAnnounced is the ordering rule for the park log: the line
+// follows the rename. A refused park leaves no object sitting under a park name, so
+// a -v line claiming one moved would send the next reader looking for a file that
+// was never touched, and would name a park that exists nowhere.
+func TestParkRefusedIsNotAnnounced(t *testing.T) {
+	drive := &fakeDrive{
+		t:          t,
+		failPark:   true,
+		commitName: "movie(20261022191709).bin",
+		listing: `{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[` +
+			`{"id":"7000000000000000012","name":"movie.bin","size":10,"type":"1"}]}}`,
+	}
+	f := newFakeFs(t, drive)
+	logged := captureLogs(t, fs.LogLevelDebug)
+	content := pattern(int(fakePartBase))
+
+	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
+	require.Error(t, err, "the swap cannot go on without moving the holder")
+	require.Len(t, drive.renames, 1, "the refused park is the only rename this run attempted")
+	require.NotContains(t, logged.raw(), "replacing", "no park happened, so no park is announced")
+	require.NotContains(t, logged.raw(), "rclone-park-", "and no park name reaches the log at all")
+}
+
+// TestClearingRefusedIsNotAnnounced is the same rule on the other park: a
+// server-side copy or move clears the name it will land on before the task is asked
+// for anything, and when that clearing rename is refused the run must not say the
+// object moved.
+func TestClearingRefusedIsNotAnnounced(t *testing.T) {
+	drive := &fakeDrive{t: t, failPark: true, folders: map[string]string{"archive": archiveID}}
+	f := newFakeFs(t, drive)
+	logged := captureLogs(t, fs.LogLevelDebug)
+	drive.listingFn = newListingScript(map[string][]string{
+		rootID: {emptyListing()},
+		archiveID: {
+			emptyListing(), // the create's verification
+			listingJSON([]string{fileJSON("6000000000000000031", "clip-01.mp4", archiveID)}, nil),
+		},
+	}).fn
+
+	_, err := f.Copy(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "archive/clip-01.mp4")
+	require.Error(t, err, "the copy cannot be asked to land on a name that could not be cleared")
+	require.Len(t, drive.renames, 1, "the refused clearing is the only rename this run attempted")
+	require.Empty(t, drive.tasks, "and no task was sent for it")
+	require.NotContains(t, logged.raw(), "clearing", "no name was cleared, so no name is announced as cleared")
+	require.NotContains(t, logged.raw(), "rclone-park-", "and no park name reaches the log at all")
 }
 
 // TestPutRestoreGivesTheRacingHolderItsNameBack is the swap that fails in the
@@ -1489,6 +1554,7 @@ func TestPutRestoreGivesTheRacingHolderItsNameBack(t *testing.T) {
 			`{"id":"7000000000000000003","name":"movie.bin","size":10,"type":"1"}]}}`,
 	}
 	f := newFakeFs(t, drive)
+	logged := captureLogs(t, fs.LogLevelDebug)
 	content := pattern(int(fakePartBase))
 
 	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
@@ -1504,6 +1570,8 @@ func TestPutRestoreGivesTheRacingHolderItsNameBack(t *testing.T) {
 	require.Len(t, drive.tasks, 1, "and only rclone's own upload is taken back")
 	require.Equal(t, taskDelete, drive.tasks[0].taskType)
 	require.Equal(t, "9000000000000001", drive.tasks[0].infos[0].FileID)
+	require.Contains(t, logged.raw(), "object 7000000000000000003 is given back the name \"movie.bin\"",
+		"a name cleared and then handed back says so, or the log leaves a park pointing at nothing")
 }
 
 // TestPutSwapsOutAFileTheDriveListedWithoutAParent is the personal endpoint's
@@ -1580,6 +1648,7 @@ func TestInstallLeavesAnObjectThatAlreadyHoldsTheName(t *testing.T) {
 			`{"id":"9000000000000001","name":"movie.bin","size":10,"type":"1"}]}}`,
 	}
 	f := newFakeFs(t, drive)
+	logged := captureLogs(t, fs.LogLevelDebug)
 	content := pattern(int(fakePartBase))
 
 	obj, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
@@ -1588,6 +1657,8 @@ func TestInstallLeavesAnObjectThatAlreadyHoldsTheName(t *testing.T) {
 
 	require.Empty(t, drive.renames, "nothing is parked when the holder of the name is the object itself")
 	require.Empty(t, drive.tasks, "and nothing is deleted")
+	require.Contains(t, logged.raw(), "\"movie.bin\" already lists this run's object (id 9000000000000001), so nothing moves",
+		"the case the commit echo lies about is written down")
 }
 
 // TestPutRefusesToOverwriteADirectory: a name can be held by a directory, and a
@@ -2212,4 +2283,138 @@ func TestExchangeFailureDoesNotPrintTheToken(t *testing.T) {
 	require.NotContains(t, err.Error(), token, "the token is never in the message")
 	require.NotContains(t, err.Error(), url.QueryEscape(token))
 	require.Contains(t, err.Error(), "<redacted>", "and the URL that held it is said to be redacted")
+}
+
+// TestUpdateParkLineStaysUnderVeryVerbose is the volume pin for the line that fires
+// most often: every overwritten file parks the object it replaces, so at -v a big
+// re-sync would print one of these per file beside core's own replaced-existing line.
+// The rename count proves the park happened, so the missing line is the level.
+func TestUpdateParkLineStaysUnderVeryVerbose(t *testing.T) {
+	drive := &fakeDrive{
+		t: t,
+		// what the proof reads back: this run's upload, standing at the name
+		listing: `{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[` +
+			`{"id":"9000000000000001","name":"movie.bin","size":10,"type":"1"}]}}`,
+	}
+	f := newFakeFs(t, drive)
+	logged := captureLogs(t, fs.LogLevelInfo)
+	content := pattern(int(fakePartBase))
+
+	old := &Object{fs: f, remote: "movie.bin", id: "5000000000000000001", size: 1, urlMu: new(sync.Mutex)}
+	require.NoError(t, old.Update(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content)))))
+	require.Len(t, drive.renames, 1, "the old object was moved aside, so a missing line below is about the level")
+
+	require.NotContains(t, logged.raw(), "now sits at \"rclone-park-", "the park line is -vv output")
+}
+
+// TestSwapBookkeepingNamesTheDisplacedObject is the other side of that level split:
+// the line saying who was displaced and under which park name is -vv output, so it
+// is checked with a -vv capture. Without this assertion the sentence could be deleted
+// outright and nothing would notice.
+func TestSwapBookkeepingNamesTheDisplacedObject(t *testing.T) {
+	drive := &fakeDrive{
+		t:          t,
+		commitName: "movie(20261022191708).bin",
+		listing: `{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[` +
+			`{"id":"7000000000000000002","name":"movie.bin","parentId":"-11","size":10,"type":"1"}]}}`,
+	}
+	f := newFakeFs(t, drive)
+	logged := captureLogs(t, fs.LogLevelDebug)
+	content := pattern(int(fakePartBase))
+
+	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
+	require.NoError(t, err)
+	require.Len(t, drive.renames, 2, "the holder moved aside and this run's object took the name")
+
+	require.Contains(t, logged.raw(), "the object it displaced (id 7000000000000000002) sits at \""+drive.renames[0].name+"\"",
+		"the swap writes down who was displaced, and under which park name")
+}
+
+// TestAlreadyListedLineStaysUnderVeryVerbose is the level pin for the line written
+// when the commit echo lies and the listing shows this run's own object standing at
+// the wanted name. Its content is asserted by the test above with a -vv capture; this
+// one runs the same drive at -v and requires silence. The id and the empty rename/task
+// counts are the proof the branch ran, so an absent line here is the level, not a
+// scenario that never got there.
+func TestAlreadyListedLineStaysUnderVeryVerbose(t *testing.T) {
+	drive := &fakeDrive{
+		t:          t,
+		commitName: "movie(20261024100000).bin",
+		listing: `{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[` +
+			`{"id":"9000000000000001","name":"movie.bin","size":10,"type":"1"}]}}`,
+	}
+	f := newFakeFs(t, drive)
+	logged := captureLogs(t, fs.LogLevelInfo)
+	content := pattern(int(fakePartBase))
+
+	obj, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
+	require.NoError(t, err)
+	require.Equal(t, "9000000000000001", obj.(*Object).id, "the listing's own object is what this run reports")
+	require.Empty(t, drive.renames, "nothing moved, which is the whole point of that branch")
+	require.Empty(t, drive.tasks, "and nothing was deleted for it")
+
+	require.NotContains(t, logged.raw(), "already lists this run's object", "that line is -vv output")
+}
+
+// TestGivenBackLineStaysUnderVeryVerbose is the level pin for the line saying a name
+// this run cleared was handed back. The swap is refused, so the restore does run; at
+// -v that must still be invisible, because a run whose every rename is refused would
+// otherwise print two lines per file instead of one.
+func TestGivenBackLineStaysUnderVeryVerbose(t *testing.T) {
+	drive := &fakeDrive{
+		t:           t,
+		commitName:  "movie(20261022191711).bin",
+		failInstall: true,
+		listing: `{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[` +
+			`{"id":"7000000000000000003","name":"movie.bin","size":10,"type":"1"}]}}`,
+	}
+	f := newFakeFs(t, drive)
+	logged := captureLogs(t, fs.LogLevelInfo)
+	content := pattern(int(fakePartBase))
+
+	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
+	require.Error(t, err)
+	require.Len(t, drive.renames, 3, "park, refused install, and the restore that gave the name back")
+	require.Equal(t, "movie.bin", drive.renames[2].name, "the third rename is the name going back")
+
+	require.NotContains(t, logged.raw(), "is given back the name", "that line is -vv output")
+}
+
+// TestSwapLinesStayOutOfDefaultLogging closes the other direction of the level
+// contract. Five tests already prove the seven bookkeeping lines are not -v output and
+// two prove these two are; nothing yet proved they stop at -v. Promoting one to the
+// default level would put a park name in every user's plain `rclone copy` with no flag
+// at all, and nothing would turn red - so this asserts the same two sentences absent
+// with the logger set to its default, and proves both branches really ran.
+func TestSwapLinesStayOutOfDefaultLogging(t *testing.T) {
+	logged := captureLogs(t, fs.LogLevelNotice)
+
+	// The upload the listing did not predict: the commit echoes another name and the
+	// wanted one turns out to be held.
+	racing := &fakeDrive{
+		t:          t,
+		commitName: "movie(20261022191708).bin",
+		listing: `{"res_code":0,"fileListAO":{"count":1,"folderList":[],"fileList":[` +
+			`{"id":"7000000000000000002","name":"movie.bin","parentId":"-11","size":10,"type":"1"}]}}`,
+	}
+	fr := newFakeFs(t, racing)
+	content := pattern(int(fakePartBase))
+	_, err := fr.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
+	require.NoError(t, err)
+	require.Len(t, racing.renames, 2, "the holder moved aside and this upload took the name")
+	require.Len(t, racing.tasks, 1, "and the displaced object was deleted")
+
+	// The replacement whose bytes the drive already held: the commit answers with the
+	// very object this run parked, so nothing went up.
+	dedup := &fakeDrive{t: t, commitID: "5000000000000000001"}
+	fd := newFakeFs(t, dedup)
+	old := &Object{fs: fd, remote: "movie.bin", id: "5000000000000000001", size: 1, urlMu: new(sync.Mutex)}
+	require.NoError(t, old.Update(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content)))))
+	require.Len(t, dedup.renames, 2, "parked, then given its name back")
+	require.Empty(t, dedup.tasks, "and nothing deleted, because it is the original")
+
+	text := logged.raw()
+	require.NotContains(t, text, "it was held by object 7000000000000000002", "the swap line is -v output, not default")
+	require.NotContains(t, text, "the drive answered the upload with the object it had just parked",
+		"and so is the dedup line")
 }

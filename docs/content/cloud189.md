@@ -415,6 +415,36 @@ For an upload all three steps are rclone's own renames. For a server-side copy o
 move the arrival takes step 2's place: the task runs while the name it will land on
 is clear, and step 2 then renames the arrival into the name rclone asked for.
 
+Every park is logged *after* the rename that made it, never before: a line announcing a
+move the drive refused would send the next reader looking for an object that was never
+touched. Two of them are `-v`, and they are the rare shapes worth interrupting a run
+for - an object that turned up beside a holder the listing had not mentioned, whether it
+came from an upload or from a copy or move whose arrival is named after its source
+(`replacing "x": it was held by object N, which now sits at "PARK"; this run's object
+is on the drive as "y"`), and a replacement whose bytes the drive already held, which
+says so because the object it had just parked is the one it got back. The rest are
+`-vv`: `replacing "x": the object this run is replacing (id N) now sits at "PARK"` for
+an overwritten file, `clearing "x": it was held by object N, which now sits at "PARK"`
+where a server-side copy or move cleared a name for its own arrival,
+`object N is given back the name "x"` when a swap could not be finished, and one line
+each for the outcomes that need no attention. `-vv` for those because they fire once per
+replaced file and a full re-sync of a large bucket would otherwise double the `-v`
+output beside rclone's own line for the same file; every path that can *leave* a park on
+the drive logs at Error or Notice whatever the level. `PARK` is printed in full and is
+the name the rename was told to use, so a `rclone-park-...` left on the drive can be
+found by searching the log for it; the converse does not hold - a park name in the log
+more often means the object was given its name back and there is nothing to find. Names
+are printed as `directory/name`, the directory being the one this run's directory
+cache knows for that id - so a line says which of two hundred `index.html` files it
+means. When the cache does not know the id (after a `DirCacheFlush`, or for a remote
+opened at an id that was never resolved to a path) the name stands alone, and a bare
+id is never printed in its place. An object sitting at the root the remote was opened at
+prints as its bare name for the same reason - within that remote, that is its whole
+path. The name is the drive's own spelling, which is not the user's when a name
+encoding is in use - except the two lines a replacement prints, which carry the path
+rclone was asked to write, since that is what the person running the command
+recognises.
+
 Replacing a file (`Update`) parks the old object **before** the new bytes go up, so
 the upload arrives wearing the name it was asked for and no rename follows it. The
 drive will not overwrite: an upload onto a name still in use is stored beside it

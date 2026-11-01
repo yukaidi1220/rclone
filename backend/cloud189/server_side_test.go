@@ -1,17 +1,21 @@
 package cloud189
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
+	fslog "github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/stretchr/testify/require"
@@ -186,6 +190,7 @@ func TestCopyWithinItsOwnDirectoryIsRefused(t *testing.T) {
 func TestServerSideCopyParksTheOccupierAndDeletesIt(t *testing.T) {
 	drive := &fakeDrive{t: t, folders: map[string]string{"archive": archiveID}}
 	f := newFakeFs(t, drive)
+	logged := captureLogs(t, fs.LogLevelDebug)
 	drive.listingFn = newListingScript(map[string][]string{
 		rootID: {emptyListing()},
 		archiveID: {
@@ -207,6 +212,10 @@ func TestServerSideCopyParksTheOccupierAndDeletesIt(t *testing.T) {
 	require.Equal(t, taskDelete, drive.tasks[1].taskType)
 	require.Equal(t, "6000000000000000006", drive.tasks[1].infos[0].FileID, "what gets deleted is the occupier")
 	require.Equal(t, drive.renames[0].name, drive.tasks[1].infos[0].FileName, "by the name it was parked under")
+	require.Contains(t, logged.raw(), "clearing \"archive/clip-01.mp4\": it was held by object 6000000000000000006, which now sits at \""+drive.renames[0].name+"\"",
+		"a name cleared for a task says who moved and where to")
+	require.Contains(t, logged.raw(), "the object that held \"archive/clip-01.mp4\" (id 6000000000000000006, parked as \""+drive.renames[0].name+"\") is being deleted",
+		"and the fate of that park is written down too")
 }
 
 // TestCopyRefusesToDisplaceADirectory: the delete that follows a successful task
@@ -464,6 +473,7 @@ func TestCopyReadbackSkipsTheRowThisRunParked(t *testing.T) {
 func TestMoveWithholdsTheDeleteWhenTheDestinationCannotBeConfirmed(t *testing.T) {
 	drive := &fakeDrive{t: t, folders: map[string]string{"archive": archiveID}}
 	f := newFakeFs(t, drive)
+	logged := captureLogs(t, fs.LogLevelDebug)
 	unrelated := fileJSON("7000000000000000021", "clip-01.mp4", archiveID)
 	drive.listingFn = newListingScript(map[string][]string{
 		rootID: {emptyListing()},
@@ -486,6 +496,8 @@ func TestMoveWithholdsTheDeleteWhenTheDestinationCannotBeConfirmed(t *testing.T)
 
 	require.Len(t, drive.tasks, 1, "the move, and nothing deleted for it")
 	require.Equal(t, taskMove, drive.tasks[0].taskType)
+	require.Contains(t, logged.raw(), "object 7000000000000000021 is given back the name \"archive/clip-01.mp4\"",
+		"the run cleared the name and gave it back, and the log says both halves")
 }
 
 // TestFailedMoveHandsTheArrivalNameBack: the task ran and landed this run's object
@@ -2383,4 +2395,134 @@ func driveFolders(d *fakeDrive) []string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return append([]string(nil), d.listFolders...)
+}
+
+// logLines collects what rclone's logger wrote while a test ran.
+type logLines struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *logLines) add(text string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.buf.WriteString(text)
+	l.buf.WriteString("\n")
+}
+
+// raw returns the captured text exactly as rclone formatted it.
+func (l *logLines) raw() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// captureLogs takes rclone's log output for the duration of the test at the passed
+// level, and returns what was written.
+//
+// It hangs off rclone's own OutputHandler rather than replacing the slog logger:
+// fs/log installs that handler as rclone's private logger at package init, so
+// swapping it with fs.SetLogger would leave the rest of the binary talking to a
+// different formatter than the CLI uses. This way the text is the line a human
+// reads in a real -v / -vv log, which is the thing these tests claim about.
+func captureLogs(t *testing.T, level fs.LogLevel) *logLines {
+	t.Helper()
+	lines := &logLines{}
+	cfg := fs.GetConfig(context.Background())
+	oldLevel := cfg.LogLevel
+	cfg.LogLevel = level
+	oldSlogLevel := fslog.Handler.SetLevel(fs.LogLevelToSlog(level))
+	fslog.Handler.SetOutput(func(_ slog.Level, text string) { lines.add(text) })
+	t.Cleanup(func() {
+		fslog.Handler.ResetOutput()
+		fslog.Handler.SetLevel(oldSlogLevel)
+		cfg.LogLevel = oldLevel
+	})
+	return lines
+}
+
+// TestSwapLogSaysTheNameWasOnlyRenamed covers the branch where the drive stored the
+// upload under another name but nothing is standing on the wanted one: one rename,
+// no park, and the log has to say that instead of leaving a bare rename behind.
+func TestSwapLogSaysTheNameWasOnlyRenamed(t *testing.T) {
+	drive := &fakeDrive{
+		t:          t,
+		commitID:   "7000000000000000005",
+		commitName: "movie(20261022191712).bin",
+		listing:    emptyListing(),
+	}
+	f := newFakeFs(t, drive)
+	logged := captureLogs(t, fs.LogLevelDebug)
+	content := pattern(int(fakePartBase))
+
+	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
+	require.NoError(t, err)
+	require.Len(t, drive.renames, 1, "only this upload's own rename, nothing was parked")
+	require.Empty(t, drivesTasks(drive), "and no displaced object to delete")
+
+	text := logged.raw()
+	require.Contains(t, text, "\"movie.bin\" is free, so the object arriving as \"movie(20261022191712).bin\" only needs the rename")
+	require.NotContains(t, text, "moves aside", "and it does not claim a park that did not happen")
+}
+
+// TestSwapLinesStayUnderVeryVerbose pins the volume decision from the other side: the
+// clearing line fires once per replaced arrival, and a full re-sync of a large bucket
+// would otherwise double what `-v` prints on top of rclone core's own line for the
+// same file. So these lines are `-vv` bookkeeping, while every path that can LEAVE
+// something behind logs at Error or Notice whatever the level. The rename count is
+// asserted too, so an absent line here is about the level and not about the event.
+func TestSwapLinesStayUnderVeryVerbose(t *testing.T) {
+	drive := &fakeDrive{t: t, folders: map[string]string{"archive": archiveID}}
+	f := newFakeFs(t, drive)
+	logged := captureLogs(t, fs.LogLevelInfo)
+	drive.listingFn = newListingScript(map[string][]string{
+		rootID: {emptyListing()},
+		archiveID: {
+			emptyListing(),
+			listingJSON([]string{fileJSON("6000000000000000007", "clip-01.mp4", archiveID)}, nil),
+			listingJSON([]string{fileJSON("900000000000000012", "clip-01.mp4", archiveID)}, nil),
+		},
+	}).fn
+
+	_, err := f.Copy(context.Background(), srcObject(f, "clip-01.mp4", "900000000000000006"), "archive/clip-01.mp4")
+	require.NoError(t, err)
+	require.Len(t, drive.renames, 1, "the park happened, so the two lines below are missing on purpose")
+
+	require.NotContains(t, logged.raw(), "clearing \"archive/clip-01.mp4\"", "the clearing line is -vv output")
+	require.NotContains(t, logged.raw(), "is being deleted", "and so is the resolution of that park")
+}
+
+// TestTruncateSnapsToARuneBoundary is the other half of the same decision: these
+// lines carry names the drive holds, and the names on this drive are as often
+// Chinese as not. A byte cut inside a three-byte character survives as \xe6 escapes
+// in a %q argument, which is neither the name nor something a reader can search for.
+func TestTruncateSnapsToARuneBoundary(t *testing.T) {
+	name := "报告" // two three-byte runes
+	require.Len(t, name, 6, "the fixture is six bytes of text")
+	require.Equal(t, name, truncate(name, 6), "an exact fit adds nothing")
+	require.Equal(t, "报...", truncate(name, 4), "the cut steps back to the start of the rune it landed inside")
+	require.True(t, utf8.ValidString(truncate(name, 4)), "and the result is still text")
+	require.Equal(t, "report", truncate("report", 60), "ascii below the limit is untouched")
+}
+
+// TestFreeNameLineStaysUnderVeryVerbose is the level pin for the line that fires on
+// every renamed object whose listing lagged behind. The test above asserts its content
+// at -vv; this one runs the same scenario at -v and requires silence, so the split
+// between the two levels cannot rot by someone promoting the cheap line.
+func TestFreeNameLineStaysUnderVeryVerbose(t *testing.T) {
+	drive := &fakeDrive{
+		t:          t,
+		commitID:   "7000000000000000005",
+		commitName: "movie(20261022191712).bin",
+		listing:    emptyListing(),
+	}
+	f := newFakeFs(t, drive)
+	logged := captureLogs(t, fs.LogLevelInfo)
+	content := pattern(int(fakePartBase))
+
+	_, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie.bin", int64(len(content))))
+	require.NoError(t, err)
+	require.Len(t, drive.renames, 1, "the rename ran, so a missing line here is about the level")
+
+	require.NotContains(t, logged.raw(), "is free, so the object arriving as", "that line is -vv output")
 }
