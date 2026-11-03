@@ -387,17 +387,21 @@ func TestRegisteredDefaults(t *testing.T) {
 
 // TestRedactLoginNameKeepsTheLastTwoDigits: what the account logs in with reaches a
 // debug log, and a phone number there is as good as a name and a contact detail. The
-// last two digits stay so two accounts can be told apart; an email is not a secret
-// and is left alone.
+// last two digits stay so two accounts can be told apart; an address that is not a
+// phone number is not a secret either and is left alone - but the number inside an
+// `@189.cn` login name is still a number, so it goes.
 func TestRedactLoginNameKeepsTheLastTwoDigits(t *testing.T) {
+	// The numbers below are synthetic (199 1234 5678), not anybody's account: a
+	// fixture that carries a real login number publishes it in the repository.
 	for _, tc := range []struct {
 		in   string
 		want string
 	}{
-		{"19912345678", "*********26"},
-		{"+86 172 6327 5626", "+** *** **** **26"},
-		{"19912345678@189.cn", "19912345678@189.cn"},
+		{"19912345678", "*********78"},
+		{"+86 199 1234 5678", "+** *** **** **78"},
+		{"19912345678@189.cn", "*********78@189.cn"},
 		{"someone@example.com", "someone@example.com"},
+		{"1234567@example.com", "*****67@example.com"},
 		{"fixture-account", "fixture-account"},
 		{"123456", "123456"},
 		{"", ""},

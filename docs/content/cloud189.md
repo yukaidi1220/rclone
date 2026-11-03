@@ -205,7 +205,9 @@ fullwidth substitutes:
   newlines, `& = % # + , ; @ ( ) [ ] { } $ ! ^`, names of 300 ASCII characters or
   200 Chinese ones, and `..` (which is a legal file name here). Escaping any of
   those would invent a restriction the server does not have and would make rclone
-  rename files the official client stores without complaint.
+  rename files the official client stores without complaint. One of them is
+  restricted anyway, by this backend and not by the drive: `$` in a directory name
+  - see the refusals below.
 - Leading and trailing **spaces** are the exception, and newer than the first
   table: the drive strips them from file and directory names alike. Uploading
   ` film.mkv` stores `film.mkv`, and the rename that installs the object under
@@ -218,12 +220,25 @@ fullwidth substitutes:
   encrypted form string, where Go would replace invalid bytes with U+FFFD and
   make the name irreversible.
 
-Two things are refused locally, before a byte of the source is read:
+Three things are refused locally, before a byte of the source is read:
 
 - A name containing a character above the BMP (an emoji, most CJK extension
   ideographs) is rejected with a no-retry error. The drive answers
   `403 EmojiArgumentError` - but only at commit time, after the whole file has
   been transferred and charged to the day's allowance.
+- A **directory** name containing `$` is refused with a no-retry error, both when
+  it is created and when a rename would give a directory that name
+  (`rclone moveto old 'new$x'`) - the rename endpoint mints a name as readily as
+  `createFolder` does. This is the backend's rule, not the drive's: measured
+  2026-11-03, `createFolder` accepted `a$b` at the top level and `c$d/e$f` nested
+  and listed both back exactly as sent. The name is judged as its owner spelled
+  it, so switching on an encoding that escapes `$` does not put the fullwidth
+  lookalike on the drive instead. File names keep accepting `$`, and a `$`
+  directory already on the drive stays listable, emptyable, deletable and movable
+  under its own name - only minting the name is refused. A whole subtree under a
+  refused directory reports one error line per file, because a failed directory
+  creation is not cached; `--retries` does not multiply them and the run is not
+  cancelled.
 - Length is deliberately not checked. There is no measured limit to enforce, and
   inventing one would block names the official client accepts.
 
@@ -733,7 +748,12 @@ account appears to have.
 - Case-only differences in names were not probed - see [File names](#file-names).
 - The standard integration suite runs against this backend in a directory of its
   own (`fstest/test_all/config.yaml`). It refuses empty files and cannot set
-  modification times, which the suite skips rather than fails.
+  modification times, which the suite skips rather than fails. Its
+  `FsEncoding/punctuation` case does **fail** here on purpose: that fixture names
+  a directory with a string carrying `$`, and this backend refuses to mint such a
+  name - see [File names](#file-names). The suite has no switch for that case and
+  adding one would mean editing shared test code, which is a larger cost than the
+  red case it hides.
 - One run left an `rclone-park-…` object behind although its delete task had
   reported success (2026-10-25, for an object parked two seconds earlier), so
   such an object can survive a replace. It is visible in listings and safe to

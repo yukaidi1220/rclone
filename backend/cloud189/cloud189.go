@@ -418,6 +418,37 @@ func validateName(name string) error {
 	return nil
 }
 
+// forbiddenDirRune is refused in a directory name although the drive stores it.
+//
+// Measured 2026-11-03 on a live personal drive: createFolder accepted `a$b` at
+// the top level and `c$d/e$f` nested, and both listed back exactly as sent - so
+// refusing costs a name this server would have kept, and the rule is a local
+// policy rather than a protocol limit.
+//
+// It is checked on the name as the user spelled it, before any encoding: the
+// default mask leaves `$` alone, and a run that turned the Dollar encoding flag
+// on would otherwise create `a＄b` where the user asked for `a$b` and the refusal
+// would have to be argued about per configuration. A directory named with the
+// fullwidth `＄` in the first place is not refused - it carries no `$`.
+//
+// Only a name being *minted* is refused: createFolder for a new directory, and the
+// rename that gives an existing directory a new name carrying it. Listing,
+// emptying, deleting and moving a directory that already carries the character go
+// on working, so a drive this backend did not fill can still be cleaned up and
+// reorganised.
+const forbiddenDirRune = '$'
+
+// validateDirName rejects a folder name this backend will not mint, before
+// createFolder or the rename is asked for it. NoRetry because the answer cannot
+// change by asking again, and not Fatal because one such name must not stop the
+// run.
+func validateDirName(name string) error {
+	if strings.ContainsRune(name, forbiddenDirRune) {
+		return fserrors.NoRetryError(fmt.Errorf("cloud189: folder name %q contains $, which this backend refuses to put on the drive - change it locally", truncate(name, 60)))
+	}
+	return nil
+}
+
 // chunkPlan returns the part size the server expects for a file of the given
 // size. The rule, measured 2026-10-22 by declaring sizes without transferring
 // them, is: one base while the file fits in ladderPartsLow parts of that size,
@@ -771,15 +802,17 @@ func (f *Fs) exchange(ctx context.Context, usedKey string) error {
 }
 
 // redactLoginName hides the phone number an account logs in with, keeping the last
-// two digits so two accounts can still be told apart in a log. An email names the
-// account without being a secret, so it is left as it is, and anything without
-// enough digits to be a phone number is left alone too.
+// two digits so two accounts can still be told apart in a log.
+//
+// The digit run is masked wherever it sits, because an 189 account's login name IS
+// the phone number with the carrier's domain bolted on, so treating any name
+// holding an `@` as an email and printing it whole would put the number in the log
+// after all. A domain is never masked, and an address whose local part is not
+// phone-shaped is left exactly as it is: naming the account is what an email is for.
 func redactLoginName(name string) string {
-	if strings.Contains(name, "@") {
-		return name
-	}
+	local, domain, hasDomain := strings.Cut(name, "@")
 	digits := 0
-	for _, r := range name {
+	for _, r := range local {
 		if r >= '0' && r <= '9' {
 			digits++
 		}
@@ -787,7 +820,7 @@ func redactLoginName(name string) string {
 	if digits < 7 {
 		return name
 	}
-	out := []rune(name)
+	out := []rune(local)
 	kept := 0
 	for i := len(out) - 1; i >= 0; i-- {
 		if out[i] < '0' || out[i] > '9' {
@@ -798,7 +831,10 @@ func redactLoginName(name string) string {
 			out[i] = '*'
 		}
 	}
-	return string(out)
+	if !hasDomain {
+		return string(out)
+	}
+	return string(out) + "@" + domain
 }
 
 // ------------------------------------------------------------ http ---------
@@ -1711,6 +1747,10 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	if err := validateName(name); err != nil {
 		return "", err
 	}
+	// The directory rule is judged on the user's spelling, not the encoded one.
+	if err := validateDirName(leaf); err != nil {
+		return "", err
+	}
 	var (
 		requestURI, q string
 		body          []byte
@@ -2450,6 +2490,18 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	srcID, srcDirectoryID, srcLeaf, dstDirID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
 	if err != nil {
 		return err
+	}
+	// The directory rule covers a rename as well as a fresh creation. After
+	// `rclone moveto remote:plain remote:'a$b'` the drive holds a directory named
+	// `a$b` and no createFolder was ever sent for it - the rename endpoint minted
+	// the name. A move that keeps the source's own name is not that: the entry
+	// already exists under that name and only the directory holding it changes, so
+	// a `$` directory already on the drive stays movable. Checked before anything is
+	// cleared, parked or tasked, so a refusal leaves the drive exactly as it was.
+	if dstLeaf != srcLeaf {
+		if err := validateDirName(dstLeaf); err != nil {
+			return err
+		}
 	}
 	parentID, err := taskParentID(srcFs.realDirID(srcDirectoryID))
 	if err != nil {

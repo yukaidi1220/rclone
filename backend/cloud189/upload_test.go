@@ -1139,6 +1139,31 @@ func sequenceOf(d *fakeDrive) []string {
 	return out
 }
 
+// TestPutStillAcceptsADollarInAFileName keeps the folder rule off the upload
+// path. The measured character table has `dollar$.bin` stored verbatim, so
+// refusing or escaping a `$` in a file name would invent a limit this server does
+// not have - and it would cost a user every file of a bucket that names things
+// with shell variables in them.
+func TestPutStillAcceptsADollarInAFileName(t *testing.T) {
+	// commitName is spelled out because the fake otherwise echoes the params it
+	// received, and those carry the name URL-escaped: the real drive answers with
+	// the decoded name it stored (measured, `dollar$.bin` lands under exactly that
+	// name). Same reason the colon test above names the commit's answer.
+	drive := &fakeDrive{t: t, commitName: "movie$.bin"}
+	f := newFakeFs(t, drive)
+	content := pattern(int(fakePartBase * 3))
+
+	obj, err := f.Put(context.Background(), bytes.NewReader(content), staticObject("movie$.bin", int64(len(content))))
+	require.NoError(t, err)
+	require.Equal(t, "movie$.bin", obj.Remote(), "the name the user asked for is the name rclone reports back")
+
+	require.Len(t, drive.initPlains, 1)
+	sent, err := url.QueryUnescape(drive.initPlains[0]["fileName"])
+	require.NoError(t, err)
+	require.Equal(t, "movie$.bin", sent, "the name reaches the drive carrying only its transport escape, not a substitution")
+	require.Empty(t, drive.renames, "nothing had to be moved out of the way for it")
+}
+
 // TestPutLandsUnderItsName covers a fresh upload that needs three parts and no
 // swap at all.
 func TestPutLandsUnderItsName(t *testing.T) {

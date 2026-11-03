@@ -1031,6 +1031,49 @@ func TestDirMoveIsOneRecursiveTask(t *testing.T) {
 	require.False(t, cached, "the moved directory leaves the source cache, it is not there any more")
 }
 
+// TestDirMoveRefusesARenameToADollarName: the rename endpoint mints a directory
+// name as readily as createFolder does, so `rclone moveto old new$x` meets the same
+// refusal. It has to arrive before the task, because a directory the task has
+// already moved cannot be un-moved by a refusal that comes afterwards.
+func TestDirMoveRefusesARenameToADollarName(t *testing.T) {
+	drive := &fakeDrive{t: t, folders: map[string]string{"archive": archiveID}}
+	f := newFakeFs(t, drive)
+	subFolder := listingJSON(nil, []string{folderJSON("900000000000000007", "sub", rootID)})
+	drive.listingFn = newListingScript(map[string][]string{
+		rootID:    {emptyListing(), subFolder},
+		archiveID: {emptyListing()},
+	}).fn
+
+	err := f.DirMove(context.Background(), f, "sub", "archive/mo$ved")
+	require.Error(t, err)
+	require.True(t, fserrors.IsNoRetryError(err))
+	require.Empty(t, drive.tasks, "refused before the task: the directory has not moved")
+	require.Empty(t, drive.renames, "and nothing has been renamed or parked")
+	require.Equal(t, []string{"archive"}, drive.mkdirs, "the clean parent above it is made, the `$` name is not")
+}
+
+// TestDirMoveOfADollarDirectoryKeepingItsNameRuns is the other half of the rule: a
+// move that keeps the source's own name mints nothing, so an `a$b` directory that
+// is already on the drive can still be reorganised. Without this the refusal would
+// silently grow from "do not create `$`" into "`$` directories cannot be touched".
+func TestDirMoveOfADollarDirectoryKeepingItsNameRuns(t *testing.T) {
+	drive := &fakeDrive{t: t, folders: map[string]string{"archive": archiveID}}
+	f := newFakeFs(t, drive)
+	dollarFolder := listingJSON(nil, []string{folderJSON("900000000000000008", "a$b", rootID)})
+	dollarArrival := listingJSON(nil, []string{folderJSON("900000000000000008", "a$b", archiveID)})
+	script := newListingScript(map[string][]string{
+		rootID: {emptyListing(), dollarFolder, dollarFolder, dollarFolder},
+		archiveID: {emptyListing(), emptyListing(), emptyListing(), emptyListing(),
+			dollarArrival},
+	})
+	drive.listingFn = script.fn
+
+	require.NoError(t, f.DirMove(context.Background(), f, "a$b", "archive/a$b"))
+	require.Len(t, drive.tasks, 1)
+	require.Equal(t, taskMove, drive.tasks[0].taskType)
+	require.Empty(t, drive.renames, "the name did not change, so no rename is asked for")
+}
+
 // TestDirMoveRefusesTheRootAndAnExistingDestination: both are refused before the
 // drive is asked to do anything.
 func TestDirMoveRefusesTheRootAndAnExistingDestination(t *testing.T) {
@@ -1758,6 +1801,90 @@ func TestMkdirOfTheFirstFolderInAnEmptyFamilyDriveNamesNoParent(t *testing.T) {
 	require.Equal(t, "s3-bak", q.Get("folderName"))
 	require.Empty(t, q.Get("parentId"),
 		"an empty family drive has no numeric root id, so the folder is created without naming a parent")
+}
+
+// TestMkdirRefusesADollarInAFolderName is the backend's own rule, not the
+// server's: measured 2026-11-03 on a live personal drive, createFolder accepted
+// `a$b` at the top level and `c$d/e$f` nested and both listed back exactly as
+// sent. The point of the test is therefore not that the name is refused but
+// *where* it is refused - before the request, because a sync over a tree of such
+// folders would otherwise pay one createFolder per directory and then retry each
+// refusal.
+func TestMkdirRefusesADollarInAFolderName(t *testing.T) {
+	const newID = "900000000000000022"
+	drive := &fakeDrive{t: t, folders: map[string]string{"a$b": newID, "plain": newID}}
+	f := newFakeFs(t, drive)
+	drive.listingFn = newListingScript(map[string][]string{
+		rootID: {emptyListing(), emptyListing()},
+	}).fn
+
+	err := f.Mkdir(context.Background(), "a$b")
+	require.Error(t, err)
+	require.Empty(t, drive.mkdirs, "the refusal is local: no createFolder is sent for the name")
+	require.True(t, fserrors.IsNoRetryError(err), "a refusal that cannot change by asking again is not retried")
+	require.False(t, fserrors.IsFatalError(err), "and one such name must not cancel the rest of the run")
+	require.Contains(t, err.Error(), "a$b", "and the name the user has to fix is in the message")
+
+	// The control that the block above is about `$` and not about directory
+	// creation: one name without the character, same drive, and the request goes.
+	require.NoError(t, f.Mkdir(context.Background(), "plain"))
+	require.Equal(t, []string{"plain"}, drive.mkdirs)
+
+	// And one level down, because the live drive accepted `c$d/e$f` nested: every
+	// component of a path is its own creation, so a `$` hidden in the middle of a
+	// path meets the same refusal while the clean parent above it is made.
+	err = f.Mkdir(context.Background(), "plain/a$b")
+	require.Error(t, err)
+	require.Equal(t, []string{"plain"}, drive.mkdirs, "the clean parent is created, the `$` level is not")
+}
+
+// TestADollarFolderAlreadyOnTheDriveStaysUsable: the rule is about putting a new
+// `$` directory on the drive. A drive this backend did not fill may already hold
+// one, and rclone has to be able to walk into it and clear it away - `mkdir` on
+// it stays the no-op it is for every other existing directory.
+func TestADollarFolderAlreadyOnTheDriveStaysUsable(t *testing.T) {
+	const subID = "900000000000000023"
+	drive := &fakeDrive{t: t}
+	f := newFakeFs(t, drive)
+	known := listingJSON(nil, []string{folderJSON(subID, "a$b", rootID)})
+	drive.listingFn = newListingScript(map[string][]string{
+		rootID: {known, known, known},
+	}).fn
+
+	require.NoError(t, f.Mkdir(context.Background(), "a$b"), "an existing directory is not a creation")
+	require.Empty(t, drive.mkdirs)
+
+	require.NoError(t, f.Purge(context.Background(), "a$b"))
+	require.Len(t, drive.tasks, 1)
+	require.Equal(t, taskDelete, drive.tasks[0].taskType)
+	require.Equal(t, subID, drive.tasks[0].infos[0].FileID, "the delete is addressed by the id the listing gave")
+}
+
+// TestDollarFolderRefusedEvenWithTheDollarEncoding: the rule reads the name as
+// its owner spelled it, so a configuration that escapes `$` cannot buy its way
+// past it. The alternative would be a drive holding `a＄b` because that run's
+// encoding said to escape `$` - a different name for the same directory, created
+// by the backend that just refused to create it.
+func TestDollarFolderRefusedEvenWithTheDollarEncoding(t *testing.T) {
+	const newID = "900000000000000024"
+	// The wire spelling of a directory the user named `a＄b` once the Dollar flag
+	// is on: the encoder quotes the fullwidth form (`‛`) so a literal `＄` stays
+	// distinguishable from a `$` that was escaped into it.
+	drive := &fakeDrive{t: t, folders: map[string]string{"a‛＄b": newID}}
+	f := newFakeFs(t, drive)
+	f.opt.Enc = cloud189DefaultEncoding | encoder.EncodeDollar
+	drive.listingFn = newListingScript(map[string][]string{
+		rootID: {emptyListing()},
+	}).fn
+
+	err := f.Mkdir(context.Background(), "a$b")
+	require.Error(t, err)
+	require.Empty(t, drive.mkdirs, "the encoded spelling is not a way past the rule")
+
+	// A directory whose own name carries the fullwidth form is not a `$`
+	// directory, and is created.
+	require.NoError(t, f.Mkdir(context.Background(), "a＄b"))
+	require.Equal(t, []string{"a‛＄b"}, drive.mkdirs)
 }
 
 // TestNilObjectStringIsTheNilConvention: the suite hands every backend a typed
